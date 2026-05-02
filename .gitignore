@@ -1,0 +1,73 @@
+.DS_Store
+**/.DS_Store
+
+.VSCodeCounter/
+.vscode/
+
+
+# Build artifacts - object files
+*.o
+*.obj
+*.ko
+*.elf
+
+# Compiled binaries
+*.bin
+*.img
+*.iso
+*.efi
+
+# Kernel/bootloader specific
+kernel
+kernel.bin
+boot.bin
+os.img
+disk.img
+*.map
+*.sym
+
+# Assembly intermediate files
+*.lst
+*.lso
+
+# Static/shared libraries
+*.a
+*.so
+*.lib
+*.dll
+*.dylib
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.gdb_history
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.bak
+
+# Build directories
+build/
+bin/
+obj/
+out/
+
+# QEMU / emulator artifacts
+*.qcow2
+*.vdi
+*.vmdk
+serial.log
+qemu.log
+bochsout.txt
+bochsrc.bak
+
+# Dependency files
+*.d

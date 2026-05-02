@@ -1,0 +1,16 @@
+#ifndef _USER_STRING_H
+#define _USER_STRING_H
+
+#include "syscalls.h"   // for size_t
+
+size_t strlen(const char* s);
+int    strcmp(const char* a, const char* b);
+int    strncmp(const char* a, const char* b, size_t n);
+char*  strcpy(char* dst, const char* src);
+void*  memset(void* dst, int value, size_t n);
+void*  memcpy(void* dst, const void* src, size_t n);
+
+// Parse a non-negative decimal integer. Stops at the first non-digit.
+unsigned int atou(const char* s);
+
+#endif

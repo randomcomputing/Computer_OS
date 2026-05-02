@@ -32,6 +32,7 @@ static volatile unsigned int buf_tail = 0;   // read by consumer
 
 static volatile int shift_down = 0;
 static volatile int caps_lock  = 0;
+static volatile int ctrl_down  = 0;
 // Set when we see 0xE0; consume the *next* scancode as an extended key.
 static volatile int extended    = 0;
 
@@ -76,8 +77,8 @@ static void keyboard_irq(struct registers* regs) {
     }
 
     // Top bit set = key release. We only care about releases for shift
-    // tracking; everything else (including extended-key releases) gets
-    // dropped on the floor.
+    // and ctrl tracking; everything else (including extended-key
+    // releases) gets dropped on the floor.
     if (sc & 0x80) {
         unsigned char code = sc & 0x7F;
         if (extended) {
@@ -85,7 +86,8 @@ static void keyboard_irq(struct registers* regs) {
             extended = 0;
             return;
         }
-        if (code == 0x2A || code == 0x36) shift_down = 0;
+        if (code == 0x1D)                  ctrl_down  = 0;
+        if (code == 0x2A || code == 0x36)  shift_down = 0;
         return;
     }
 
@@ -99,6 +101,7 @@ static void keyboard_irq(struct registers* regs) {
 
     // Regular key press from here on.
     if (sc == 0x2A || sc == 0x36) { shift_down = 1; return; }
+    if (sc == 0x1D)               { ctrl_down  = 1; return; }
     if (sc == 0x3A)               { caps_lock = !caps_lock; return; }
 
     if (sc >= 128) return;
@@ -114,6 +117,17 @@ static void keyboard_irq(struct registers* regs) {
         } else {
             if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
         }
+    }
+
+    // Ctrl + letter -> control character (Ctrl-A = 0x01 ... Ctrl-Z = 0x1A),
+    // matching the standard terminal convention. The editor (and any
+    // future readline-style code) keys off these. Ctrl + non-letter is
+    // dropped for now — add cases here if you ever want Ctrl-[ etc.
+    if (ctrl_down) {
+        char up = c;
+        if (up >= 'a' && up <= 'z') up -= ('a' - 'A');
+        if (up >= 'A' && up <= 'Z') c = up - 'A' + 1;
+        else return;
     }
 
     push_char(c);

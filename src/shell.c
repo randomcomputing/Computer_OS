@@ -14,6 +14,7 @@
 #include "userprog.h"
 #include "rtc.h"
 #include "loader.h"
+#include "editor.h"
 
 #define LINE_MAX 128
 
@@ -29,7 +30,7 @@ static const char* commands[] = {
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
     "cd", "pwd",
     "history", "date", "time", "tz",
-    "user", "run", "reboot", "shutdown",
+    "user", "run", "edit", "reboot", "shutdown",
     0
 };
 
@@ -650,6 +651,7 @@ static void cmd_help(void) {
     printf("  user          run the ring-3 demo program\n");
     printf("  run <file>    load and run an ELF32 or flat-binary program from FAT12\n");
     printf("                  e.g.  run ECHO.ELF    run HELLO.BIN\n");
+    printf("  edit [<file>]  open a file in the full-screen text editor\n");
     printf("  reboot        restart the machine\n");
     printf("  shutdown      power off (ACPI S5)\n");
     printf("Editing: Tab=complete, Up/Down=history, Left/Right=move,\n");
@@ -1013,6 +1015,16 @@ static void cmd_run(const char* args) {
     (void)id;
 }
 
+static void cmd_edit(const char* args) {
+    while (*args == ' ') args++;
+    // Pass null for "no file" so the editor opens an empty buffer and
+    // prompts for a filename on save.
+    editor_run(args[0] ? args : 0);
+    // The editor leaves the screen in whatever state it last drew. Clear
+    // it so the shell prompt comes back on a clean screen.
+    vga_clear();
+}
+
 static void cmd_shutdown(void) {
     printf("Shutting down...\n");
     pit_sleep(200);
@@ -1159,6 +1171,7 @@ static void execute(char* line) {
     else if (strcmp(line, "tz")       == 0) cmd_tz(args);
     else if (strcmp(line, "user")     == 0) cmd_user();
     else if (strcmp(line, "run")      == 0) cmd_run(args);
+    else if (strcmp(line, "edit")     == 0) cmd_edit(args);
     else if (strcmp(line, "reboot")   == 0) cmd_reboot();
     else if (strcmp(line, "shutdown") == 0) cmd_shutdown();
     else {

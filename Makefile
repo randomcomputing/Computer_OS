@@ -42,6 +42,7 @@ SYSCALL_O    = syscall.o
 SYSCALL_ASM_O = syscall_asm.o
 USERPROG_O   = userprog.o
 LOADER_O     = loader.o
+EDITOR_O     = editor.o
 RTC_O        = rtc.o
 DISK_IMG     = disk.img
 FAT_IMG      = fatdisk.img
@@ -54,7 +55,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(PRINTF_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-              $(LOADER_O) $(RTC_O)
+              $(LOADER_O) $(EDITOR_O) $(RTC_O)
 
 ISO_DIR = isodir
 
@@ -128,7 +129,7 @@ $(SERIAL_O): src/serial.c include/serial.h include/io.h
 	@echo "Compiling serial driver..."
 	$(CC) $(CFLAGS) src/serial.c -o $(SERIAL_O)
 
-$(SHELL_O): src/shell.c include/shell.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h
+$(SHELL_O): src/shell.c include/shell.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h
 	@echo "Compiling shell..."
 	$(CC) $(CFLAGS) src/shell.c -o $(SHELL_O)
 
@@ -175,6 +176,10 @@ $(USERPROG_O): src/userprog.c include/userprog.h include/vmm.h include/pmm.h inc
 $(LOADER_O): src/loader.c include/loader.h include/elf.h include/fat12.h include/vmm.h include/pmm.h include/task.h include/kheap.h include/string.h include/printf.h
 	@echo "Compiling user-program loader..."
 	$(CC) $(CFLAGS) src/loader.c -o $(LOADER_O)
+
+$(EDITOR_O): src/editor.c include/editor.h include/vga.h include/keyboard.h include/kheap.h include/string.h include/printf.h include/fat12.h
+	@echo "Compiling text editor..."
+	$(CC) $(CFLAGS) src/editor.c -o $(EDITOR_O)
 
 $(RTC_O): src/rtc.c include/rtc.h include/io.h
 	@echo "Compiling RTC driver..."

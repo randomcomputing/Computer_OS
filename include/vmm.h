@@ -51,6 +51,6 @@ unsigned int vmm_kernel_pd_phys(void);
 
 // Page-fault handler, called from isr.c when int_no == 14.
 struct registers;
-void vmm_page_fault(struct registers* regs);
+int vmm_page_fault(struct registers* regs);
 
 #endif

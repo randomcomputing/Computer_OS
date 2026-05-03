@@ -45,6 +45,8 @@ LOADER_O     = loader.o
 EDITOR_O     = editor.o
 RTC_O        = rtc.o
 DISK_IMG     = disk.img
+UACCESS_O    = uaccess.o
+
 FAT_IMG      = fatdisk.img
 ISO_FILE     = Computer_OS.iso
 
@@ -55,8 +57,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(PRINTF_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-              $(LOADER_O) $(EDITOR_O) $(RTC_O)
-
+			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O)
 ISO_DIR = isodir
 
 all: $(ISO_FILE)
@@ -141,7 +142,7 @@ $(PMM_O): src/pmm.c include/pmm.h include/memmap.h include/printf.h
 	@echo "Compiling physical memory manager..."
 	$(CC) $(CFLAGS) src/pmm.c -o $(PMM_O)
 
-$(VMM_O): src/vmm.c include/vmm.h include/pmm.h include/printf.h include/vga.h include/isr.h
+$(VMM_O): src/vmm.c include/vmm.h include/pmm.h include/printf.h include/vga.h include/isr.h include/task.h
 	@echo "Compiling virtual memory manager..."
 	$(CC) $(CFLAGS) src/vmm.c -o $(VMM_O)
 
@@ -161,7 +162,7 @@ $(GDT_O): src/gdt.c include/gdt.h
 	@echo "Compiling GDT/TSS..."
 	$(CC) $(CFLAGS) src/gdt.c -o $(GDT_O)
 
-$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h
+$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h include/uaccess.h
 	@echo "Compiling syscall dispatcher..."
 	$(CC) $(CFLAGS) src/syscall.c -o $(SYSCALL_O)
 
@@ -184,6 +185,10 @@ $(EDITOR_O): src/editor.c include/editor.h include/vga.h include/keyboard.h incl
 $(RTC_O): src/rtc.c include/rtc.h include/io.h
 	@echo "Compiling RTC driver..."
 	$(CC) $(CFLAGS) src/rtc.c -o $(RTC_O)
+
+$(UACCESS_O): src/uaccess.c include/uaccess.h include/task.h
+	@echo "Compiling user-access helpers..."
+	$(CC) $(CFLAGS) src/uaccess.c -o $(UACCESS_O)
 
 $(ATA_O): src/ata.c include/ata.h include/io.h include/printf.h
 	@echo "Compiling ATA driver..."

@@ -3,6 +3,7 @@
 #include "printf.h"
 #include "vga.h"
 #include "isr.h"
+#include "task.h"
 
 #define ENTRIES    1024
 #define KERNEL_VMA 0xC0000000u
@@ -219,10 +220,32 @@ void vmm_init(unsigned int identity_mb) {
 // =====================================================================
 // Page-fault handler
 // =====================================================================
+//
+// Returns 1 if the fault was handled and execution should resume normally
+// (caller in isr.c must NOT halt), 0 if unrecoverable (caller halts).
+//
+// Recovery cases handled today:
+//   - copy_from_user / copy_to_user / strnlen_user faulting on a bad
+//     user pointer. Detected by current->in_user_access; we rewrite the
+//     saved EIP to the helper's recovery label and let the iret resume
+//     there. The helper sees uaccess_faulted=1 and returns -1.
+//
+// Anything else falls through to the diagnostic dump and the caller halts.
 
-void vmm_page_fault(struct registers* regs) {
+int vmm_page_fault(struct registers* regs) {
     unsigned int cr2 = read_cr2();
     unsigned int err = regs->err_code;
+
+    // --- recoverable: kernel touched a bad user pointer inside a uaccess
+    // helper. CPL was 0 (so err&4 is clear) but in_user_access is set.
+    task_t* cur = task_current();
+    if (cur && cur->in_user_access && cur->fault_recovery_eip) {
+        cur->uaccess_faulted = 1;
+        regs->eip            = cur->fault_recovery_eip;
+        // We deliberately leave in_user_access set; the helper itself
+        // clears it once we land at the recovery label.
+        return 1;
+    }
 
     vga_set_color(VGA_LIGHT_RED, VGA_BLACK);
     printf("\n*** PAGE FAULT ***\n");
@@ -234,4 +257,5 @@ void vmm_page_fault(struct registers* regs) {
            (err & 2) ? "write"                : "read",
            (err & 4) ? "user mode"            : "kernel mode",
            (err & 16) ? ", instruction fetch" : "");
+    return 0;
 }

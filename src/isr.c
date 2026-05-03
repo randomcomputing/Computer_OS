@@ -36,8 +36,11 @@ static const char* exception_names[32] = {
 
 void isr_handler(struct registers* regs) {
     // Page fault gets its own handler — it needs CR2 and a decoded error code.
+    // It returns 1 if recoverable (e.g. copy_from_user landed on a bad
+    // user pointer); we return immediately so the iret resumes at the
+    // helper's recovery label.
     if (regs->int_no == 14) {
-        vmm_page_fault(regs);
+        if (vmm_page_fault(regs)) return;
         halt();
     }
 

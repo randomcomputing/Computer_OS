@@ -43,6 +43,17 @@ typedef struct task {
     void        (*on_exit)(struct task*);
     void*         user_data;    // opaque pointer for on_exit's use
 
+    // --- user-pointer access fault recovery (uaccess.c) ---------------
+    // Set non-zero by copy_from_user / copy_to_user / strnlen_user
+    // around the inner copy loop. While set, a page fault triggered
+    // from the kernel (CPL=0) on a faulting address is *not* fatal:
+    // the page-fault handler rewrites the saved EIP to fault_recovery_eip
+    // so the helper bails out and returns -EFAULT. Cleared on the way
+    // out of every helper. Zero-initialised by memset() in task_spawn.
+    unsigned int  in_user_access;
+    unsigned int  fault_recovery_eip;
+    int           uaccess_faulted;   // set to 1 by page fault handler
+
     struct task*  next;         // circular ready list
 } task_t;
 

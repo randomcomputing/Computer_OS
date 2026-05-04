@@ -10,6 +10,13 @@
 
 // =====================================================================
 // Per-task user resource tracking
+//
+// We need to remember every physical frame mapped into the user's PD so
+// we can free them on exit. The original implementation used a fixed
+// array sized for code + a few extras; that doesn't scale once the heap
+// can grow to thousands of pages. We use a simple linked list of blocks
+// instead — each block holds PAGES_PER_BLOCK records, and we allocate a
+// new block when the current one fills up.
 // =====================================================================
 
 typedef struct {
@@ -17,29 +24,55 @@ typedef struct {
     unsigned int phys;
 } mapped_page_t;
 
-#define MAX_USER_PAGES (LOADER_CODE_PAGES + 8)
+#define PAGES_PER_BLOCK 64
+
+typedef struct page_block {
+    mapped_page_t      pages[PAGES_PER_BLOCK];
+    int                used;
+    struct page_block* next;
+} page_block_t;
 
 typedef struct {
-    mapped_page_t pages[MAX_USER_PAGES];
-    int           npages;
+    page_block_t* head;             // singly-linked list, newest at head
+    int           total_pages;      // running count, for diagnostics
+
+    // Heap region (sbrk). heap_brk grows in 4 KB increments and is the
+    // first byte NOT yet allocated; the user program treats it as the
+    // current break.
+    unsigned int  heap_base;
+    unsigned int  heap_brk;
+    unsigned int  heap_max;         // hard cap; heap_brk may not exceed this
+    unsigned int  pd_phys;          // saved so sbrk can map without re-deriving
 } user_resources_t;
 
 static volatile int busy = 0;
 
+// Forward decl — used by both elf_load/flat_load and loader_sbrk.
+static int record_page(user_resources_t* r, unsigned int virt, unsigned int phys);
+
 // =====================================================================
 // Resource cleanup
 //
-// Frees the physical frames of all user pages.  The page tables and PD
-// are freed separately via vmm_free_user_pd(t->pd_phys) in on_user_exit.
+// Frees the physical frames of every page the loader (or sbrk) mapped
+// for this task, then frees the block list. Page tables and the PD
+// itself are freed separately via vmm_free_user_pd() in on_user_exit.
 // =====================================================================
 
 static void release_resources(user_resources_t* r) {
-    for (int i = 0; i < r->npages; i++) {
-        if (r->pages[i].phys) {
-            pmm_free(r->pages[i].phys);
-            r->pages[i].phys = 0;
+    page_block_t* b = r->head;
+    while (b) {
+        for (int i = 0; i < b->used; i++) {
+            if (b->pages[i].phys) {
+                pmm_free(b->pages[i].phys);
+                b->pages[i].phys = 0;
+            }
         }
+        page_block_t* next = b->next;
+        kfree(b);
+        b = next;
     }
+    r->head = 0;
+    r->total_pages = 0;
 }
 
 static void on_user_exit(task_t* t) {
@@ -58,20 +91,42 @@ static void on_user_exit(task_t* t) {
 }
 
 // =====================================================================
+// Page-record bookkeeping
+//
+// Returns 0 on success, -1 if we couldn't allocate a new tracking block.
+// =====================================================================
+
+static int record_page(user_resources_t* r, unsigned int virt, unsigned int phys) {
+    page_block_t* b = r->head;
+    if (!b || b->used >= PAGES_PER_BLOCK) {
+        page_block_t* nb = (page_block_t*)kmalloc(sizeof(page_block_t));
+        if (!nb) {
+            printf("loader: out of kernel heap tracking user pages\n");
+            return -1;
+        }
+        memset(nb, 0, sizeof(*nb));
+        nb->next = r->head;
+        r->head  = nb;
+        b = nb;
+    }
+    b->pages[b->used].virt = virt;
+    b->pages[b->used].phys = phys;
+    b->used++;
+    r->total_pages++;
+    return 0;
+}
+
+// =====================================================================
 // Page mapping helper
 //
 // Allocates a physical frame, maps it into the given user PD at `virt`
-// with `flags`, and zeroes the frame via its physical address (the
-// identity map keeps all PMM frames < 4 MB accessible regardless of
-// which CR3 is loaded).  Records the pair for cleanup.
+// with `flags`, zeroes the frame via its physical address (the identity
+// map keeps all PMM frames < 4 MB accessible regardless of which CR3 is
+// loaded), and records the pair for cleanup.
 // =====================================================================
 
 static unsigned int alloc_user_page(unsigned int virt, unsigned int flags,
                                     user_resources_t* r, unsigned int pd_phys) {
-    if (r->npages >= MAX_USER_PAGES) {
-        printf("loader: too many user pages\n");
-        return 0;
-    }
     unsigned int frame = pmm_alloc();
     if (!frame) { printf("loader: out of physical memory\n"); return 0; }
 
@@ -85,9 +140,12 @@ static unsigned int alloc_user_page(unsigned int virt, unsigned int flags,
     // low 4 MB, so (void*)frame is always accessible from kernel code.
     memset((void*)frame, 0, 4096);
 
-    r->pages[r->npages].virt = virt;
-    r->pages[r->npages].phys = frame;
-    r->npages++;
+    if (record_page(r, virt, frame) != 0) {
+        // Tracking failed; unmap and free the frame so we don't leak it.
+        vmm_unmap_pd(pd_phys, virt);
+        pmm_free(frame);
+        return 0;
+    }
     return frame;
 }
 
@@ -261,6 +319,10 @@ int loader_run(const char* path) {
     user_resources_t* r = (user_resources_t*)kmalloc(sizeof(*r));
     if (!r) { vmm_free_user_pd(pd_phys); kfree(buf); return -1; }
     memset(r, 0, sizeof(*r));
+    r->pd_phys   = pd_phys;
+    r->heap_base = LOADER_HEAP_BASE;
+    r->heap_brk  = LOADER_HEAP_BASE;
+    r->heap_max  = LOADER_HEAP_BASE + LOADER_HEAP_MAX;
 
     unsigned int entry;
     if (elf32_valid(buf, n)) {
@@ -308,4 +370,54 @@ int loader_run(const char* path) {
     t->on_exit   = on_user_exit;
 
     return id;
+}
+
+// =====================================================================
+// SYS_SBRK backend
+//
+// Grow the calling task's user heap by `delta` bytes, rounded up to a
+// page boundary. Returns the OLD break (so a user-space malloc gets
+// "here's the chunk you just allocated"). On failure, returns -1.
+//
+// Negative delta is accepted but treated as a no-op for now — shrinking
+// the heap would require unmapping pages and updating the tracker mid-
+// list, which we don't need yet.
+// =====================================================================
+
+int loader_sbrk(int delta) {
+    task_t* t = task_current();
+    if (!t || !t->is_user || !t->user_data) return -1;
+
+    user_resources_t* r = (user_resources_t*)t->user_data;
+    unsigned int old_brk = r->heap_brk;
+
+    if (delta == 0) return (int)old_brk;
+    if (delta < 0)  return (int)old_brk;   // shrink not implemented
+
+    unsigned int d       = (unsigned int)delta;
+    unsigned int new_brk = old_brk + d;
+
+    // Overflow / cap check.
+    if (new_brk < old_brk)         return -1;     // wraparound
+    if (new_brk > r->heap_max)     return -1;     // exceeds cap
+
+    // Allocate every fresh page between old_brk and new_brk. Existing
+    // pages (when old_brk wasn't page-aligned) are left alone.
+    unsigned int first_page = (old_brk + 0xFFFu) & ~0xFFFu;
+    unsigned int last_page  = (new_brk + 0xFFFu) & ~0xFFFu;
+
+    for (unsigned int v = first_page; v < last_page; v += 0x1000) {
+        if (vmm_resolve_pd(r->pd_phys, v)) continue;   // already mapped
+        if (!alloc_user_page(v,
+                             VMM_PRESENT | VMM_WRITE | VMM_USER,
+                             r, r->pd_phys)) {
+            // Out of memory or tracking failed. Pages we already mapped
+            // on this call stay mapped (tracked, freed on exit), but
+            // the user sees -1 and doesn't get any of this delta.
+            return -1;
+        }
+    }
+
+    r->heap_brk = new_brk;
+    return (int)old_brk;
 }

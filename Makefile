@@ -162,7 +162,7 @@ $(GDT_O): src/gdt.c include/gdt.h
 	@echo "Compiling GDT/TSS..."
 	$(CC) $(CFLAGS) src/gdt.c -o $(GDT_O)
 
-$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h include/uaccess.h
+$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h include/uaccess.h include/loader.h
 	@echo "Compiling syscall dispatcher..."
 	$(CC) $(CFLAGS) src/syscall.c -o $(SYSCALL_O)
 
@@ -240,6 +240,13 @@ $(FAT_IMG): userprogs/hello.asm userprogs/count.asm \
 	mcopy -i $(FAT_IMG) /tmp/_count.bin         ::COUNT.BIN
 	mcopy -i $(FAT_IMG) userprogs/c/testc.elf   ::TESTC.ELF
 	mcopy -i $(FAT_IMG) userprogs/c/echo.elf    ::ECHO.ELF
+	mcopy -i $(FAT_IMG) userprogs/c/maltest.elf ::MALTEST.ELF
+	mcopy -i $(FAT_IMG) userprogs/c/colors.elf  ::COLORS.ELF
+	mcopy -i $(FAT_IMG) userprogs/c/game.elf    ::GAME.ELF
+	mcopy -i $(FAT_IMG) userprogs/c/calc.elf    ::CALC.ELF
+
+
+
 	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
 	@echo "FAT12 disk ready: $(FAT_IMG)"
 

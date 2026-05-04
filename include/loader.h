@@ -31,6 +31,19 @@
 #define LOADER_STACK_TOP  (LOADER_CODE_VIRT + 0x100000)
 #define LOADER_STACK_PAGE (LOADER_STACK_TOP - 0x1000)
 
+// Per-process user heap (sbrk).
+//
+// The heap is mapped on demand by SYS_SBRK. It starts empty (heap_brk ==
+// heap_base) and grows upward one page at a time as the user program
+// asks for memory. We park it well above the code region (which tops out
+// at 0x01100000) and leave a generous gap so future code-size growth
+// doesn't collide.
+//
+// Maximum is 16 MB — enough for any reasonable user program, small
+// enough that a runaway malloc loop can't eat all of physical memory.
+#define LOADER_HEAP_BASE  0x02000000u
+#define LOADER_HEAP_MAX   0x01000000u   // 16 MB cap on heap growth
+
 // Read `path` from FAT12 and run it as a ring-3 program.
 // Returns the new task id on success, or -1 on any failure
 // (file missing, too big, out of memory, another program running).
@@ -38,5 +51,11 @@ int loader_run(const char* path);
 
 // Is a loaded program currently running?
 int loader_is_busy(void);
+
+// SYS_SBRK backend: extend the calling task's user heap by `delta` bytes.
+// Returns the OLD break on success, or -1 on any failure (no heap, would
+// exceed cap, OOM). Negative delta is currently a no-op (returns the
+// current break unchanged).
+int loader_sbrk(int delta);
 
 #endif

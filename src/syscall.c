@@ -5,6 +5,7 @@
 #include "task.h"
 #include "keyboard.h"
 #include "uaccess.h"
+#include "loader.h"
 
 // Stub from syscall_asm.asm.
 extern void syscall_stub(void);
@@ -43,7 +44,6 @@ static int sys_write(int fd, const char* buf, unsigned int len) {
         unsigned int n = len - total;
         if (n > sizeof(chunk)) n = sizeof(chunk);
         if (copy_from_user(chunk, buf + total, n) != 0) {
-            // If we already wrote some bytes, return that; otherwise -EFAULT.
             return (total > 0) ? (int)total : EFAULT;
         }
         for (unsigned int i = 0; i < n; i++) vga_putchar(chunk[i]);
@@ -57,8 +57,6 @@ static int sys_read(int fd, char* buf, unsigned int len) {
     if (fd != 0) return EBADF;
     if (len == 0) return 0;
 
-    // Range-check upfront so we fail fast on obviously bogus pointers.
-    // We still rely on copy_to_user to catch unmapped pages mid-read.
     if (!user_range_ok(buf, len)) return EFAULT;
 
     // Pull characters from the keyboard buffer one at a time, yielding
@@ -91,11 +89,8 @@ void syscall_handler(struct registers* regs) {
 
     switch (num) {
         case SYS_EXIT:
-            // a1 is the exit code; we don't surface it yet.
             (void)a1;
             task_exit();
-            // task_exit doesn't return, but if we got here something is
-            // very wrong — just sit and hope.
             for (;;) __asm__ volatile ("hlt");
 
         case SYS_WRITE:
@@ -116,11 +111,10 @@ void syscall_handler(struct registers* regs) {
             break;
 
         case SYS_SBRK:
-            ret = -1;
+            ret = loader_sbrk((int)a1);
             break;
 
         case SYS_SETCOLOR:
-            // a1 = fg (0-15), a2 = bg (0-15)
             if (a1 < 16 && a2 < 16)
                 vga_set_color((enum vga_color)a1, (enum vga_color)a2);
             ret = 0;

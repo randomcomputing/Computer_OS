@@ -12,12 +12,6 @@
 //   edx  -> arg 3
 //   int $0x80
 //   eax  <- return value
-//
-// All four registers are clobbered by the syscall as far as the C
-// compiler is concerned; we list them explicitly. We also clobber
-// "memory" so the compiler doesn't reorder loads/stores across the
-// trap (e.g. it must not assume a buffer's contents are unchanged
-// after a sys_read returns).
 
 typedef unsigned int size_t;
 
@@ -78,7 +72,6 @@ static inline int _syscall3(int num, int a, int b, int c) {
 
 static inline void exit(int code) {
     _syscall1(SYS_EXIT, code);
-    // exit doesn't return, but the compiler doesn't know that.
     for (;;) { }
 }
 
@@ -96,6 +89,14 @@ static inline int getpid(void) {
 
 static inline void sched_yield(void) {
     _syscall0(SYS_YIELD);
+}
+
+// Grow the user heap by `delta` bytes. Returns a pointer to the start
+// of the newly allocated region (i.e. the OLD break) on success, or
+// (void*)-1 on failure. Mirrors POSIX sbrk.
+static inline void* sbrk(int delta) {
+    int ret = _syscall1(SYS_SBRK, delta);
+    return (void*)ret;
 }
 
 static inline void set_color(int fg, int bg) {

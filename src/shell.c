@@ -34,6 +34,7 @@ static const char* commands[] = {
     "user", "run", "edit", "reboot", "shutdown",
     "gfx",
     "gfxmouse",
+    "paint",
     0
 };
 
@@ -1161,7 +1162,7 @@ static void cmd_gfx(void) {
     gfx_line(50, 50, 260, 150, 2);
 
     // Text rendered from the VGA bitmap font, in graphics mode.
-    gfx_text(70, 170, "Graphics Mode Test", 15, -1);
+    gfx_text(70, 170, "Hello from graphics mode!", 15, -1);
     gfx_text(70, 186, "0123456789 +-*/= () {}", 14, -1);
 
     // Block until a key is pressed, then go back to text mode. We can't
@@ -1177,6 +1178,14 @@ static void cmd_gfxmouse(void) {
     printf("Entering graphics mode. Move the mouse, hold left button to\n");
     printf("paint, press any key to exit.\n");
     gfx_mouse_demo();                 // blocks until a key is pressed
+    vga_clear();
+    printf("Back in text mode.\n");
+}
+
+static void cmd_paint(void) {
+    printf("Paint: click a colour swatch, hold LEFT to draw, RIGHT to\n");
+    printf("erase. Click QUIT (or press any key) to exit.\n");
+    gfx_paint();                      // blocks until QUIT or a keypress
     vga_clear();
     printf("Back in text mode.\n");
 }
@@ -1224,6 +1233,7 @@ static void execute(char* line) {
     else if (strcmp(line, "edit")     == 0) cmd_edit(args);
     else if (strcmp(line, "gfx")      == 0) cmd_gfx();
     else if (strcmp(line, "gfxmouse") == 0) cmd_gfxmouse();
+    else if (strcmp(line, "paint")    == 0) cmd_paint();
     else if (strcmp(line, "reboot")   == 0) cmd_reboot();
     else if (strcmp(line, "shutdown") == 0) cmd_shutdown();
     else {

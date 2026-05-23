@@ -339,6 +339,21 @@ static int clampi(int v, int lo, int hi) {
     return v;
 }
 
+// Mouse sensitivity. The driver accumulates raw movement counts into
+// mx/my (one count per unit reported by the device). On a macOS trackpad
+// under QEMU those counts come in large, so the cursor flies across the
+// screen. We divide the raw count down to slow it. Higher = slower.
+// 3 feels close to a normal desktop pointer; bump it up if it's still fast.
+#define MOUSE_SENSITIVITY 3
+
+// Read the scaled, clamped cursor X/Y in screen pixels.
+static int cursor_x(void) {
+    return clampi(mouse_dx() / MOUSE_SENSITIVITY, 0, GFX_WIDTH  - CUR_W);
+}
+static int cursor_y(void) {
+    return clampi(mouse_dy() / MOUSE_SENSITIVITY, 0, GFX_HEIGHT - CUR_H);
+}
+
 // Run the interactive demo. Move the mouse to move the cursor; hold the
 // left button to paint; press any key to quit back to text mode.
 // Returns when a key is pressed.
@@ -359,8 +374,8 @@ void gfx_mouse_demo(void) {
     // Start the cursor at wherever the mouse currently reports (clamped).
     // mx/my accumulate from boot, so this may not be screen-centre — that's
     // fine, the cursor simply begins at the live position.
-    int px = clampi(mouse_dx(), 0, GFX_WIDTH  - CUR_W);
-    int py = clampi(mouse_dy(), 0, GFX_HEIGHT - CUR_H);
+    int px = cursor_x();
+    int py = cursor_y();
     cursor_save(px, py);
     cursor_draw(px, py);
 
@@ -371,8 +386,8 @@ void gfx_mouse_demo(void) {
 
         // mouse_dx/dy are accumulated absolute-ish coordinates. Clamp to
         // the screen (leaving room for the sprite).
-        int nx = clampi(mouse_dx(), 0, GFX_WIDTH  - CUR_W);
-        int ny = clampi(mouse_dy(), 0, GFX_HEIGHT - CUR_H);
+        int nx = cursor_x();
+        int ny = cursor_y();
 
         // Paint with the left button (bit 0). We draw a small dot at the
         // cursor hotspot (top-left) under the restored background, so the
@@ -433,4 +448,125 @@ void gfx_text(int x, int y, const char* s, unsigned char fg, int bg) {
         gfx_char(cx, cy, *s, fg, bg);
         cx += GLYPH_W;
     }
+}
+
+// --- paint program -----------------------------------------------------
+// A self-contained MS-Paint-style toy. Layout:
+//
+//   row 0..TOOLBAR_H : toolbar — 16 colour swatches, a CLEAR box, a QUIT
+//                      box, and a swatch showing the current colour.
+//   separator line
+//   below            : canvas. Hold LEFT to draw, RIGHT to erase.
+//
+// Picking a colour or hitting CLEAR/QUIT is done by clicking in the
+// toolbar. Everything is drawn with the primitives we already have
+// (gfx_fill_rect, gfx_draw_rect, gfx_line, gfx_text), and the cursor uses
+// the existing save-under-restore helpers so it leaves no trail.
+
+#define TOOLBAR_H   24
+#define SWATCH_W    16
+#define SWATCH_H    16
+#define SWATCH_Y    4
+#define BRUSH       2      // half-size of the square brush (so 5x5-ish)
+#define CANVAS_TOP  (TOOLBAR_H + 1)
+
+// X position where the 16 swatches begin, and where CLEAR/QUIT sit.
+#define SWATCH_X0   4
+#define CLEAR_X     (SWATCH_X0 + 16 * SWATCH_W + 8)
+#define QUIT_X      (CLEAR_X + 40)
+#define BOX_W       36
+
+// Is (mx,my) inside the rectangle (rx,ry,rw,rh)?
+static int in_box(int mx, int my, int rx, int ry, int rw, int rh) {
+    return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+}
+
+static void paint_draw_toolbar(unsigned char cur_color) {
+    gfx_fill_rect(0, 0, GFX_WIDTH, TOOLBAR_H, 8);   // dark grey toolbar
+
+    // 16 colour swatches.
+    for (int c = 0; c < 16; c++) {
+        int x = SWATCH_X0 + c * SWATCH_W;
+        gfx_fill_rect(x, SWATCH_Y, SWATCH_W - 2, SWATCH_H, (unsigned char)c);
+        // Outline the currently-selected colour in white.
+        if (c == cur_color) gfx_draw_rect(x - 1, SWATCH_Y - 1, SWATCH_W, SWATCH_H + 2, 15);
+    }
+
+    // CLEAR and QUIT boxes with labels.
+    gfx_fill_rect(CLEAR_X, SWATCH_Y, BOX_W, SWATCH_H, 7);
+    gfx_text(CLEAR_X + 2, SWATCH_Y + 4, "CLR", 0, -1);
+    gfx_fill_rect(QUIT_X, SWATCH_Y, BOX_W, SWATCH_H, 4);
+    gfx_text(QUIT_X + 3, SWATCH_Y + 4, "QUIT", 15, -1);
+
+    // Separator line under the toolbar.
+    gfx_line(0, TOOLBAR_H, GFX_WIDTH - 1, TOOLBAR_H, 7);
+}
+
+// Clear just the canvas (leave the toolbar intact).
+static void paint_clear_canvas(void) {
+    gfx_fill_rect(0, CANVAS_TOP, GFX_WIDTH, GFX_HEIGHT - CANVAS_TOP, 0);
+}
+
+void gfx_paint(void) {
+    gfx_init();
+    gfx_clear(0);
+
+    unsigned char cur_color = 15;     // start drawing in white
+    paint_draw_toolbar(cur_color);
+    paint_clear_canvas();
+
+    int px = cursor_x();
+    int py = cursor_y();
+    cursor_save(px, py);
+    cursor_draw(px, py);
+
+    char dummy;
+    for (;;) {
+        if (keyboard_try_getchar(&dummy)) break;   // key also quits
+
+        int nx = cursor_x();
+        int ny = cursor_y();
+        int btn = mouse_buttons();
+        int left  = btn & 0x01;
+        int right = btn & 0x02;
+
+        // Always erase the old cursor before doing anything that draws,
+        // so we never save the cursor sprite into the canvas.
+        cursor_restore(px, py);
+
+        // Hotspot is the cursor's top-left pixel.
+        if (left) {
+            if (py < TOOLBAR_H) {
+                // Clicked in the toolbar — pick colour or hit a button.
+                for (int c = 0; c < 16; c++) {
+                    int sx = SWATCH_X0 + c * SWATCH_W;
+                    if (in_box(px, py, sx, SWATCH_Y, SWATCH_W - 2, SWATCH_H)) {
+                        cur_color = (unsigned char)c;
+                        paint_draw_toolbar(cur_color);
+                    }
+                }
+                if (in_box(px, py, CLEAR_X, SWATCH_Y, BOX_W, SWATCH_H)) {
+                    paint_clear_canvas();
+                }
+                if (in_box(px, py, QUIT_X, SWATCH_Y, BOX_W, SWATCH_H)) {
+                    break;
+                }
+            } else {
+                // Draw on the canvas with a small square brush.
+                gfx_fill_rect(px - BRUSH, py - BRUSH, BRUSH * 2 + 1, BRUSH * 2 + 1, cur_color);
+            }
+        } else if (right && py >= CANVAS_TOP) {
+            // Right button erases (paints background colour 0).
+            gfx_fill_rect(px - BRUSH, py - BRUSH, BRUSH * 2 + 1, BRUSH * 2 + 1, 0);
+        }
+
+        // Move cursor to its new spot and redraw it on top of everything.
+        px = nx; py = ny;
+        cursor_save(px, py);
+        cursor_draw(px, py);
+
+        pit_sleep(8);
+    }
+
+    gfx_set_text_mode();
 }

@@ -60,4 +60,8 @@ void gfx_mouse_demo(void);
 void gfx_char(int x, int y, char ch, unsigned char fg, int bg);
 void gfx_text(int x, int y, const char* s, unsigned char fg, int bg);
 
+// Interactive paint program: toolbar of colours + CLEAR/QUIT, canvas you
+// draw on with the left button (right button erases). Key or QUIT exits.
+void gfx_paint(void);
+
 #endif

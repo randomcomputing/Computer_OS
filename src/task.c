@@ -229,16 +229,26 @@ static task_t* pick_next(task_t* from) {
 }
 
 static void reap_zombies(void) {
-    while (zombie) {
-        task_t* z = zombie;
-        zombie = z->next;
-        // Run any per-task cleanup hook first (loaders use this to
-        // release user pages, file handles, etc.). Interrupts are off
-        // here — the hook should be quick and side-effect-free beyond
-        // freeing its own resources.
-        if (z->on_exit) z->on_exit(z);
-        if (z->stack_base) kfree((void*)z->stack_base);
-        kfree(z);
+    // Walk the zombie list, freeing only those whose status has been
+    // collected (reaped_by_parent). A zombie whose parent may still call
+    // wait() is left in place so its exit_code survives until read.
+    task_t* prev = 0;
+    task_t* z = zombie;
+    while (z) {
+        task_t* next = z->next;
+        if (z->reaped_by_parent) {
+            // Unlink z from the zombie list.
+            if (prev) prev->next = next;
+            else      zombie = next;
+
+            if (z->on_exit) z->on_exit(z);
+            if (z->stack_base) kfree((void*)z->stack_base);
+            kfree(z);
+            // prev stays the same; z is gone.
+        } else {
+            prev = z;
+        }
+        z = next;
     }
 }
 
@@ -272,12 +282,32 @@ void yield(void) {
 }
 
 void task_exit(void) {
+    task_exit_code(0);
+}
+
+void task_exit_code(int code) {
     __asm__ volatile ("cli");
 
+    current->exit_code = code;
+    current->has_exited = 1;
     current->state = TASK_DEAD;
     ready_remove(current);
 
-    // Push onto zombie list; the next task to yield will reap us.
+    // If a parent is blocked waiting on us, make it runnable again so it
+    // can collect our status. The actual status hand-off happens in
+    // sys_wait when the parent runs; here we just unblock it.
+    task_t* p = current->parent;
+    if (p && p->state == TASK_BLOCKED && p->wait_any) {
+        p->state = TASK_READY;
+    }
+
+    // If we have no parent that will ever wait on us (kernel threads,
+    // orphans), mark ourselves collectable so the reaper frees us. A
+    // task whose parent may still wait stays un-reaped until wait()
+    // reads its exit_code and sets reaped_by_parent.
+    if (!p) current->reaped_by_parent = 1;
+
+    // Push onto zombie list; the reaper frees us once reaped_by_parent.
     current->next = zombie;
     zombie = current;
 
@@ -287,7 +317,16 @@ void task_exit(void) {
     }
 
     task_t* next = ready;
-    while (next->state == TASK_DEAD) next = next->next;
+    while (next->state == TASK_DEAD || next->state == TASK_BLOCKED) {
+        next = next->next;
+        if (next == ready) {
+            // Everyone left is blocked/dead. Nothing to run — idle until
+            // an interrupt (e.g. keyboard) wakes someone. This shouldn't
+            // normally happen because the shell is always runnable.
+            __asm__ volatile ("sti");
+            for (;;) __asm__ volatile ("hlt");
+        }
+    }
     next->state = TASK_RUNNING;
 
     current = next;
@@ -344,7 +383,8 @@ void task_list_print(void) {
     task_t* p = ready;
     do {
         const char* s = (p->state == TASK_RUNNING) ? "RUN " :
-                        (p->state == TASK_READY)   ? "ready" : "dead ";
+                        (p->state == TASK_READY)   ? "ready" :
+                        (p->state == TASK_BLOCKED) ? "block" : "dead ";
         printf("  %d   %s   %s%s\n",
                p->id, s, p->name, (p == current) ? "  *" : "");
         p = p->next;

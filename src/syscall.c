@@ -89,8 +89,7 @@ void syscall_handler(struct registers* regs) {
 
     switch (num) {
         case SYS_EXIT:
-            (void)a1;
-            task_exit();
+            task_exit_code((int)a1);
             for (;;) __asm__ volatile ("hlt");
 
         case SYS_WRITE:

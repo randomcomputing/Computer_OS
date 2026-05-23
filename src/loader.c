@@ -45,8 +45,6 @@ typedef struct {
     unsigned int  pd_phys;          // saved so sbrk can map without re-deriving
 } user_resources_t;
 
-static volatile int busy = 0;
-
 // Forward decl — used by both elf_load/flat_load and loader_sbrk.
 static int record_page(user_resources_t* r, unsigned int virt, unsigned int phys);
 
@@ -87,7 +85,6 @@ static void on_user_exit(task_t* t) {
         vmm_free_user_pd(t->pd_phys);
         t->pd_phys = 0;
     }
-    busy = 0;
 }
 
 // =====================================================================
@@ -281,14 +278,7 @@ static unsigned int flat_load(const unsigned char* buf, int filesz,
 // Public API
 // =====================================================================
 
-int loader_is_busy(void) { return busy; }
-
 int loader_run(const char* path) {
-    if (busy) {
-        printf("loader: another program is still running\n");
-        return -1;
-    }
-
     unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
     if (!buf) { printf("loader: out of kernel heap\n"); return -1; }
 
@@ -349,11 +339,8 @@ int loader_run(const char* path) {
         return -1;
     }
 
-    busy = 1;
-
     int id = task_spawn_user(entry, LOADER_STACK_TOP, pd_phys, path);
     if (id < 0) {
-        busy = 0;
         printf("loader: task_spawn_user failed\n");
         release_resources(r);
         kfree(r);
@@ -368,6 +355,7 @@ int loader_run(const char* path) {
     }
     t->user_data = r;
     t->on_exit   = on_user_exit;
+    t->parent    = task_current();
 
     return id;
 }

@@ -15,6 +15,7 @@
 #include "rtc.h"
 #include "loader.h"
 #include "editor.h"
+#include "gfx.h"
 
 #define LINE_MAX 128
 
@@ -31,6 +32,8 @@ static const char* commands[] = {
     "cd", "pwd",
     "history", "date", "time", "tz",
     "user", "run", "edit", "reboot", "shutdown",
+    "gfx",
+    "gfxmouse",
     0
 };
 
@@ -1003,15 +1006,23 @@ static void cmd_run(const char* args) {
 
     printf("[run] %s started as task %d\n", args, id);
 
-    // Block the shell until the program is fully cleaned up. We poll on
-    // loader_is_busy() rather than task state because the busy flag is
-    // cleared by the reaper's on_exit hook — and that hook runs from a
-    // *different* task's yield(). If we polled task state and exited the
-    // loop the moment we saw TASK_DEAD, the reaper might not have run
-    // yet, leaving the loader thinking a program is still loaded and
-    // refusing the next `run`.
-    while (loader_is_busy()) yield();
-    printf("[run] %s finished\n", args);
+    // Block the shell until the program finishes. We poll the specific
+    // task id: once the task has exited we collect it (mark its zombie
+    // collectable so the reaper frees it) and stop. yield() drives the
+    // scheduler so the user task actually gets to run.
+    extern task_t* task_find_by_id(int id);
+    int code = 0;
+    for (;;) {
+        task_t* t = task_find_by_id(id);
+        if (!t) break;                 // already gone (e.g. orphan-reaped)
+        if (t->has_exited) {
+            code = t->exit_code;
+            t->reaped_by_parent = 1;   // let the reaper free it
+            break;
+        }
+        yield();
+    }
+    printf("[run] %s finished (exit %d)\n", args, code);
     (void)id;
 }
 
@@ -1131,6 +1142,45 @@ static const char* split_args(char* line) {
     return line;
 }
 
+// ---- graphics demo ----------------------------------------------------
+// Switch into VGA mode 13h (320x200x256), prove we can address the
+// framebuffer, then restore text mode so the shell keeps working.
+static void cmd_gfx(void) {
+    gfx_init();                       // enter graphics mode, screen -> black
+
+    // One bright-white pixel dead centre. This is the actual "get a pixel
+    // to display" goal — everything else here is just so it's easy to see.
+    gfx_putpixel(GFX_WIDTH / 2, GFX_HEIGHT / 2, 15);
+
+    // A small red square near the top-left, to confirm the row-major
+    // framebuffer math (y*width + x) is right and not mirrored/skewed.
+    gfx_fill_rect(20, 20, 16, 16, 4);
+
+    // A line drawn with the real Bresenham routine — any slope, not just
+    // the 45-degree special case we hand-rolled before.
+    gfx_line(50, 50, 260, 150, 2);
+
+    // Text rendered from the VGA bitmap font, in graphics mode.
+    gfx_text(70, 170, "Graphics Mode Test", 15, -1);
+    gfx_text(70, 186, "0123456789 +-*/= () {}", 14, -1);
+
+    // Block until a key is pressed, then go back to text mode. We can't
+    // printf to the screen here (we're in graphics mode), so we just wait.
+    (void)keyboard_getchar();
+
+    gfx_set_text_mode();
+    vga_clear();
+    printf("Back in text mode. Drew a centre pixel + red square + green line.\n");
+}
+
+static void cmd_gfxmouse(void) {
+    printf("Entering graphics mode. Move the mouse, hold left button to\n");
+    printf("paint, press any key to exit.\n");
+    gfx_mouse_demo();                 // blocks until a key is pressed
+    vga_clear();
+    printf("Back in text mode.\n");
+}
+
 static void execute(char* line) {
     while (*line == ' ') line++;
     if (*line == '\0') return;
@@ -1172,6 +1222,8 @@ static void execute(char* line) {
     else if (strcmp(line, "user")     == 0) cmd_user();
     else if (strcmp(line, "run")      == 0) cmd_run(args);
     else if (strcmp(line, "edit")     == 0) cmd_edit(args);
+    else if (strcmp(line, "gfx")      == 0) cmd_gfx();
+    else if (strcmp(line, "gfxmouse") == 0) cmd_gfxmouse();
     else if (strcmp(line, "reboot")   == 0) cmd_reboot();
     else if (strcmp(line, "shutdown") == 0) cmd_shutdown();
     else {

@@ -44,6 +44,7 @@ USERPROG_O   = userprog.o
 LOADER_O     = loader.o
 EDITOR_O     = editor.o
 RTC_O        = rtc.o
+GFX_O        = gfx.o
 DISK_IMG     = disk.img
 UACCESS_O    = uaccess.o
 
@@ -57,7 +58,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(PRINTF_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O)
+			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O)
 ISO_DIR = isodir
 
 all: $(ISO_FILE)
@@ -89,6 +90,10 @@ $(KERNEL_O): kernel.c include/vga.h include/printf.h include/idt.h include/pic.h
 $(VGA_O): src/vga.c include/vga.h include/io.h
 	@echo "Compiling VGA driver..."
 	$(CC) $(CFLAGS) src/vga.c -o $(VGA_O)
+
+$(GFX_O): src/gfx.c include/gfx.h include/io.h
+	@echo "Compiling graphics (mode 13h) driver..."
+	$(CC) $(CFLAGS) src/gfx.c -o $(GFX_O)
 
 $(PRINTF_O): src/printf.c include/printf.h include/vga.h include/serial.h
 	@echo "Compiling printf..."

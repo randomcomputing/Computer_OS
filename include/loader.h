@@ -15,8 +15,8 @@
 // and execution begins there.  Build with:
 //   nasm -f bin -o hello.bin hello.asm   # [ORG 0x01000000]
 //
-// One program at a time.  While a task is alive loader_run() returns -1.
-// The reaper's on_exit hook unmaps all user pages and frees their frames.
+// Multiple programs may be alive at once.  The reaper's on_exit hook
+// unmaps all user pages and frees their frames when each task exits.
 
 // Where user code is mapped. Must match the program's link/ORG address.
 #define LOADER_CODE_VIRT  0x01000000
@@ -46,11 +46,10 @@
 
 // Read `path` from FAT12 and run it as a ring-3 program.
 // Returns the new task id on success, or -1 on any failure
-// (file missing, too big, out of memory, another program running).
+// (file missing, too big, out of memory). Multiple user programs may
+// be alive at once (e.g. a parent that forked a child); the caller
+// waits on the returned task id to know when it has finished.
 int loader_run(const char* path);
-
-// Is a loaded program currently running?
-int loader_is_busy(void);
 
 // SYS_SBRK backend: extend the calling task's user heap by `delta` bytes.
 // Returns the OLD break on success, or -1 on any failure (no heap, would

@@ -20,6 +20,7 @@ typedef void (*task_entry_fn)(void);
 typedef enum {
     TASK_READY = 0,
     TASK_RUNNING,
+    TASK_BLOCKED,   // waiting on a child (sys_wait); not schedulable until woken
     TASK_DEAD,
 } task_state_t;
 
@@ -36,6 +37,27 @@ typedef struct task {
     task_state_t  state;
     int           is_user;      // 1 if this task runs in ring 3
     char          name[16];
+
+    // --- process hierarchy + exit status (sys_fork / sys_wait) --------
+    // parent      : task that forked/spawned us, or NULL. A parent
+    //               blocked in sys_wait is woken when one of its
+    //               children exits.
+    // exit_code   : value passed to sys_exit, valid once has_exited==1.
+    // has_exited  : set by task_exit before the task becomes a zombie,
+    //               so a parent calling wait *after* the child died can
+    //               still collect the status (we stash it on the PCB and
+    //               defer reaping until the parent has read it).
+    // wait_any    : set while this task is blocked in sys_wait, meaning
+    //               "wake me when any child exits".
+    // reaped_by_parent : 1 once a parent has collected this zombie's
+    //               status (or the task had no parent); the reaper only
+    //               frees a zombie once this is set, so status survives
+    //               until wait() reads it.
+    struct task*  parent;
+    int           exit_code;
+    int           has_exited;
+    int           wait_any;
+    int           reaped_by_parent;
 
     // Optional cleanup hook. Called by the reaper just before the task
     // struct itself is freed. Useful for loaders that need to release
@@ -70,6 +92,9 @@ int  task_spawn_user(unsigned int user_eip, unsigned int user_esp,
 
 void yield(void);
 void task_exit(void);
+// Exit with an explicit status code (used by SYS_EXIT). task_exit() is
+// equivalent to task_exit_code(0).
+void task_exit_code(int code);
 void tasking_enable_preemption(void);
 
 // Called from the PIT IRQ. No-op until preemption is enabled.

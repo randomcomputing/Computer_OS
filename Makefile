@@ -37,6 +37,8 @@ TASK_O       = task.o
 TASK_ASM_O   = task_switch.o
 ATA_O        = ata.o
 FAT12_O      = fat12.o
+VFS_O        = vfs.o
+RAMFS_O      = ramfs.o
 GDT_O        = gdt.o
 SYSCALL_O    = syscall.o
 SYSCALL_ASM_O = syscall_asm.o
@@ -56,7 +58,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(PRINTF_O) \
               $(PIC_O) $(IRQ_O) $(IRQ_ASM_O) $(KEYBOARD_O) $(MOUSE_O) \
               $(STRING_O) $(SHELL_O) $(PIT_O) $(SERIAL_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
-              $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) \
+              $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
 			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O)
 ISO_DIR = isodir
@@ -202,6 +204,14 @@ $(ATA_O): src/ata.c include/ata.h include/io.h include/printf.h
 $(FAT12_O): src/fat12.c include/fat12.h include/ata.h include/string.h include/kheap.h include/printf.h
 	@echo "Compiling FAT12 driver..."
 	$(CC) $(CFLAGS) src/fat12.c -o $(FAT12_O)
+
+$(VFS_O): src/vfs.c include/vfs.h include/fat12.h
+	@echo "Compiling VFS layer..."
+	$(CC) $(CFLAGS) src/vfs.c -o $(VFS_O)
+
+$(RAMFS_O): src/ramfs.c include/ramfs.h include/vfs.h
+	@echo "Compiling ramfs..."
+	$(CC) $(CFLAGS) src/ramfs.c -o $(RAMFS_O)
 
 $(KERNEL_BIN): $(KERNEL_OBJS) linker.ld
 	@echo "Linking kernel..."

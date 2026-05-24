@@ -14,6 +14,8 @@
 #include "task.h"
 #include "ata.h"
 #include "fat12.h"
+#include "vfs.h"
+#include "ramfs.h"
 #include "gdt.h"
 #include "syscall.h"
 
@@ -90,7 +92,21 @@ void kmain(void) {
     if (ata_init()) {
         printf("[OK] ATA primary master detected\n");
         if (fat12_mount() == 0) {
-            printf("[OK] FAT12 mounted\n");
+            // Bring up the VFS and mount FAT12 as the root filesystem.
+            // From here on, the rest of the kernel talks to vfs_* instead
+            // of fat12_* directly.
+            vfs_init();
+            if (vfs_mount("/", fat12_vfs_ops(), "fat12") == 0) {
+                printf("[OK] FAT12 mounted at / via VFS\n");
+            } else {
+                printf("[..] VFS mount table full\n");
+            }
+            // Mount an in-memory filesystem at /tmp to demonstrate the VFS
+            // hosting two filesystems at once. Contents vanish on reboot.
+            ramfs_init();
+            if (vfs_mount("/tmp", ramfs_vfs_ops(), "ramfs") == 0) {
+                printf("[OK] ramfs mounted at /tmp\n");
+            }
         } else {
             printf("[..] No FAT12 filesystem found\n");
         }

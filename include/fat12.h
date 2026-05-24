@@ -108,4 +108,9 @@ int fat12_rmdir(const char* path);
 int fat12_cp(const char* src, const char* dst);
 int fat12_mv(const char* src, const char* dst);
 
+
+// ---- VFS adapters (path-based wrappers used by the VFS layer) ----------
+int fat12_vfs_list(const char* path, fat12_dirent_t* out, int max);
+int fat12_vfs_is_dir(const char* path);
+
 #endif

@@ -1,6 +1,6 @@
 #include "loader.h"
 #include "elf.h"
-#include "fat12.h"
+#include "vfs.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "task.h"
@@ -282,7 +282,7 @@ int loader_run(const char* path) {
     unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
     if (!buf) { printf("loader: out of kernel heap\n"); return -1; }
 
-    int n = fat12_read_file(path, buf, LOADER_CODE_BYTES);
+    int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
     if (n < 0) {
         printf("loader: %s: not found\n", path);
         kfree(buf);

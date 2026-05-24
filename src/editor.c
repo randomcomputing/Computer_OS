@@ -28,7 +28,7 @@
 #include "kheap.h"
 #include "string.h"
 #include "printf.h"
-#include "fat12.h"
+#include "vfs.h"
 
 // ---- screen layout -----------------------------------------------------
 // Row 0       = title bar
@@ -373,7 +373,7 @@ static int load_file(const char* p) {
         while (cap < try_cap) {
             if (grow() < 0) return -1;
         }
-        int got = fat12_read_file(p, buf, cap);
+        int got = vfs_read_file(p, buf, cap);
         if (got < 0) return -1;
         // If we filled the whole buffer the file might be larger — try
         // again with a bigger one. Otherwise we got everything.
@@ -400,7 +400,7 @@ static int save_file(const char* p) {
     if (!tmp) return -1;
     memcpy(tmp,             buf,           gap_start);
     memcpy(tmp + gap_start, buf + gap_end, n - gap_start);
-    int rc = fat12_write_file(p, tmp, n);
+    int rc = vfs_write_file(p, tmp, n);
     kfree(tmp);
     return rc < 0 ? -1 : 0;
 }

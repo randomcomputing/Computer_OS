@@ -451,7 +451,6 @@ void gfx_text(int x, int y, const char* s, unsigned char fg, int bg) {
 }
 
 // --- paint program -----------------------------------------------------
-// A self-contained MS-Paint-style toy. Layout:
 //
 //   row 0..TOOLBAR_H : toolbar — 16 colour swatches, a CLEAR box, a QUIT
 //                      box, and a swatch showing the current colour.

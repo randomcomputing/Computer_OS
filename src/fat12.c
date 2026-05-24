@@ -1245,3 +1245,23 @@ int fat12_mv(const char* src, const char* dst) {
     if (fat12_flush_fat() < 0) return -1;
     return 0;
 }
+
+// ---- VFS adapters ------------------------------------------------------
+// Path-based wrappers so the VFS can treat FAT12 through a uniform,
+// cluster-free interface. These use only the public fat12_* API. The VFS
+// always passes absolute paths (rooted at this mount), which FAT12 resolves
+// from its root independent of its internal cwd.
+
+// List a directory given by path. Returns entry count or -1.
+int fat12_vfs_list(const char* path, fat12_dirent_t* out, int max) {
+    unsigned int dir;
+    if (fat12_resolve_dir(path, &dir) < 0) return -1;
+    return fat12_list_dir(dir, out, max);
+}
+
+// Return 1 if `path` names a directory, else 0. fat12_resolve_dir succeeds
+// only for directories, so this is a direct test.
+int fat12_vfs_is_dir(const char* path) {
+    unsigned int dir;
+    return (fat12_resolve_dir(path, &dir) == 0) ? 1 : 0;
+}

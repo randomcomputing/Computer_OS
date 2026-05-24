@@ -9,7 +9,7 @@
 #include "vmm.h"
 #include "kheap.h"
 #include "task.h"
-#include "fat12.h"
+#include "vfs.h"
 #include "io.h"
 #include "userprog.h"
 #include "rtc.h"
@@ -29,7 +29,7 @@ static const char* commands[] = {
     "meminfo", "pmemstat", "palloc", "vmap", "kmstat", "kmtest",
     "ps", "spawn", "yield", "preempt",
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
-    "cd", "pwd",
+    "cd", "pwd", "mount",
     "history", "date", "time", "tz",
     "user", "run", "edit", "reboot", "shutdown",
     "gfx",
@@ -179,9 +179,9 @@ static void print_command_matches(const char* prefix) {
     if (col > 0) printf("\n");
 }
 
-static void print_dir_matches(unsigned int dir, const char* prefix) {
-    fat12_dirent_t entries[64];
-    int n = fat12_list_dir(dir, entries, 64);
+static void print_dir_matches(const char* dirpath, const char* prefix) {
+    vfs_dirent_t entries[64];
+    int n = vfs_list(dirpath, entries, 64);
     if (n <= 0) return;
     int col = 0;
     for (int i = 0; i < n; i++) {
@@ -204,9 +204,9 @@ static void print_dir_matches(unsigned int dir, const char* prefix) {
 // Walk the directory and find matches against `prefix`. We don't keep
 // the list — for unique completion we only need the LCP and one sample.
 // The caller separately calls print_dir_matches() if there are multiple.
-static int match_dir(unsigned int dir, const char* prefix, match_result_t* m) {
-    fat12_dirent_t entries[64];
-    int n = fat12_list_dir(dir, entries, 64);
+static int match_dir(const char* dirpath, const char* prefix, match_result_t* m) {
+    vfs_dirent_t entries[64];
+    int n = vfs_list(dirpath, entries, 64);
     if (n < 0) return -1;
     for (int i = 0; i < n; i++) {
         if (entries[i].name[0] == '.' &&
@@ -380,7 +380,7 @@ static void handle_tab(char* buf, int max_line,
 
     char dirpath[128];
     char base[64];
-    unsigned int dir_cluster = fat12_cwd();
+    dirpath[0] = '\0';   // empty = current working directory
 
     if (completing_command) {
         // No "/" handling for command names — they're flat.
@@ -389,10 +389,9 @@ static void handle_tab(char* buf, int max_line,
         // Filename completion: split on the last '/'.
         if (split_partial_path(word, dirpath, sizeof(dirpath),
                                base, sizeof(base)) < 0) return;
-        if (dirpath[0] != '\0') {
-            if (fat12_resolve_dir(dirpath, &dir_cluster) < 0) return;
-        }
-        match_dir(dir_cluster, base, &m);
+        // dirpath now holds the directory portion ("" means cwd). The VFS
+        // resolves it itself, so we just pass the path down.
+        match_dir(dirpath, base, &m);
     }
 
     if (m.count == 0) {
@@ -475,7 +474,7 @@ static void handle_tab(char* buf, int max_line,
         vga_set_cursor(*anchor_row, *anchor_col + *len);
         printf("\n");
         if (completing_command) print_command_matches(word);
-        else                    print_dir_matches(dir_cluster, base);
+        else                    print_dir_matches(dirpath, base);
         // Reprint prompt; this becomes our new anchor.
         print_prompt(anchor_row, anchor_col);
         // Re-draw the line at the new anchor (treat prev_len = 0 since
@@ -745,20 +744,26 @@ static void cmd_kmtest(void) {
 
 // ---- filesystem commands ---------------------------------------------
 
+static void cmd_mount(void) {
+    int shown = 0;
+    for (int i = 0; ; i++) {
+        const vfs_mount_t* m = vfs_mount_at(i);
+        if (i >= 8) break;
+        if (!m) continue;
+        printf("  %-8s on %s\n", m->name, m->prefix);
+        shown++;
+    }
+    if (!shown) printf("(no filesystems mounted)\n");
+}
+
 static void cmd_ls(const char* args) {
     while (*args == ' ') args++;
-    unsigned int dir;
-    if (*args == '\0') {
-        dir = fat12_cwd();
-    } else if (fat12_resolve_dir(args, &dir) < 0) {
-        printf("ls: %s: not a directory\n", args);
-        return;
-    }
 
-    fat12_dirent_t entries[64];
-    int n = fat12_list_dir(dir, entries, 64);
+    vfs_dirent_t entries[64];
+    // vfs_list("") lists the cwd; otherwise it lists the given path.
+    int n = vfs_list(args, entries, 64);
     if (n < 0) {
-        printf("ls: no filesystem mounted\n");
+        printf("ls: %s: not a directory\n", (*args ? args : "."));
         return;
     }
     if (n == 0) {
@@ -779,7 +784,7 @@ static void cmd_cat(const char* args) {
     char* buf = (char*)kmalloc(CAT_MAX);
     if (!buf) { printf("cat: out of memory\n"); return; }
 
-    int n = fat12_read_file(args, buf, CAT_MAX);
+    int n = vfs_read_file(args, buf, CAT_MAX);
     if (n < 0) {
         printf("cat: %s: not found\n", args);
         kfree(buf);
@@ -817,7 +822,7 @@ static void cmd_write(const char* args) {
     for (unsigned int i = 0; i < len; i++) buf[i] = text[i];
     buf[len] = '\n';
 
-    int n = fat12_write_file(fname, buf, len + 1);
+    int n = vfs_write_file(fname, buf, len + 1);
     kfree(buf);
     if (n < 0) {
         printf("write: %s: failed (disk full, bad name, or read-only)\n", fname);
@@ -829,7 +834,7 @@ static void cmd_write(const char* args) {
 static void cmd_rm(const char* args) {
     while (*args == ' ') args++;
     if (*args == '\0') { printf("usage: rm <file>\n"); return; }
-    if (fat12_delete_file(args) < 0) {
+    if (vfs_delete_file(args) < 0) {
         printf("rm: %s: not found or cannot delete\n", args);
         return;
     }
@@ -855,7 +860,7 @@ static void cmd_cp(const char* args) {
     if (src[0] == '\0' || dst[0] == '\0') {
         printf("usage: cp <src> <dst>\n"); return;
     }
-    if (fat12_cp(src, dst) < 0) {
+    if (vfs_cp(src, dst) < 0) {
         printf("cp: failed (missing source, read-only target, or out of space)\n");
         return;
     }
@@ -869,7 +874,7 @@ static void cmd_mv(const char* args) {
     if (src[0] == '\0' || dst[0] == '\0') {
         printf("usage: mv <src> <dst>\n"); return;
     }
-    if (fat12_mv(src, dst) < 0) {
+    if (vfs_mv(src, dst) < 0) {
         printf("mv: failed (missing source, target exists, or invalid path)\n");
         return;
     }
@@ -879,7 +884,7 @@ static void cmd_mv(const char* args) {
 static void cmd_mkdir(const char* args) {
     while (*args == ' ') args++;
     if (*args == '\0') { printf("usage: mkdir <path>\n"); return; }
-    if (fat12_mkdir(args) < 0) {
+    if (vfs_mkdir(args) < 0) {
         printf("mkdir: %s: failed (already exists, parent missing, or out of space)\n", args);
         return;
     }
@@ -889,7 +894,7 @@ static void cmd_mkdir(const char* args) {
 static void cmd_rmdir(const char* args) {
     while (*args == ' ') args++;
     if (*args == '\0') { printf("usage: rmdir <path>\n"); return; }
-    if (fat12_rmdir(args) < 0) {
+    if (vfs_rmdir(args) < 0) {
         printf("rmdir: %s: failed (not a directory, not empty, or in use)\n", args);
         return;
     }
@@ -899,14 +904,14 @@ static void cmd_rmdir(const char* args) {
 static void cmd_cd(const char* args) {
     while (*args == ' ') args++;
     const char* target = (*args == '\0') ? "/" : args;
-    if (fat12_chdir(target) < 0) {
+    if (vfs_chdir(target) < 0) {
         printf("cd: %s: not a directory\n", target);
     }
 }
 
 static void cmd_pwd(void) {
     char buf[128];
-    int n = fat12_getcwd(buf, sizeof(buf));
+    int n = vfs_getcwd(buf, sizeof(buf));
     if (n < 0) printf("pwd: error\n");
     else       printf("%s\n", buf);
 }
@@ -1224,6 +1229,7 @@ static void execute(char* line) {
     else if (strcmp(line, "rmdir")    == 0) cmd_rmdir(args);
     else if (strcmp(line, "cd")       == 0) cmd_cd(args);
     else if (strcmp(line, "pwd")      == 0) cmd_pwd();
+    else if (strcmp(line, "mount")    == 0) cmd_mount();
     else if (strcmp(line, "history")  == 0) cmd_history();
     else if (strcmp(line, "date")     == 0) cmd_date();
     else if (strcmp(line, "time")     == 0) cmd_date();

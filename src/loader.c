@@ -7,6 +7,7 @@
 #include "kheap.h"
 #include "string.h"
 #include "printf.h"
+#include "isr.h"
 
 // =====================================================================
 // Per-task user resource tracking
@@ -408,4 +409,236 @@ int loader_sbrk(int delta) {
 
     r->heap_brk = new_brk;
     return (int)old_brk;
+}
+
+// =====================================================================
+// fork()
+//
+// Clone the calling user task into a brand-new address space. We walk
+// the parent's resource tracker (which records every page the loader or
+// sbrk mapped: code, data, heap, stack), and for each one:
+//   - allocate a fresh physical frame
+//   - copy the parent's page contents into it (both frames are in the
+//     identity-mapped low region, so we copy physical->physical with no
+//     CR3 switch)
+//   - map it into the child PD at the same virtual address with the
+//     parent's exact flags
+//   - record it in the child's tracker so it's freed on the child's exit
+//
+// Then we spawn the child via task_clone_user, handing it the syscall
+// register frame with eax forced to 0. The parent gets the child's pid.
+// =====================================================================
+
+static int clone_resources(user_resources_t* dst, user_resources_t* src,
+                           unsigned int child_pd) {
+    // Copy heap bookkeeping verbatim — the actual heap pages are copied
+    // below along with everything else in the page list.
+    dst->heap_base = src->heap_base;
+    dst->heap_brk  = src->heap_brk;
+    dst->heap_max  = src->heap_max;
+    dst->pd_phys   = child_pd;
+    dst->head      = 0;
+    dst->total_pages = 0;
+
+    for (page_block_t* b = src->head; b; b = b->next) {
+        for (int i = 0; i < b->used; i++) {
+            unsigned int virt = b->pages[i].virt;
+
+            // Get the parent's PTE so we replicate its flags exactly.
+            unsigned int pte = vmm_resolve_pd_flags(src->pd_phys, virt);
+            if (!pte) continue;                 // stale entry; skip
+            unsigned int parent_phys = pte & 0xFFFFF000;
+            unsigned int flags       = pte & 0xFFF;
+
+            unsigned int frame = pmm_alloc();
+            if (!frame) {
+                printf("fork: out of physical memory\n");
+                return -1;
+            }
+            // Copy page contents physical->physical (identity-mapped).
+            memcpy((void*)frame, (void*)parent_phys, 4096);
+
+            if (!vmm_map_pd(child_pd, virt, frame, flags)) {
+                pmm_free(frame);
+                printf("fork: vmm_map_pd failed at 0x%x\n", virt);
+                return -1;
+            }
+            if (record_page(dst, virt, frame) != 0) {
+                vmm_unmap_pd(child_pd, virt);
+                pmm_free(frame);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int loader_fork(struct registers* frame) {
+    task_t* parent = task_current();
+    if (!parent || !parent->is_user || !parent->user_data) {
+        printf("fork: caller is not a user task\n");
+        return -1;
+    }
+    user_resources_t* pr = (user_resources_t*)parent->user_data;
+
+    // 1. Fresh address space for the child.
+    unsigned int child_pd = vmm_create_user_pd();
+    if (!child_pd) { printf("fork: cannot create child PD\n"); return -1; }
+
+    // 2. Child resource tracker.
+    user_resources_t* cr = (user_resources_t*)kmalloc(sizeof(*cr));
+    if (!cr) { vmm_free_user_pd(child_pd); return -1; }
+    memset(cr, 0, sizeof(*cr));
+
+    // 3. Deep-copy every parent page into the child.
+    if (clone_resources(cr, pr, child_pd) != 0) {
+        release_resources(cr);
+        kfree(cr);
+        vmm_free_user_pd(child_pd);
+        return -1;
+    }
+
+    // 4. Build the child's resume frame: identical to the parent's trap
+    //    frame, but with eax = 0 so fork() returns 0 in the child. We
+    //    pass the parent's frame to task_clone_user, which copies it onto
+    //    the child's kernel stack; tweak a local copy's eax first.
+    struct registers child_frame_storage;
+    // struct registers is 14 words; the cross-ring useresp/ss live just
+    // past it in the same contiguous block the asm stub built. Copy all
+    // 16 words so the child can iret across rings.
+    for (int i = 0; i < 16; i++)
+        ((unsigned int*)&child_frame_storage)[i] = ((unsigned int*)frame)[i];
+    child_frame_storage.eax = 0;   // child sees fork() == 0
+
+    int cid = task_clone_user(&child_frame_storage, child_pd, parent->name);
+    if (cid < 0) {
+        release_resources(cr);
+        kfree(cr);
+        vmm_free_user_pd(child_pd);
+        return -1;
+    }
+
+    // 5. Wire up the child's PCB: resource tracker, cleanup hook, parent.
+    task_t* child = task_find_by_id(cid);
+    if (!child) {
+        // Extremely unlikely (we just created it). Leak-safe: the reaper
+        // will free the task; resources are already attached below only
+        // if we found it, so free them here.
+        release_resources(cr);
+        kfree(cr);
+        return cid;
+    }
+    child->user_data = cr;
+    child->on_exit   = on_user_exit;
+    child->parent    = parent;
+
+    // Parent's return value: the child's pid.
+    return cid;
+}
+
+// =====================================================================
+// exec()
+//
+// Replace the calling task's program image in place. We load the new
+// program into a *fresh* PD, and only once that has fully succeeded do
+// we tear down the old address space and switch the live task over to
+// the new one. This keeps exec atomic-ish: a failure to load the new
+// image leaves the caller's current program intact and running.
+//
+// On success we rewrite `frame` so that when the syscall stub iret's, it
+// lands at the new program's entry point on a fresh user stack. We also
+// swap the task's pd_phys / user_data and reload CR3, because the rest
+// of this syscall (and the iret) execute with the *current* CR3 — which
+// must become the new address space before we return to ring 3.
+// =====================================================================
+
+int loader_exec(const char* path, struct registers* frame) {
+    task_t* t = task_current();
+    if (!t || !t->is_user || !t->user_data) {
+        printf("exec: caller is not a user task\n");
+        return -1;
+    }
+
+    // --- Load the new image into a fresh PD (don't touch the old one) --
+    unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
+    if (!buf) { printf("exec: out of kernel heap\n"); return -1; }
+
+    int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
+    if (n <= 0) {
+        printf("exec: %s: not found\n", path);
+        kfree(buf);
+        return -1;
+    }
+
+    unsigned int new_pd = vmm_create_user_pd();
+    if (!new_pd) { kfree(buf); return -1; }
+
+    user_resources_t* nr = (user_resources_t*)kmalloc(sizeof(*nr));
+    if (!nr) { vmm_free_user_pd(new_pd); kfree(buf); return -1; }
+    memset(nr, 0, sizeof(*nr));
+    nr->pd_phys   = new_pd;
+    nr->heap_base = LOADER_HEAP_BASE;
+    nr->heap_brk  = LOADER_HEAP_BASE;
+    nr->heap_max  = LOADER_HEAP_BASE + LOADER_HEAP_MAX;
+
+    unsigned int entry;
+    if (elf32_valid(buf, n)) entry = elf_load(buf, n, nr, new_pd);
+    else                     entry = flat_load(buf, n, nr, new_pd);
+    kfree(buf);
+
+    if (!entry) {
+        release_resources(nr);
+        kfree(nr);
+        vmm_free_user_pd(new_pd);
+        return -1;
+    }
+
+    // New user stack.
+    if (!alloc_user_page(LOADER_STACK_PAGE,
+                         VMM_PRESENT | VMM_WRITE | VMM_USER, nr, new_pd)) {
+        release_resources(nr);
+        kfree(nr);
+        vmm_free_user_pd(new_pd);
+        return -1;
+    }
+
+    // --- Commit: swap the live task onto the new address space ---------
+    // Free the OLD resources + PD. We're currently running on the old
+    // CR3, but the kernel half is identical across all user PDs and the
+    // identity-mapped low region (where page tables live) is shared, so
+    // it's safe to free the old user pages and switch CR3 right after.
+    user_resources_t* old = (user_resources_t*)t->user_data;
+    unsigned int old_pd = t->pd_phys;
+
+    t->pd_phys   = new_pd;
+    t->user_data = nr;
+    // on_exit stays on_user_exit (already set when the task was created).
+
+    // Switch CR3 to the new address space so the upcoming iret resolves
+    // the new program's pages.
+    vmm_switch_pd(new_pd);
+
+    // Now that we're off the old PD, release it.
+    if (old) {
+        release_resources(old);
+        kfree(old);
+    }
+    if (old_pd) vmm_free_user_pd(old_pd);
+
+    // --- Rewrite the trap frame to enter the new program --------------
+    // Clean ring-3 state: entry point, fresh stack top, ring-3 segments,
+    // IF=1. Zero the GP regs the way a fresh process expects.
+    struct user_trap_frame* uf = (struct user_trap_frame*)frame;
+    uf->eip     = entry;
+    uf->cs      = 0x1B;            // ring-3 code
+    uf->eflags  = 0x202;          // IF=1, reserved bit
+    uf->useresp = LOADER_STACK_TOP;
+    uf->ss      = 0x23;           // ring-3 data
+    uf->ds      = 0x23;
+    uf->eax = uf->ebx = uf->ecx = uf->edx = 0;
+    uf->esi = uf->edi = uf->ebp = 0;
+
+    // The syscall stub will iret into the new program. Returning 0 here
+    // is irrelevant (eax is overwritten above), but keep it tidy.
+    return 0;
 }

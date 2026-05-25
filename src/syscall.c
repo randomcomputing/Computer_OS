@@ -119,6 +119,44 @@ void syscall_handler(struct registers* regs) {
             ret = 0;
             break;
 
+        case SYS_FORK:
+            // Clone the calling task. Parent gets the child pid; the
+            // child re-emerges from this same int 0x80 with eax==0,
+            // arranged by loader_fork via task_clone_user.
+            ret = loader_fork(regs);
+            break;
+
+        case SYS_EXEC: {
+            // Replace the current image with the program named by the
+            // user string in a1. On success loader_exec rewrites `regs`
+            // to enter the new program and the stub iret's there; the
+            // value we put in eax is overwritten in that case. On
+            // failure the old program keeps running and sees -1.
+            char path[64];
+            if (copy_from_user(path, (const char*)a1, sizeof(path)) != 0) {
+                ret = EFAULT;
+                break;
+            }
+            path[sizeof(path) - 1] = '\0';
+            ret = loader_exec(path, regs);
+            break;
+        }
+
+        case SYS_WAIT: {
+            // Block until a child exits; write its exit code to the user
+            // int* in a1 (if non-NULL) and return the child's pid.
+            int status = 0;
+            int pid = task_wait_child(&status);
+            if (pid >= 0 && a1 != 0) {
+                if (copy_to_user((void*)a1, &status, sizeof(int)) != 0) {
+                    ret = EFAULT;
+                    break;
+                }
+            }
+            ret = pid;
+            break;
+        }
+
         default:
             printf("[syscall] unknown number %u\n", num);
             ret = -1;

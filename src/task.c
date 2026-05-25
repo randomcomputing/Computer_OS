@@ -4,11 +4,13 @@
 #include "string.h"
 #include "gdt.h"
 #include "vmm.h"
+#include "isr.h"
 
 // Defined in task_switch.asm.
 extern void task_switch(unsigned int* old_esp_ptr, unsigned int new_esp);
 extern void task_trampoline(void);
 extern void enter_user_mode(unsigned int user_eip, unsigned int user_esp);
+extern void enter_user_resume(struct registers* frame);
 
 #define STACK_SIZE 8192   // 8 KB per task — plenty for our kernel threads
 
@@ -218,6 +220,68 @@ static void user_entry_shim(void) {
     for (;;) __asm__ volatile ("hlt");
 }
 
+// --------------------------------------------------------------------
+// Fork support: a child created by task_clone_user starts here on its
+// first scheduling. Unlike user_entry_shim (which dives to a fresh
+// entry point), this resumes from the complete register frame captured
+// at the parent's int 0x80, so the child re-emerges from fork() exactly
+// where the parent did — but with eax already set to 0 in its frame.
+// --------------------------------------------------------------------
+static void fork_resume_shim(void) {
+    task_t* t = current;
+    if (!t || !t->resume_frame) {
+        printf("[task] fork shim: no resume frame\n");
+        for (;;) __asm__ volatile ("hlt");
+    }
+    tss_set_kernel_stack(t->kstack_top);
+    enter_user_resume((struct registers*)t->resume_frame);
+    for (;;) __asm__ volatile ("hlt");   // never reached
+}
+
+// Number of 32-bit words in the cross-ring register frame we snapshot
+// for fork: struct registers (14 words) + useresp + ss = 16 words.
+#define FORK_FRAME_WORDS 16
+
+int task_clone_user(struct registers* frame, unsigned int pd_phys,
+                    const char* name) {
+    task_t* t = (task_t*)kmalloc(sizeof(task_t));
+    if (!t) return -1;
+
+    unsigned int base = (unsigned int)kmalloc(STACK_SIZE);
+    if (!base) { kfree(t); return -1; }
+
+    memset(t, 0, sizeof(*t));
+    t->stack_base = base;
+    t->stack_size = STACK_SIZE;
+    t->kstack_top = base + STACK_SIZE;
+    t->pd_phys    = pd_phys;
+    t->id         = next_id++;
+    t->state      = TASK_READY;
+    t->is_user    = 1;
+    name_copy(t->name, name ? name : "child", sizeof(t->name));
+
+    // Lay the saved register frame on the very top of the child's kernel
+    // stack so it lives as long as the task does, then build the normal
+    // task_switch bootstrap frame *below* it. fork_resume_shim reads the
+    // frame via t->resume_frame.
+    unsigned int sp = base + STACK_SIZE;
+    sp -= FORK_FRAME_WORDS * 4;
+    unsigned int* fcopy = (unsigned int*)sp;
+    for (int i = 0; i < FORK_FRAME_WORDS; i++)
+        fcopy[i] = ((unsigned int*)frame)[i];
+    t->resume_frame = (unsigned int)fcopy;
+
+    // Bootstrap frame so the first task_switch lands in task_trampoline,
+    // which calls fork_resume_shim.
+    t->esp = task_init_stack(sp, fork_resume_shim);
+
+    __asm__ volatile ("cli");
+    ready_insert(t);
+    __asm__ volatile ("sti");
+
+    return t->id;
+}
+
 // Pick the next runnable task after `from`. Skips DEAD entries.
 static task_t* pick_next(task_t* from) {
     task_t* p = from->next;
@@ -363,6 +427,73 @@ void scheduler_tick(void) {
 }
 
 task_t* task_current(void) { return current; }
+
+// --------------------------------------------------------------------
+// wait(): block until a child of `current` exits, collect it, return pid.
+//
+// A child that exits is moved to the zombie list by task_exit_code (and
+// removed from `ready`), with has_exited=1 and reaped_by_parent=0 while a
+// parent might still wait. So wait() must scan BOTH lists for our
+// children: a zombie that already died (collect immediately) or a live
+// child (sleep until it dies and wakes us).
+// --------------------------------------------------------------------
+
+// Does `current` have any child anywhere (ready list or zombie list)?
+static int has_any_child(void) {
+    if (ready) {
+        task_t* p = ready;
+        do {
+            if (p->parent == current && p != current) return 1;
+            p = p->next;
+        } while (p != ready);
+    }
+    for (task_t* z = zombie; z; z = z->next)
+        if (z->parent == current) return 1;
+    return 0;
+}
+
+// Find an already-exited, not-yet-collected child on the zombie list.
+static task_t* find_dead_child(void) {
+    for (task_t* z = zombie; z; z = z->next)
+        if (z->parent == current && z->has_exited && !z->reaped_by_parent)
+            return z;
+    return 0;
+}
+
+int task_wait_child(int* status) {
+    for (;;) {
+        __asm__ volatile ("cli");
+
+        // Already-dead child waiting to be collected?
+        task_t* z = find_dead_child();
+        if (z) {
+            int pid = z->id;
+            if (status) *status = z->exit_code;
+            z->reaped_by_parent = 1;   // let the reaper free it
+            __asm__ volatile ("sti");
+            return pid;
+        }
+
+        // No dead child yet. If we have no children at all, there's
+        // nothing to wait for — return -1 rather than block forever.
+        if (!has_any_child()) {
+            __asm__ volatile ("sti");
+            return -1;
+        }
+
+        // Block until a child exit wakes us. task_exit_code flips our
+        // state back to READY when one of our children dies.
+        current->wait_any = 1;
+        current->state    = TASK_BLOCKED;
+        __asm__ volatile ("sti");
+
+        // Give up the CPU. When we're scheduled again, loop and re-check.
+        yield();
+
+        current->wait_any = 0;
+        // loop back around to collect
+    }
+}
 
 // Look up a task by id. Returns NULL if no such task exists or if the
 // task has been reaped. Used by the shell to wait on a spawned task.

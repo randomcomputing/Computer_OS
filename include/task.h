@@ -31,6 +31,9 @@ typedef struct task {
     unsigned int  kstack_top;   // kernel stack top (used as tss.esp0 when user task runs)
     unsigned int  user_eip;     // initial ring-3 EIP (only meaningful if is_user)
     unsigned int  user_esp;     // initial ring-3 ESP (only meaningful if is_user)
+    unsigned int  resume_frame; // for forked children: addr of the saved
+                                // register frame to iret into on first run
+                                // (0 for fresh tasks that use user_eip/esp)
     unsigned int  pd_phys;      // physical addr of this task's page directory;
                                 // 0 means use the kernel PD (kernel tasks only)
     int           id;
@@ -90,8 +93,35 @@ int  task_spawn(task_entry_fn fn, const char* name);
 int  task_spawn_user(unsigned int user_eip, unsigned int user_esp,
                      unsigned int pd_phys, const char* name);
 
+// --- fork support -----------------------------------------------------
+// Create a child ring-3 task that, on its first scheduling, resumes in
+// ring 3 from a *complete* saved register frame rather than from a fresh
+// entry point. `frame` is a 16-field snapshot (struct registers plus the
+// cross-ring useresp/ss the CPU pushed) captured at the int 0x80 that
+// invoked fork; the caller will have set frame->eax = 0 so the child
+// sees 0 as fork's return value. `pd_phys` is the child's freshly built
+// address space. The child shares the parent's name with a tag.
+//
+// Returns the new task id, or -1 on allocation failure. The caller
+// (loader_fork) is responsible for populating pd_phys with a copy of the
+// parent's user pages and attaching user_data / on_exit / parent.
+struct registers;
+int  task_clone_user(struct registers* frame, unsigned int pd_phys,
+                     const char* name);
+
 void yield(void);
 void task_exit(void);
+
+// --- wait() support ---------------------------------------------------
+// Block the calling task until one of its children exits, then collect
+// that child: write its exit code through *status (if non-NULL, kernel
+// pointer), mark the zombie reapable, and return the child's pid.
+//
+// Returns -1 immediately if the caller has no children at all (nothing
+// to wait for). Otherwise it sleeps (TASK_BLOCKED) and is woken by
+// task_exit_code when a child dies. Designed to be called from the
+// SYS_WAIT handler in syscall.c.
+int  task_wait_child(int* status);
 // Exit with an explicit status code (used by SYS_EXIT). task_exit() is
 // equivalent to task_exit_code(0).
 void task_exit_code(int code);

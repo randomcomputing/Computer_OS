@@ -12,6 +12,9 @@
 #define SYS_YIELD     4
 #define SYS_SBRK      5
 #define SYS_SETCOLOR  6
+#define SYS_FORK      7
+#define SYS_EXEC      8
+#define SYS_WAIT      9
 
 // Install the int 0x80 IDT entry with DPL=3 so user code can invoke it.
 // Call this from kmain after idt_init().

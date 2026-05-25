@@ -22,6 +22,9 @@ typedef unsigned int size_t;
 #define SYS_YIELD     4
 #define SYS_SBRK      5
 #define SYS_SETCOLOR  6
+#define SYS_FORK      7
+#define SYS_EXEC      8
+#define SYS_WAIT      9
 
 // VGA color values (mirror of kernel's enum vga_color).
 #define COLOR_BLACK         0
@@ -105,6 +108,26 @@ static inline void set_color(int fg, int bg) {
 
 static inline void reset_color(void) {
     set_color(COLOR_WHITE, COLOR_BLACK);
+}
+
+// fork(): create a child process that is a copy of the caller. Returns
+// the child's pid in the parent, 0 in the child, or -1 on failure.
+static inline int fork(void) {
+    return _syscall0(SYS_FORK);
+}
+
+// exec(): replace the current process image with the program at `path`
+// (e.g. "ECHO.ELF"). On success it does not return — the new program
+// runs in place. On failure returns -1 and the caller keeps running.
+static inline int exec(const char* path) {
+    return _syscall1(SYS_EXEC, (int)path);
+}
+
+// wait(): block until a child exits. If `status` is non-NULL, the
+// child's exit code is stored there. Returns the exited child's pid, or
+// -1 if the caller has no children.
+static inline int wait(int* status) {
+    return _syscall1(SYS_WAIT, (int)status);
 }
 
 #endif

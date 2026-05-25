@@ -81,3 +81,60 @@ enter_user_mode:
     push 0x1B                ; user CS
     push eax                 ; user EIP
     iret
+
+
+; void enter_user_resume(struct registers* regs);
+;
+; Resume a ring-3 task from a *complete* saved register frame, rather
+; than from a fresh (eip, esp) pair. This is what a forked child uses:
+; the child must re-emerge from `int 0x80` at exactly the instruction
+; the parent did, with identical register state EXCEPT eax (which the
+; fork syscall sets to 0 in the child's copy of the frame before this
+; runs). enter_user_mode can't do that — it only knows an entry point.
+;
+; The `struct registers` layout (see include/isr.h) from low address up:
+;     ds, edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax,
+;     int_no, err_code, eip, cs, eflags, [useresp, ss]
+;
+; The last two (useresp, ss) are present because the original int 0x80
+; came from ring 3, so the CPU pushed them on the privilege change. The
+; fork path captures them too (the frame we're handed is 16 bytes longer
+; than a same-ring frame). We rebuild the exact iret frame by hand.
+;
+; We do NOT pusha/popa here; we load each register explicitly from the
+; struct so we have full control, then iret. Interrupts are off on entry
+; (the shim runs with cli) and come back on via the restored EFLAGS.
+global enter_user_resume
+enter_user_resume:
+    mov  eax, [esp + 4]      ; regs pointer (struct registers*)
+    mov  ebp, eax            ; keep base pointer to the struct in ebp
+
+    ; Reload ring-3 data segments. (The saved ds in the struct is the
+    ; user ds = 0x23; load it directly to be faithful.)
+    mov  bx, [ebp + 0]       ; regs->ds  (low 16 bits)
+    mov  ds, bx
+    mov  es, bx
+    mov  fs, bx
+    mov  gs, bx
+
+    ; Build the iret frame: ss, useresp, eflags, cs, eip (low addr last).
+    ; Offsets into struct registers:
+    ;   eip=44 cs=48 eflags=52 useresp=56 ss=60
+    push dword [ebp + 60]    ; user SS
+    push dword [ebp + 56]    ; user ESP (useresp)
+    push dword [ebp + 52]    ; EFLAGS (already has IF=1 from original trap)
+    push dword [ebp + 48]    ; user CS
+    push dword [ebp + 44]    ; user EIP
+
+    ; Restore general-purpose registers from the struct. Load eax LAST
+    ; via a scratch so we don't clobber ebp (our struct pointer) early.
+    ; Offsets: edi=4 esi=8 ebp=12 ebx=20 edx=24 ecx=28 eax=32
+    mov  edi, [ebp + 4]
+    mov  esi, [ebp + 8]
+    mov  ebx, [ebp + 20]
+    mov  edx, [ebp + 24]
+    mov  ecx, [ebp + 28]
+    mov  eax, [ebp + 32]     ; child's eax (fork set this to 0)
+    mov  ebp, [ebp + 12]     ; finally restore user ebp
+
+    iret

@@ -129,7 +129,10 @@ load_kernel:
     mov di, 1                   ; next (cyl, head): cyl=0, head=1
 
 .next_track:
-    cmp di, 14                  ; 14 tracks ≈ 124 KB total — plenty
+    cmp di, 20                  ; 20 tracks ≈ 180 KB total — headroom for
+                                ; a growing kernel (was 14 ≈ 124 KB; the
+                                ; kernel crossed 80 KB once fork/exec/wait
+                                ; landed, so we give it more runway here)
     jae .read_done
 
     ; cyl = di >> 1, head = di & 1

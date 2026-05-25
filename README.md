@@ -249,6 +249,7 @@ run MYPROG.ELF
 | `COLORS.ELF` | Prints the 16-color VGA palette |
 | `MEMSTAT.ELF` | Heap probe — grows `malloc` allocations until they fail |
 | `MALTEST.ELF` | Stress-tests `malloc` with many small allocations |
+| `FORKTEST.ELF` | Demonstrates `fork` / `wait` / `exec` (see system calls) |
 | `HELLO.BIN` / `COUNT.BIN` | Legacy flat-binary demos (assembled with `nasm -f bin`) |
 
 Legacy flat binaries (`nasm -f bin` with `[ORG 0x01000000]`) still run — the loader
@@ -270,9 +271,64 @@ registers; return value comes back in `eax`.
 | 4 | `yield` | — | 0 |
 | 5 | `sbrk` | increment | previous break (grows the user heap) |
 | 6 | `setcolor` | fg (0–15), bg (0–15) | 0 |
+| 7 | `fork` | — | child pid to parent, 0 to child, -1 on error |
+| 8 | `exec` | path | does not return on success; -1 on error |
+| 9 | `wait` | int\* status | exited child's pid (status written through ptr), -1 if no children |
 
 File descriptors: `0` = stdin (keyboard), `1` = stdout (VGA), `2` = stderr (VGA).
 The user-space `malloc` is built on top of `sbrk`.
+
+### Process control: fork / exec / wait
+
+These three give user programs real Unix-style process control on top of the
+existing per-task address spaces.
+
+- **`fork()`** clones the calling process. The kernel builds a fresh page
+  directory for the child and **deep-copies every page the parent has mapped**
+  — code, data, heap, and stack — into new physical frames, preserving each
+  page's original read/write/user flags. The child is a separate process with
+  its own address space: writes in one are invisible to the other. The child
+  re-emerges from the same `int 0x80` the parent called, except its `eax` (the
+  return value) is forced to `0`, so the classic idiom works:
+
+  ```c
+  int pid = fork();
+  if (pid == 0) {
+      // child
+  } else if (pid > 0) {
+      // parent; pid is the child's id
+  } else {
+      // fork failed
+  }
+  ```
+
+- **`exec(path)`** replaces the calling process's image with the program at
+  `path` (e.g. `"ECHO.ELF"`). The new image is loaded into a *fresh* address
+  space first; only once that fully succeeds does the kernel tear down the old
+  pages, switch the live task onto the new address space, and rewrite the trap
+  frame so the syscall return lands at the new program's entry on a clean
+  stack. On success `exec` does not return. On failure (missing file, bad
+  image, OOM) it returns `-1` and the original program keeps running.
+
+- **`wait(&status)`** blocks the caller until one of its children exits, writes
+  the child's exit code through `status`, reaps the zombie, and returns the
+  child's pid. It returns `-1` immediately if the caller has no children. The
+  scheduler marks a waiting parent `BLOCKED` and wakes it from `task_exit` when
+  a child dies, so a blocked parent consumes no CPU.
+
+The fork machinery lives in `task.c` (`task_clone_user` plus the
+`enter_user_resume` stub in `task_switch.asm`, which `iret`s into a copied
+register frame) and `loader.c` (`loader_fork` / `loader_exec`, which own the
+address-space copy and image swap). `FORKTEST.ELF` exercises all three:
+
+```
+run FORKTEST.ELF
+```
+
+It forks a child that exits with a known status (proving the parent/child split
+and the `wait` status hand-off), confirms the child's memory writes don't leak
+into the parent (proving the copy is real, not shared), then forks a second
+child that `exec`s `ECHO.ELF` in place.
 
 ---
 
@@ -371,7 +427,14 @@ This is a learning OS, not a production one. Notably:
 - The scheduler is plain round-robin — no priorities, no blocking/sleeping queues
   beyond `pit_sleep`.
 - FAT12 only (1.44 MB floppy-style images); no FAT16/32, no journaling.
-- No networking, no dynamic linking, no signals.
+- No networking, no dynamic linking, no signals. `fork`/`exec`/`wait` exist
+  (see the system-calls section) but there is no `kill`/signal delivery, no
+  process groups, and `wait` collects any child rather than a specific pid.
+- A small, bounded amount of physical memory (a few pages) is not reclaimed at
+  the end of each user-program lifecycle. It does not grow without bound during
+  a single program and does not threaten stability at this scale, but a future
+  pass on the loader's page-table teardown (`vmm_free_user_pd` /
+  `release_resources`) could tighten it up.
 - `ramfs` contents are lost on reboot by design.
 
 These are the natural next things to extend if you want to keep hacking on it.

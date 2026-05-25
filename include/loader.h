@@ -57,4 +57,25 @@ int loader_run(const char* path);
 // current break unchanged).
 int loader_sbrk(int delta);
 
+// --- fork / exec ------------------------------------------------------
+struct registers;
+
+// fork(): clone the calling user task. Builds a new address space, deep-
+// copies every page the parent has mapped (code, data, heap, stack),
+// duplicates the resource tracker, and spawns a child that resumes from
+// `frame` with eax forced to 0. Returns the child's pid to the parent,
+// or -1 on failure. `frame` is the syscall register snapshot (with the
+// cross-ring useresp/ss appended) so the child can iret back to ring 3.
+int loader_fork(struct registers* frame);
+
+// exec(): replace the calling task's image with the program at `path`.
+// Tears down the caller's current user pages, loads the new ELF/flat
+// binary into a fresh address space, resets the heap, and rewrites
+// `frame` so the syscall return path iret's into the new program's
+// entry with a clean stack. On success this does not "return" in the
+// usual sense — the caller resumes as the new program. Returns -1 on
+// failure (file missing, bad image, OOM), in which case the caller's
+// original image is left running.
+int loader_exec(const char* path, struct registers* frame);
+
 #endif

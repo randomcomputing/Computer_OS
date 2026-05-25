@@ -259,6 +259,7 @@ $(FAT_IMG): userprogs/hello.asm userprogs/count.asm \
 	mcopy -i $(FAT_IMG) userprogs/c/colors.elf  ::COLORS.ELF
 	mcopy -i $(FAT_IMG) userprogs/c/game.elf    ::GAME.ELF
 	mcopy -i $(FAT_IMG) userprogs/c/calc.elf    ::CALC.ELF
+	mcopy -i $(FAT_IMG) userprogs/c/forktest.elf ::FORKTEST.ELF
 
 
 

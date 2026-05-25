@@ -159,6 +159,26 @@ unsigned int vmm_resolve_pd(unsigned int pd_phys, unsigned int virt) {
     return resolve_in_pd(phys_to_accessible(pd_phys), virt);
 }
 
+// Like vmm_resolve_pd but returns the full PTE: physical frame in the
+// high 20 bits and the access flags (PRESENT/WRITE/USER/...) in the low
+// 12. Returns 0 if not mapped. fork() uses this to copy each parent page
+// into the child with the parent's exact permissions rather than
+// guessing them from the address range.
+unsigned int vmm_resolve_pd_flags(unsigned int pd_phys, unsigned int virt) {
+    unsigned int* pd = phys_to_accessible(pd_phys);
+    unsigned int pde = pd[pd_index(virt)];
+    if (!(pde & VMM_PRESENT)) return 0;
+    if (pde & 0x80) {
+        // 4 MB page: synthesize a 4 KB-style PTE for this slice.
+        unsigned int phys = (pde & 0xFFC00000) | (virt & 0x003FF000);
+        return phys | (pde & 0xFFF & ~0x80u);
+    }
+    unsigned int* pt = phys_to_accessible(pde & 0xFFFFF000);
+    unsigned int pte = pt[pt_index(virt)];
+    if (!(pte & VMM_PRESENT)) return 0;
+    return pte;   // already frame|flags
+}
+
 unsigned int vmm_create_user_pd(void) {
     unsigned int pd_phys = pmm_alloc();
     if (!pd_phys) return 0;

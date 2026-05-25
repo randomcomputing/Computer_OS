@@ -25,6 +25,21 @@ struct registers {
     unsigned int eip, cs, eflags;                         // pushed by CPU
 };
 
+// Extended view of the trap frame for traps that crossed from ring 3 to
+// ring 0 (every int 0x80 syscall, since the gate is DPL=3 and user code
+// is the only caller). In that case the CPU also pushed the user's ESP
+// and SS just above EFLAGS. This overlay lets the syscall layer read and
+// rewrite the full ring-3 context (needed by fork/exec). It is ONLY
+// valid for frames known to come from ring 3 — do not use it on ring-0
+// CPU exception frames, where useresp/ss were not pushed.
+struct user_trap_frame {
+    unsigned int ds;
+    unsigned int edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
+    unsigned int int_no, err_code;
+    unsigned int eip, cs, eflags;
+    unsigned int useresp, ss;
+};
+
 // Called from the common assembly stub. Prints a diagnostic and halts.
 void isr_handler(struct registers* regs);
 

@@ -31,6 +31,10 @@ int          vmm_map_pd(unsigned int pd_phys, unsigned int virt,
 void         vmm_unmap_pd(unsigned int pd_phys, unsigned int virt);
 unsigned int vmm_resolve_pd(unsigned int pd_phys, unsigned int virt);
 
+// Resolve to the full PTE (frame in high 20 bits | flags in low 12), or
+// 0 if not mapped. Used by fork() to replicate a page's exact flags.
+unsigned int vmm_resolve_pd_flags(unsigned int pd_phys, unsigned int virt);
+
 // Allocate a fresh page directory for a user task.  Copies all 1024 PDEs
 // from the current kernel PD so the kernel half is immediately accessible
 // (syscalls / interrupts execute kernel code with the user PD in CR3).

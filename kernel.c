@@ -18,6 +18,7 @@
 #include "ramfs.h"
 #include "gdt.h"
 #include "syscall.h"
+#include "pci.h"
 
 void halt(void);
 
@@ -84,6 +85,14 @@ void kmain(void) {
 
     syscall_init();
     printf("[OK] Syscall gate (int 0x80) installed\n");
+
+    // Enumerate the PCI bus. This just discovers what hardware is plugged in
+    // (storage controllers, the NIC we'll drive later); it doesn't program
+    // anything yet. `lspci` at the shell lists what this found.
+    {
+        int n = pci_init();
+        printf("[OK] PCI scan: %d device%s found\n", n, n == 1 ? "" : "s");
+    }
 
     // Storage stack: ATA driver first, then mount FAT12 on top of it.
     // Both are best-effort: if there's no -hda image attached or it's

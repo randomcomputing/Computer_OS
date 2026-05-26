@@ -52,4 +52,17 @@ static inline void outsw(unsigned short port, const void* src, unsigned int coun
                       : "d"(port));
 }
 
+// 32-bit ("long") port I/O. PCI configuration space is read and written one
+// 32-bit dword at a time through the config-address (0xCF8) and config-data
+// (0xCFC) ports, so the PCI driver needs these. NIC registers later will too.
+static inline unsigned int inl(unsigned short port) {
+    unsigned int val;
+    __asm__ volatile ("inl %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+static inline void outl(unsigned short port, unsigned int val) {
+    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
 #endif

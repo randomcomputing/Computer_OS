@@ -16,6 +16,7 @@ ENTRY_O      = entry.o
 KERNEL_O     = kernel.o
 HALT_O       = halt.o
 VGA_O        = vga.o
+CONSOLE_O    = console.o
 PRINTF_O     = printf.o
 IDT_O        = idt.o
 ISR_O        = isr.o
@@ -49,18 +50,19 @@ RTC_O        = rtc.o
 GFX_O        = gfx.o
 DISK_IMG     = disk.img
 UACCESS_O    = uaccess.o
+PCI_O        = pci.o
 
 FAT_IMG      = fatdisk.img
 ISO_FILE     = Computer_OS.iso
 
-KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(PRINTF_O) \
+KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(CONSOLE_O) $(PRINTF_O) \
               $(IDT_O) $(ISR_O) $(ISR_ASM_O) \
               $(PIC_O) $(IRQ_O) $(IRQ_ASM_O) $(KEYBOARD_O) $(MOUSE_O) \
               $(STRING_O) $(SHELL_O) $(PIT_O) $(SERIAL_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O)
+			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O) $(PCI_O)
 ISO_DIR = isodir
 
 all: $(ISO_FILE)
@@ -85,13 +87,17 @@ $(IRQ_ASM_O): src/irq_asm.asm
 	@echo "Assembling IRQ stubs..."
 	$(AS) $(ASFLAGS_ELF) src/irq_asm.asm -o $(IRQ_ASM_O)
 
-$(KERNEL_O): kernel.c include/vga.h include/printf.h include/idt.h include/pic.h include/keyboard.h include/mouse.h include/pit.h include/shell.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/ata.h include/fat12.h include/gdt.h include/syscall.h
+$(KERNEL_O): kernel.c include/vga.h include/printf.h include/idt.h include/pic.h include/keyboard.h include/mouse.h include/pit.h include/shell.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/ata.h include/fat12.h include/gdt.h include/syscall.h include/pci.h
 	@echo "Compiling C kernel..."
 	$(CC) $(CFLAGS) kernel.c -o $(KERNEL_O)
 
 $(VGA_O): src/vga.c include/vga.h include/io.h
 	@echo "Compiling VGA driver..."
 	$(CC) $(CFLAGS) src/vga.c -o $(VGA_O)
+
+$(CONSOLE_O): src/console.c include/console.h include/vga.h
+	@echo "Compiling console abstraction..."
+	$(CC) $(CFLAGS) src/console.c -o $(CONSOLE_O)
 
 $(GFX_O): src/gfx.c include/gfx.h include/io.h
 	@echo "Compiling graphics (mode 13h) driver..."
@@ -137,7 +143,7 @@ $(SERIAL_O): src/serial.c include/serial.h include/io.h
 	@echo "Compiling serial driver..."
 	$(CC) $(CFLAGS) src/serial.c -o $(SERIAL_O)
 
-$(SHELL_O): src/shell.c include/shell.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h
+$(SHELL_O): src/shell.c include/shell.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h
 	@echo "Compiling shell..."
 	$(CC) $(CFLAGS) src/shell.c -o $(SHELL_O)
 
@@ -282,3 +288,6 @@ clean:
 	rm -f *.o *.bin *.iso disk.img $(FAT_IMG)
 	$(MAKE) -C userprogs/c clean
 	rm -rf $(ISO_DIR)
+$(PCI_O): src/pci.c include/pci.h include/io.h include/printf.h
+	@echo "Compiling PCI bus driver..."
+	$(CC) $(CFLAGS) src/pci.c -o $(PCI_O)

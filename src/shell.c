@@ -16,6 +16,7 @@
 #include "loader.h"
 #include "editor.h"
 #include "gfx.h"
+#include "pci.h"
 
 #define LINE_MAX 128
 
@@ -27,6 +28,7 @@
 static const char* commands[] = {
     "help", "clear", "echo", "about", "uptime", "sleep",
     "meminfo", "pmemstat", "palloc", "vmap", "kmstat", "kmtest",
+    "lspci",
     "ps", "spawn", "yield", "preempt",
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
     "cd", "pwd", "mount",
@@ -634,6 +636,7 @@ static void cmd_help(void) {
     printf("  vmap <virt>   resolve a virtual address to physical\n");
     printf("  kmstat        show kernel heap stats\n");
     printf("  kmtest        run a quick heap sanity test\n");
+    printf("  lspci         list devices on the PCI bus\n");
     printf("  ps            list tasks\n");
     printf("  spawn <kind>  launch a demo task: counter | spinner\n");
     printf("  yield         voluntarily yield the CPU once\n");
@@ -727,6 +730,43 @@ static void cmd_vmap(const char* args) {
 }
 
 static void cmd_kmstat(void) { kheap_print(); }
+
+// ---- PCI -------------------------------------------------------------
+// Print one 16-bit value as exactly 4 zero-padded hex digits. The kernel
+// printf has no width specifiers, so we lay the nibbles out by hand to keep
+// the vendor:device column aligned.
+static void print_hex16(unsigned short v) {
+    const char* digits = "0123456789ABCDEF";
+    char out[5];
+    out[0] = digits[(v >> 12) & 0xF];
+    out[1] = digits[(v >> 8)  & 0xF];
+    out[2] = digits[(v >> 4)  & 0xF];
+    out[3] = digits[v & 0xF];
+    out[4] = '\0';
+    printf("%s", out);
+}
+
+static void cmd_lspci(void) {
+    int n = pci_device_count();
+    if (n == 0) {
+        printf("No PCI devices found.\n");
+        return;
+    }
+    printf("%d PCI device%s:\n", n, n == 1 ? "" : "s");
+    printf("  B:D.F   VEND:DEV   CLASS  IRQ  DESCRIPTION\n");
+    for (int i = 0; i < n; i++) {
+        const pci_device_t* d = pci_get_device(i);
+        printf("  %u:%u.%u   ", d->bus, d->device, d->function);
+        print_hex16(d->vendor_id);
+        printf(":");
+        print_hex16(d->device_id);
+        printf("  %u/%u", d->class_code, d->subclass);
+        // IRQ 0xFF means "no legacy interrupt line assigned".
+        if (d->irq_line == 0xFF) printf("   --");
+        else                     printf("   %u", d->irq_line);
+        printf("   %s\n", pci_class_name(d->class_code, d->subclass));
+    }
+}
 
 static void cmd_kmtest(void) {
     void* a = kmalloc(64);
@@ -1215,6 +1255,7 @@ static void execute(char* line) {
     else if (strcmp(line, "vmap")     == 0) cmd_vmap(args);
     else if (strcmp(line, "kmstat")   == 0) cmd_kmstat();
     else if (strcmp(line, "kmtest")   == 0) cmd_kmtest();
+    else if (strcmp(line, "lspci")    == 0) cmd_lspci();
     else if (strcmp(line, "ps")       == 0) cmd_ps();
     else if (strcmp(line, "spawn")    == 0) cmd_spawn(args);
     else if (strcmp(line, "yield")    == 0) cmd_yield();

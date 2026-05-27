@@ -1,5 +1,5 @@
 #include "printf.h"
-#include "vga.h"
+#include "console.h"
 #include "serial.h"
 
 // Use GCC's built-in varargs since we have no stdarg.h (-nostdinc).
@@ -14,7 +14,7 @@ typedef __builtin_va_list va_list;
 // terminal when running with -serial stdio). If you add another output
 // later, this is the only place you need to change.
 static void putchar_out(char c) {
-    vga_putchar(c);
+    con_putchar(c);
     serial_putc(c);
 }
 

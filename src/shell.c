@@ -1,5 +1,5 @@
 #include "shell.h"
-#include "vga.h"
+#include "console.h"
 #include "printf.h"
 #include "keyboard.h"
 #include "string.h"
@@ -17,6 +17,7 @@
 #include "editor.h"
 #include "gfx.h"
 #include "pci.h"
+#include "bochs_vbe.h"
 
 #define LINE_MAX 128
 
@@ -28,7 +29,7 @@
 static const char* commands[] = {
     "help", "clear", "echo", "about", "uptime", "sleep",
     "meminfo", "pmemstat", "palloc", "vmap", "kmstat", "kmtest",
-    "lspci",
+    "lspci", "vbe",
     "ps", "spawn", "yield", "preempt",
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
     "cd", "pwd", "mount",
@@ -333,32 +334,32 @@ static void apply_extend(char* buf, int max_line,
 static void redraw_line(int anchor_row, int anchor_col,
                         const char* buf, int len, int pos,
                         int prev_len) {
-    int width = vga_cols();
+    int width = con_cols();
     int max_len = width - anchor_col;
     if (len > max_len) len = max_len;
     if (prev_len > max_len) prev_len = max_len;
 
-    vga_set_cursor(anchor_row, anchor_col);
+    con_set_cursor(anchor_row, anchor_col);
     for (int i = 0; i < len; i++) {
-        vga_putchar_at_cursor(buf[i]);
-        vga_set_cursor(anchor_row, anchor_col + i + 1);
+        con_putchar_at_cursor(buf[i]);
+        con_set_cursor(anchor_row, anchor_col + i + 1);
     }
     for (int i = len; i < prev_len; i++) {
-        vga_putchar_at_cursor(' ');
-        vga_set_cursor(anchor_row, anchor_col + i + 1);
+        con_putchar_at_cursor(' ');
+        con_set_cursor(anchor_row, anchor_col + i + 1);
     }
     int target = anchor_col + pos;
     if (target >= width) target = width - 1;
-    vga_set_cursor(anchor_row, target);
+    con_set_cursor(anchor_row, target);
 }
 
 // Print the prompt; returns the cursor position (where the line will
 // start) so readline can use it as the editing anchor.
 static void print_prompt(int* row_out, int* col_out) {
-    vga_set_color(VGA_WHITE, VGA_BLACK);
+    con_set_color(CON_WHITE, CON_BLACK);
     printf("> ");
-    vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
-    vga_get_cursor(row_out, col_out);
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    con_get_cursor(row_out, col_out);
 }
 
 // Try to expand the current word at the cursor. Modifies buf/len/pos
@@ -473,7 +474,7 @@ static void handle_tab(char* buf, int max_line,
     } else {
         // No further extension possible — show the list.
         // Move past current line, print matches, redraw prompt + line.
-        vga_set_cursor(*anchor_row, *anchor_col + *len);
+        con_set_cursor(*anchor_row, *anchor_col + *len);
         printf("\n");
         if (completing_command) print_command_matches(word);
         else                    print_dir_matches(dirpath, base);
@@ -491,7 +492,7 @@ static void readline(char* buf, unsigned int max,
     int pos = 0;
     int hist_view = 0;
 
-    int width = vga_cols();
+    int width = con_cols();
     int max_line = (int)max - 1;
     int row_cap  = width - anchor_col;
     if (max_line > row_cap) max_line = row_cap;
@@ -501,14 +502,14 @@ static void readline(char* buf, unsigned int max,
         char c = keyboard_getchar();
         unsigned char uc = (unsigned char)c;
 
-        if (uc == KEY_PGUP) { vga_scroll_up(vga_rows() / 2);   continue; }
-        if (uc == KEY_PGDN) { vga_scroll_down(vga_rows() / 2); continue; }
+        if (uc == KEY_PGUP) { con_scroll_up(con_rows() / 2);   continue; }
+        if (uc == KEY_PGDN) { con_scroll_down(con_rows() / 2); continue; }
 
-        if (vga_is_scrolled()) vga_scroll_reset();
+        if (con_is_scrolled()) con_scroll_reset();
 
         if (c == '\n') {
-            vga_set_cursor(anchor_row, anchor_col + len);
-            vga_putchar('\n');
+            con_set_cursor(anchor_row, anchor_col + len);
+            con_putchar('\n');
             buf[len] = '\0';
             return;
         }
@@ -537,25 +538,25 @@ static void readline(char* buf, unsigned int max,
         if (uc == KEY_LEFT) {
             if (pos > 0) {
                 pos--;
-                vga_set_cursor(anchor_row, anchor_col + pos);
+                con_set_cursor(anchor_row, anchor_col + pos);
             }
             continue;
         }
         if (uc == KEY_RIGHT) {
             if (pos < len) {
                 pos++;
-                vga_set_cursor(anchor_row, anchor_col + pos);
+                con_set_cursor(anchor_row, anchor_col + pos);
             }
             continue;
         }
         if (uc == KEY_HOME) {
             pos = 0;
-            vga_set_cursor(anchor_row, anchor_col);
+            con_set_cursor(anchor_row, anchor_col);
             continue;
         }
         if (uc == KEY_END) {
             pos = len;
-            vga_set_cursor(anchor_row, anchor_col + pos);
+            con_set_cursor(anchor_row, anchor_col + pos);
             continue;
         }
 
@@ -637,6 +638,7 @@ static void cmd_help(void) {
     printf("  kmstat        show kernel heap stats\n");
     printf("  kmtest        run a quick heap sanity test\n");
     printf("  lspci         list devices on the PCI bus\n");
+    printf("  vbe           set 1024x768x32 framebuffer (test pattern)\n");
     printf("  ps            list tasks\n");
     printf("  spawn <kind>  launch a demo task: counter | spinner\n");
     printf("  yield         voluntarily yield the CPU once\n");
@@ -665,7 +667,7 @@ static void cmd_help(void) {
     printf("         PgUp/PgDn=scroll output history.\n");
 }
 
-static void cmd_clear(void) { vga_clear(); }
+static void cmd_clear(void) { con_clear(); }
 
 static void cmd_echo(const char* args) {
     while (*args == ' ') args++;
@@ -673,9 +675,9 @@ static void cmd_echo(const char* args) {
 }
 
 static void cmd_about(void) {
-    vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
     printf("Computer OS\n");
-    vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
     printf("A tiny hobby kernel built from scratch.\n");
     printf("Bootloader -> protected mode -> C kernel -> IDT -> PIC -> keyboard -> shell.\n");
 }
@@ -768,6 +770,45 @@ static void cmd_lspci(void) {
     }
 }
 
+// ---- Bochs VBE framebuffer test ------------------------------------------
+// Sets 1024x768x32 and paints a test pattern straight into the linear
+// framebuffer: vertical RGB gradient bars and a white border. This proves the
+// mode-set and the PCI-derived framebuffer address before we move the whole
+// text console onto the framebuffer. NOTE: once this runs, VGA text mode is
+// gone, so the shell prompt won't come back until you reboot.
+static void cmd_vbe(void) {
+    if (!bochs_vbe_available()) {
+        printf("Bochs/QEMU VBE adapter not present.\n");
+        return;
+    }
+    printf("Setting 1024x768x32 and drawing a test pattern...\n");
+    printf("(VGA text mode will be replaced; reboot to return to the shell.)\n");
+
+    bochs_vbe_mode_t m;
+    if (!bochs_vbe_set_mode(1024, 768, &m)) {
+        printf("VBE mode-set failed; still in text mode.\n");
+        return;
+    }
+
+    // Each pixel is a 32-bit little-endian XRGB value: 0x00RRGGBB.
+    volatile unsigned int* fb = (volatile unsigned int*)m.virt;
+    unsigned int stride = m.pitch / 4;   // pixels per row
+    for (unsigned int y = 0; y < m.height; y++) {
+        for (unsigned int x = 0; x < m.width; x++) {
+            unsigned char r = (unsigned char)(x * 255 / m.width);
+            unsigned char g = (unsigned char)(y * 255 / m.height);
+            unsigned char b = (unsigned char)((x ^ y) & 0xFF);
+            unsigned int px = ((unsigned int)r << 16) |
+                              ((unsigned int)g << 8)  |
+                               (unsigned int)b;
+            // White 2px border so the screen edges are unmistakable.
+            if (x < 2 || y < 2 || x >= m.width - 2u || y >= m.height - 2u)
+                px = 0x00FFFFFF;
+            fb[y * stride + x] = px;
+        }
+    }
+}
+
 static void cmd_kmtest(void) {
     void* a = kmalloc(64);
     void* b = kmalloc(128);
@@ -834,7 +875,7 @@ static void cmd_cat(const char* args) {
     for (int i = 0; i < n; i++) {
         char c = buf[i];
         if (c == '\r') continue;
-        vga_putchar(c);
+        con_putchar(c);
     }
     if (n > 0 && buf[n - 1] != '\n') printf("\n");
     kfree(buf);
@@ -1079,7 +1120,7 @@ static void cmd_edit(const char* args) {
     editor_run(args[0] ? args : 0);
     // The editor leaves the screen in whatever state it last drew. Clear
     // it so the shell prompt comes back on a clean screen.
-    vga_clear();
+    con_clear();
 }
 
 static void cmd_shutdown(void) {
@@ -1215,7 +1256,7 @@ static void cmd_gfx(void) {
     (void)keyboard_getchar();
 
     gfx_set_text_mode();
-    vga_clear();
+    con_clear();
     printf("Back in text mode. Drew a centre pixel + red square + green line.\n");
 }
 
@@ -1223,7 +1264,7 @@ static void cmd_gfxmouse(void) {
     printf("Entering graphics mode. Move the mouse, hold left button to\n");
     printf("paint, press any key to exit.\n");
     gfx_mouse_demo();                 // blocks until a key is pressed
-    vga_clear();
+    con_clear();
     printf("Back in text mode.\n");
 }
 
@@ -1231,7 +1272,7 @@ static void cmd_paint(void) {
     printf("Paint: click a colour swatch, hold LEFT to draw, RIGHT to\n");
     printf("erase. Click QUIT (or press any key) to exit.\n");
     gfx_paint();                      // blocks until QUIT or a keypress
-    vga_clear();
+    con_clear();
     printf("Back in text mode.\n");
 }
 
@@ -1256,6 +1297,7 @@ static void execute(char* line) {
     else if (strcmp(line, "kmstat")   == 0) cmd_kmstat();
     else if (strcmp(line, "kmtest")   == 0) cmd_kmtest();
     else if (strcmp(line, "lspci")    == 0) cmd_lspci();
+    else if (strcmp(line, "vbe")      == 0) cmd_vbe();
     else if (strcmp(line, "ps")       == 0) cmd_ps();
     else if (strcmp(line, "spawn")    == 0) cmd_spawn(args);
     else if (strcmp(line, "yield")    == 0) cmd_yield();
@@ -1284,9 +1326,9 @@ static void execute(char* line) {
     else if (strcmp(line, "reboot")   == 0) cmd_reboot();
     else if (strcmp(line, "shutdown") == 0) cmd_shutdown();
     else {
-        vga_set_color(VGA_LIGHT_RED, VGA_BLACK);
+        con_set_color(CON_LIGHT_RED, CON_BLACK);
         printf("unknown command: %s\n", line);
-        vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+        con_set_color(CON_LIGHT_GREY, CON_BLACK);
     }
 }
 

@@ -56,6 +56,16 @@ void pci_config_write32(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset, pci_
     outl(PCI_CONFIG_DATA, value);
 }
 
+void pci_config_write16(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset, pci_u16 value) {
+    pci_u32 old = pci_config_read32(bus, dev, func, offset & 0xFC);
+    int shift = (offset & 2) * 8;
+
+    old &= ~((pci_u32)0xFFFF << shift);
+    old |= ((pci_u32)value << shift);
+
+    pci_config_write32(bus, dev, func, offset & 0xFC, old);
+}
+
 // Read one function's identifying fields into the table. Caller has already
 // confirmed the function exists (vendor != 0xFFFF).
 static void pci_record(pci_u8 bus, pci_u8 dev, pci_u8 func) {
@@ -129,6 +139,48 @@ const pci_device_t* pci_find_class(pci_u8 class_code, pci_u8 subclass) {
         if (g_devices[i].class_code == class_code && g_devices[i].subclass == subclass)
             return &g_devices[i];
     return 0;
+}
+
+
+#define PCI_COMMAND_REG        0x04
+#define PCI_COMMAND_IO_SPACE   0x1
+#define PCI_COMMAND_MEM_SPACE  0x2
+#define PCI_COMMAND_BUS_MASTER 0x4
+
+void pci_enable_bus_mastering(const pci_device_t* dev) {
+    pci_u16 cmd = pci_config_read16(dev->bus,
+                                    dev->device,
+                                    dev->function,
+                                    PCI_COMMAND_REG);
+
+    cmd |= PCI_COMMAND_IO_SPACE;
+    cmd |= PCI_COMMAND_MEM_SPACE;
+    cmd |= PCI_COMMAND_BUS_MASTER;
+
+    pci_config_write16(dev->bus,
+                       dev->device,
+                       dev->function,
+                       PCI_COMMAND_REG,
+                       cmd);
+}
+
+pci_u32 pci_bar_addr(const pci_device_t* dev, int bar) {
+    if (bar < 0 || bar >= 6) return 0;
+
+    pci_u32 raw = dev->bar[bar];
+
+    if (raw & 1) {
+        // I/O BAR: low 2 bits are flags.
+        return raw & 0xFFFFFFFCu;
+    }
+
+    // Memory BAR: low 4 bits are flags.
+    return raw & 0xFFFFFFF0u;
+}
+
+int pci_bar_is_io(const pci_device_t* dev, int bar) {
+    if (bar < 0 || bar >= 6) return 0;
+    return (dev->bar[bar] & 1) != 0;
 }
 
 // Just the handful of classes we're likely to see under QEMU. The networking

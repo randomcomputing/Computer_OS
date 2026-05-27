@@ -1,7 +1,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
-#include "vga.h"
+#include "console.h"
 #include "isr.h"
 #include "task.h"
 
@@ -267,9 +267,9 @@ int vmm_page_fault(struct registers* regs) {
         return 1;
     }
 
-    vga_set_color(VGA_LIGHT_RED, VGA_BLACK);
+    con_set_color(CON_LIGHT_RED, CON_BLACK);
     printf("\n*** PAGE FAULT ***\n");
-    vga_set_color(VGA_WHITE, VGA_BLACK);
+    con_set_color(CON_WHITE, CON_BLACK);
     printf("  fault addr (CR2): 0x%x\n", cr2);
     printf("  EIP:              0x%x\n", regs->eip);
     printf("  cause: %s, %s, %s%s\n",

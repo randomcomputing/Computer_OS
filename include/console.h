@@ -75,4 +75,10 @@ void con_scroll_down(int rows);
 void con_scroll_reset(void);
 int  con_is_scrolled(void);
 
+// Switch the console to the framebuffer backend. Requires that a VBE linear
+// mode has already been set (bochs_vbe_set_mode). Sets up the framebuffer
+// console, clears it, and routes all subsequent con_* output there. Returns
+// 1 on success, 0 if no framebuffer is available (console stays on VGA text).
+int con_use_framebuffer(void);
+
 #endif

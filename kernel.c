@@ -1,4 +1,4 @@
-#include "vga.h"
+#include "console.h"
 #include "printf.h"
 #include "idt.h"
 #include "pic.h"
@@ -19,26 +19,21 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "pci.h"
+#include "bochs_vbe.h"
+#include "boot_banner.h"
+#include "e1000.h"
 
 void halt(void);
 
 void kmain(void) {
-    vga_init();
+    con_init();
     serial_init();
     serial_write("Serial[OK]\n");
 
 
     
-    vga_set_color(VGA_WHITE, VGA_BLACK);
-    printf("###############################\n");
-    printf("###");
-    vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-    printf("       Computer OS       ");
-    vga_set_color(VGA_WHITE, VGA_BLACK);
-    printf("###\n");
-    printf("###############################\n");
-    printf("\n");
-    vga_set_color(VGA_WHITE, VGA_BLACK);
+    boot_banner();
+    con_set_color(CON_WHITE, CON_BLACK);
     printf("[OK] Bootloader  [OK] Protected Mode  [OK] Kernel Running\n");
     printf("[OK] Higher-half kernel at 0xC0000000\n");
 
@@ -92,12 +87,19 @@ void kmain(void) {
     {
         int n = pci_init();
         printf("[OK] PCI scan: %d device%s found\n", n, n == 1 ? "" : "s");
+
+        if (e1000_init()) {
+            printf("[OK] e1000 network card initialized\n");
+        } else {
+            printf("[..] e1000 network card not initialized\n");
+        }
     }
 
     // Storage stack: ATA driver first, then mount FAT12 on top of it.
     // Both are best-effort: if there's no -hda image attached or it's
     // not a FAT12 disk, we just print a warning and the shell still
     // boots — `ls` and `cat` will report no filesystem.
+    int g_fs_ok = 0;   // did the root filesystem mount? (used in the FB recap)
     if (ata_init()) {
         printf("[OK] ATA primary master detected\n");
         if (fat12_mount() == 0) {
@@ -107,6 +109,7 @@ void kmain(void) {
             vfs_init();
             if (vfs_mount("/", fat12_vfs_ops(), "fat12") == 0) {
                 printf("[OK] FAT12 mounted at / via VFS\n");
+                g_fs_ok = 1;
             } else {
                 printf("[..] VFS mount table full\n");
             }
@@ -123,6 +126,33 @@ void kmain(void) {
         printf("[..] No ATA disk attached (boot with -hda <image>)\n");
     }
     printf("\n");
+
+    // Switch the console to the high-res framebuffer for the shell. Boot ran
+    // in VGA text mode (above); now we move to graphics. On success we repaint
+    // the banner and a green [OK] recap in the framebuffer console; on failure
+    // we report it in red and stay in VGA text so the shell still works.
+    {
+        bochs_vbe_mode_t m;
+        if (bochs_vbe_set_mode(1024, 768, &m) && con_use_framebuffer()) {
+            // Now drawing into the framebuffer console. Repaint the boot screen.
+            boot_banner();
+            print_status(1, "Bootloader / Protected Mode / Kernel running");
+            print_status(1, "Higher-half kernel at 0xC0000000");
+            print_status(1, "GDT / IDT / PIC / syscall gate");
+            print_status(1, "Keyboard, mouse, timer (100 Hz)");
+            print_status(1, "PMM / VMM / kernel heap online");
+            print_status(1, "Tasking online (kmain = task 0)");
+            print_status(1, "PCI bus enumerated");
+            print_status(g_fs_ok, g_fs_ok ? "FAT12 mounted at / via VFS"
+                                          : "No filesystem (running without disk)");
+            print_status(1, "Framebuffer console 1024x768x32");
+            con_set_color(CON_LIGHT_GREY, CON_BLACK);
+            printf("\n");
+        } else {
+            // Framebuffer unavailable — make it visible and stay in text mode.
+            print_status(0, "Framebuffer unavailable - staying in VGA text mode");
+        }
+    }
 
     __asm__ volatile ("sti");
 

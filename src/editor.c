@@ -23,7 +23,7 @@
 // `left_col`   : first column visible (for horizontal scroll).
 
 #include "editor.h"
-#include "vga.h"
+#include "console.h"
 #include "keyboard.h"
 #include "kheap.h"
 #include "string.h"
@@ -36,11 +36,11 @@
 // Row N-1     = hint / status bar
 
 #define TITLE_ROW   0
-#define HINT_ROW    (vga_rows() - 1)
+#define HINT_ROW    (con_rows() - 1)
 #define TEXT_TOP    1
-#define TEXT_BOT    (vga_rows() - 2)
+#define TEXT_BOT    (con_rows() - 2)
 #define TEXT_ROWS   (TEXT_BOT - TEXT_TOP + 1)
-#define TEXT_COLS   (vga_cols())
+#define TEXT_COLS   (con_cols())
 
 #define TAB_WIDTH   4
 #define INITIAL_CAP (64 * 1024)
@@ -219,20 +219,20 @@ static int strlen_local(const char* s) {
     int n = 0; while (s[n]) n++; return n;
 }
 
-static void draw_bar(int row, const char* text, enum vga_color fg, enum vga_color bg) {
-    vga_set_color(fg, bg);
-    int cols = vga_cols();
+static void draw_bar(int row, const char* text, enum con_color fg, enum con_color bg) {
+    con_set_color(fg, bg);
+    int cols = con_cols();
     int n = strlen_local(text);
     if (n > cols) n = cols;
     for (int c = 0; c < cols; c++) {
-        vga_set_cursor(row, c);
-        vga_putchar_at_cursor(c < n ? text[c] : ' ');
+        con_set_cursor(row, c);
+        con_putchar_at_cursor(c < n ? text[c] : ' ');
     }
 }
 
 static void render(void) {
-    enum vga_color fg = VGA_LIGHT_GREY;
-    enum vga_color bg = VGA_BLACK;
+    enum con_color fg = CON_LIGHT_GREY;
+    enum con_color bg = CON_BLACK;
 
     // Title bar.
     char title[80];
@@ -245,10 +245,10 @@ static void render(void) {
     for (const char* p = name; *p && pos < 79; p++) title[pos++] = *p;
     for (const char* p = mark; *p && pos < 79; p++) title[pos++] = *p;
     title[pos] = 0;
-    draw_bar(TITLE_ROW, title, VGA_BLACK, VGA_LIGHT_GREY);
+    draw_bar(TITLE_ROW, title, CON_BLACK, CON_LIGHT_GREY);
 
     // Text area: walk the buffer and paint visible lines.
-    vga_set_color(fg, bg);
+    con_set_color(fg, bg);
     int screen_row = TEXT_TOP;
     int file_line  = 0;
     unsigned int n = text_len();
@@ -264,8 +264,8 @@ static void render(void) {
     while (screen_row <= TEXT_BOT) {
         // Clear the row first so deleted content doesn't ghost.
         for (int c = 0; c < TEXT_COLS; c++) {
-            vga_set_cursor(screen_row, c);
-            vga_putchar_at_cursor(' ');
+            con_set_cursor(screen_row, c);
+            con_putchar_at_cursor(' ');
         }
 
         if (i >= n && file_line > 0) {
@@ -281,8 +281,8 @@ static void render(void) {
         int screen_col  = 0;
         while (i < n && text_at(i) != '\n') {
             if (col_in_line >= left_col && screen_col < TEXT_COLS) {
-                vga_set_cursor(screen_row, screen_col);
-                vga_putchar_at_cursor(text_at(i));
+                con_set_cursor(screen_row, screen_col);
+                con_putchar_at_cursor(text_at(i));
                 screen_col++;
             }
             col_in_line++;
@@ -297,18 +297,18 @@ static void render(void) {
     draw_bar(HINT_ROW,
              status[0] ? status
                        : " ^S Save   ^X Exit   ^K Cut line   ^U Paste",
-             VGA_BLACK, VGA_LIGHT_GREY);
+             CON_BLACK, CON_LIGHT_GREY);
     status[0] = 0;   // status messages are one-shot
 
     // Place the hardware cursor at the cursor's screen position.
-    vga_set_color(fg, bg);
+    con_set_color(fg, bg);
     int sr = TEXT_TOP + (cur_row - top_line);
     int sc = cur_col - left_col;
     if (sr < TEXT_TOP) sr = TEXT_TOP;
     if (sr > TEXT_BOT) sr = TEXT_BOT;
     if (sc < 0) sc = 0;
     if (sc >= TEXT_COLS) sc = TEXT_COLS - 1;
-    vga_set_cursor(sr, sc);
+    con_set_cursor(sr, sc);
 }
 
 // ---- prompt at the hint bar -------------------------------------------
@@ -318,7 +318,7 @@ static void render(void) {
 // `out` for text input and returns 0 on enter, -1 on cancel.
 
 static char prompt_yn(const char* msg) {
-    draw_bar(HINT_ROW, msg, VGA_BLACK, VGA_YELLOW);
+    draw_bar(HINT_ROW, msg, CON_BLACK, CON_YELLOW);
     while (1) {
         unsigned char c = (unsigned char)keyboard_getchar();
         if (c == 'y' || c == 'Y') return 'y';
@@ -337,8 +337,8 @@ static int prompt_text(const char* msg, char* out, int max) {
         for (const char* s = msg; *s && p < 79; s++) line[p++] = *s;
         for (int i = 0; i < len && p < 79; i++) line[p++] = out[i];
         line[p] = 0;
-        draw_bar(HINT_ROW, line, VGA_BLACK, VGA_YELLOW);
-        vga_set_cursor(HINT_ROW, p < vga_cols() ? p : vga_cols() - 1);
+        draw_bar(HINT_ROW, line, CON_BLACK, CON_YELLOW);
+        con_set_cursor(HINT_ROW, p < con_cols() ? p : con_cols() - 1);
 
         unsigned char c = (unsigned char)keyboard_getchar();
         if (c == '\n')        { out[len] = 0; return 0; }
@@ -530,7 +530,7 @@ int editor_run(const char* p) {
         }
     }
 
-    vga_clear();
+    con_clear();
 
     while (1) {
         recompute_cursor();
@@ -568,8 +568,8 @@ int editor_run(const char* p) {
                         if (!do_save()) break;   // failed/cancelled save
                     }
                 }
-                vga_clear();
-                vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+                con_clear();
+                con_set_color(CON_LIGHT_GREY, CON_BLACK);
                 kfree(buf);
                 buf = 0;
                 return 0;

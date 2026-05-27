@@ -1,5 +1,5 @@
 #include "isr.h"
-#include "vga.h"
+#include "console.h"
 #include "printf.h"
 #include "vmm.h"
 
@@ -44,12 +44,12 @@ void isr_handler(struct registers* regs) {
         halt();
     }
 
-    vga_set_color(VGA_LIGHT_RED, VGA_BLACK);
+    con_set_color(CON_LIGHT_RED, CON_BLACK);
     printf("\n*** EXCEPTION %d: %s ***\n",
            regs->int_no,
            regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown");
 
-    vga_set_color(VGA_WHITE, VGA_BLACK);
+    con_set_color(CON_WHITE, CON_BLACK);
     printf("  error code: 0x%x\n", regs->err_code);
     printf("  EIP:        0x%x\n", regs->eip);
     printf("  CS:         0x%x\n", regs->cs);
@@ -59,7 +59,7 @@ void isr_handler(struct registers* regs) {
     printf("  ESI=0x%x  EDI=0x%x  EBP=0x%x\n",
            regs->esi, regs->edi, regs->ebp);
 
-    vga_set_color(VGA_YELLOW, VGA_BLACK);
+    con_set_color(CON_YELLOW, CON_BLACK);
     printf("\nSystem halted.\n");
 
     halt();

@@ -3,7 +3,7 @@
 #include "irq.h"
 #include "pic.h"
 #include "isr.h"
-#include "vga.h"
+#include "console.h"
 
 // PS/2 controller ports.
 #define PS2_DATA   0x60   // read responses, write data bytes
@@ -159,9 +159,9 @@ static void mouse_irq(struct registers* regs) {
             if (rows > 5)  rows = 5;
             if (rows < -5) rows = -5;
             if (rows > 0) {
-                vga_scroll_down(rows);
+                con_scroll_down(rows);
             } else {
-                vga_scroll_up(-rows);
+                con_scroll_up(-rows);
             }
         }
     }

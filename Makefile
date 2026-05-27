@@ -48,9 +48,14 @@ LOADER_O     = loader.o
 EDITOR_O     = editor.o
 RTC_O        = rtc.o
 GFX_O        = gfx.o
+FONT_O       = font8x16.o
 DISK_IMG     = disk.img
 UACCESS_O    = uaccess.o
 PCI_O        = pci.o
+E1000_O      = e1000.o
+BVBE_O       = bochs_vbe.o
+FBCON_O      = fbcon.o
+BANNER_O     = boot_banner.o
 
 FAT_IMG      = fatdisk.img
 ISO_FILE     = Computer_OS.iso
@@ -62,7 +67,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(CONSOLE_O) $(PRINTF_O)
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O) $(PCI_O)
+			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O) $(FONT_O) $(PCI_O) $(E1000_O) $(BVBE_O) $(FBCON_O) $(BANNER_O)
 ISO_DIR = isodir
 
 all: $(ISO_FILE)
@@ -87,7 +92,7 @@ $(IRQ_ASM_O): src/irq_asm.asm
 	@echo "Assembling IRQ stubs..."
 	$(AS) $(ASFLAGS_ELF) src/irq_asm.asm -o $(IRQ_ASM_O)
 
-$(KERNEL_O): kernel.c include/vga.h include/printf.h include/idt.h include/pic.h include/keyboard.h include/mouse.h include/pit.h include/shell.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/ata.h include/fat12.h include/gdt.h include/syscall.h include/pci.h
+$(KERNEL_O): kernel.c include/console.h include/vga.h include/printf.h include/idt.h include/pic.h include/keyboard.h include/mouse.h include/pit.h include/shell.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/ata.h include/fat12.h include/gdt.h include/syscall.h include/pci.h include/e1000.h
 	@echo "Compiling C kernel..."
 	$(CC) $(CFLAGS) kernel.c -o $(KERNEL_O)
 
@@ -95,15 +100,11 @@ $(VGA_O): src/vga.c include/vga.h include/io.h
 	@echo "Compiling VGA driver..."
 	$(CC) $(CFLAGS) src/vga.c -o $(VGA_O)
 
-$(CONSOLE_O): src/console.c include/console.h include/vga.h
-	@echo "Compiling console abstraction..."
-	$(CC) $(CFLAGS) src/console.c -o $(CONSOLE_O)
-
-$(GFX_O): src/gfx.c include/gfx.h include/io.h
+$(GFX_O): src/gfx.c include/gfx.h include/io.h include/font8x16.h
 	@echo "Compiling graphics (mode 13h) driver..."
 	$(CC) $(CFLAGS) src/gfx.c -o $(GFX_O)
 
-$(PRINTF_O): src/printf.c include/printf.h include/vga.h include/serial.h
+$(PRINTF_O): src/printf.c include/printf.h include/console.h include/vga.h include/serial.h
 	@echo "Compiling printf..."
 	$(CC) $(CFLAGS) src/printf.c -o $(PRINTF_O)
 
@@ -111,7 +112,7 @@ $(IDT_O): src/idt.c include/idt.h
 	@echo "Compiling IDT..."
 	$(CC) $(CFLAGS) src/idt.c -o $(IDT_O)
 
-$(ISR_O): src/isr.c include/isr.h include/vga.h include/printf.h include/vmm.h
+$(ISR_O): src/isr.c include/isr.h include/console.h include/vga.h include/printf.h include/vmm.h
 	@echo "Compiling ISR handler..."
 	$(CC) $(CFLAGS) src/isr.c -o $(ISR_O)
 
@@ -127,7 +128,7 @@ $(KEYBOARD_O): src/keyboard.c include/keyboard.h include/irq.h include/pic.h inc
 	@echo "Compiling keyboard driver..."
 	$(CC) $(CFLAGS) src/keyboard.c -o $(KEYBOARD_O)
 
-$(MOUSE_O): src/mouse.c include/mouse.h include/irq.h include/pic.h include/io.h include/isr.h include/vga.h
+$(MOUSE_O): src/mouse.c include/mouse.h include/irq.h include/pic.h include/io.h include/isr.h include/console.h include/vga.h
 	@echo "Compiling mouse driver..."
 	$(CC) $(CFLAGS) src/mouse.c -o $(MOUSE_O)
 
@@ -143,7 +144,7 @@ $(SERIAL_O): src/serial.c include/serial.h include/io.h
 	@echo "Compiling serial driver..."
 	$(CC) $(CFLAGS) src/serial.c -o $(SERIAL_O)
 
-$(SHELL_O): src/shell.c include/shell.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h
+$(SHELL_O): src/shell.c include/shell.h include/console.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h
 	@echo "Compiling shell..."
 	$(CC) $(CFLAGS) src/shell.c -o $(SHELL_O)
 
@@ -155,7 +156,7 @@ $(PMM_O): src/pmm.c include/pmm.h include/memmap.h include/printf.h
 	@echo "Compiling physical memory manager..."
 	$(CC) $(CFLAGS) src/pmm.c -o $(PMM_O)
 
-$(VMM_O): src/vmm.c include/vmm.h include/pmm.h include/printf.h include/vga.h include/isr.h include/task.h
+$(VMM_O): src/vmm.c include/vmm.h include/pmm.h include/printf.h include/console.h include/vga.h include/isr.h include/task.h
 	@echo "Compiling virtual memory manager..."
 	$(CC) $(CFLAGS) src/vmm.c -o $(VMM_O)
 
@@ -175,7 +176,7 @@ $(GDT_O): src/gdt.c include/gdt.h
 	@echo "Compiling GDT/TSS..."
 	$(CC) $(CFLAGS) src/gdt.c -o $(GDT_O)
 
-$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h include/uaccess.h include/loader.h
+$(SYSCALL_O): src/syscall.c include/syscall.h include/idt.h include/console.h include/vga.h include/printf.h include/task.h include/keyboard.h include/isr.h include/uaccess.h include/loader.h
 	@echo "Compiling syscall dispatcher..."
 	$(CC) $(CFLAGS) src/syscall.c -o $(SYSCALL_O)
 
@@ -191,7 +192,7 @@ $(LOADER_O): src/loader.c include/loader.h include/elf.h include/fat12.h include
 	@echo "Compiling user-program loader..."
 	$(CC) $(CFLAGS) src/loader.c -o $(LOADER_O)
 
-$(EDITOR_O): src/editor.c include/editor.h include/vga.h include/keyboard.h include/kheap.h include/string.h include/printf.h include/fat12.h
+$(EDITOR_O): src/editor.c include/editor.h include/console.h include/vga.h include/keyboard.h include/kheap.h include/string.h include/printf.h include/fat12.h
 	@echo "Compiling text editor..."
 	$(CC) $(CFLAGS) src/editor.c -o $(EDITOR_O)
 
@@ -276,12 +277,16 @@ run: $(ISO_FILE) $(FAT_IMG)
 	@echo "Booting OS in QEMU..."
 	$(QEMU) -cdrom $(ISO_FILE) \
 	        -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk \
+	        -netdev user,id=net0 \
+	        -device e1000,netdev=net0 \
 	        -boot d -display cocoa,zoom-to-fit=on
 
 debug: $(ISO_FILE) $(FAT_IMG)
 	@echo "Booting OS in QEMU (debug mode)..."
 	$(QEMU) -cdrom $(ISO_FILE) \
 	        -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk \
+	        -netdev user,id=net0 \
+	        -device e1000,netdev=net0 \
 	        -boot d -serial stdio -no-reboot -display cocoa,zoom-to-fit=on
 
 clean:
@@ -291,3 +296,27 @@ clean:
 $(PCI_O): src/pci.c include/pci.h include/io.h include/printf.h
 	@echo "Compiling PCI bus driver..."
 	$(CC) $(CFLAGS) src/pci.c -o $(PCI_O)
+
+$(E1000_O): src/e1000.c include/e1000.h include/pci.h include/vmm.h include/printf.h
+	@echo "Compiling e1000 network driver..."
+	$(CC) $(CFLAGS) src/e1000.c -o $(E1000_O)
+
+$(CONSOLE_O): src/console.c include/console.h include/vga.h include/console_backend.h include/fbcon.h include/bochs_vbe.h
+	@echo "Compiling console abstraction..."
+	$(CC) $(CFLAGS) src/console.c -o $(CONSOLE_O)
+
+$(FONT_O): src/font8x16.c include/font8x16.h
+	@echo "Compiling embedded 8x16 font..."
+	$(CC) $(CFLAGS) src/font8x16.c -o $(FONT_O)
+
+$(BVBE_O): src/bochs_vbe.c include/bochs_vbe.h include/io.h include/pci.h include/vmm.h include/printf.h
+	@echo "Compiling Bochs VBE driver..."
+	$(CC) $(CFLAGS) src/bochs_vbe.c -o $(BVBE_O)
+
+$(FBCON_O): src/fbcon.c include/fbcon.h include/console_backend.h include/bochs_vbe.h include/font8x16.h include/string.h
+	@echo "Compiling framebuffer console..."
+	$(CC) $(CFLAGS) src/fbcon.c -o $(FBCON_O)
+
+$(BANNER_O): src/boot_banner.c include/boot_banner.h include/console.h include/printf.h
+	@echo "Compiling boot banner..."
+	$(CC) $(CFLAGS) src/boot_banner.c -o $(BANNER_O)

@@ -1,6 +1,6 @@
 #include "syscall.h"
 #include "idt.h"
-#include "vga.h"
+#include "console.h"
 #include "printf.h"
 #include "task.h"
 #include "keyboard.h"
@@ -46,7 +46,7 @@ static int sys_write(int fd, const char* buf, unsigned int len) {
         if (copy_from_user(chunk, buf + total, n) != 0) {
             return (total > 0) ? (int)total : EFAULT;
         }
-        for (unsigned int i = 0; i < n; i++) vga_putchar(chunk[i]);
+        for (unsigned int i = 0; i < n; i++) con_putchar(chunk[i]);
         total += n;
     }
     return (int)total;
@@ -115,7 +115,7 @@ void syscall_handler(struct registers* regs) {
 
         case SYS_SETCOLOR:
             if (a1 < 16 && a2 < 16)
-                vga_set_color((enum vga_color)a1, (enum vga_color)a2);
+                con_set_color((enum con_color)a1, (enum con_color)a2);
             ret = 0;
             break;
 

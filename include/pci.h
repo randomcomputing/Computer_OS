@@ -51,6 +51,12 @@ pci_u32 pci_config_read32(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset);
 pci_u16 pci_config_read16(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset);
 pci_u8  pci_config_read8 (pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset);
 void    pci_config_write32(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset, pci_u32 value);
+void    pci_config_write16(pci_u8 bus, pci_u8 dev, pci_u8 func, pci_u8 offset, pci_u16 value);
+
+// Helpers useful for real device drivers.
+void    pci_enable_bus_mastering(const pci_device_t* dev);
+pci_u32 pci_bar_addr(const pci_device_t* dev, int bar);
+int     pci_bar_is_io(const pci_device_t* dev, int bar);
 
 // --- Enumeration -------------------------------------------------------------
 // Scan every bus/device/function once and fill an internal table. Returns the

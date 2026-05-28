@@ -17,6 +17,10 @@
 #include "editor.h"
 #include "gfx.h"
 #include "pci.h"
+#include "e1000.h"
+#include "arp.h"
+#include "net.h"
+#include "tcp.h"
 #include "bochs_vbe.h"
 
 #define LINE_MAX 128
@@ -29,7 +33,7 @@
 static const char* commands[] = {
     "help", "clear", "echo", "about", "uptime", "sleep",
     "meminfo", "pmemstat", "palloc", "vmap", "kmstat", "kmtest",
-    "lspci", "vbe",
+    "lspci", "vbe", "nettest", "ping", "resolve", "http",
     "ps", "spawn", "yield", "preempt",
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
     "cd", "pwd", "mount",
@@ -770,6 +774,151 @@ static void cmd_lspci(void) {
     }
 }
 
+// ---- e1000 / ARP network test --------------------------------------------
+// Resolves the SLIRP gateway (10.0.2.2) via ARP: broadcast a "who-has"
+// request and wait for the reply. Success printing the gateway's MAC proves
+// the whole path — descriptor rings, Ethernet framing, ARP — end to end.
+static void cmd_nettest(void) {
+    unsigned char mac[6];
+    e1000_get_mac(mac);
+    printf("our MAC %x:%x:%x:%x:%x:%x  (IP 10.0.2.15)\n",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    unsigned int gw = 0x0A000202u;   // 10.0.2.2, the SLIRP gateway
+    printf("ARP: who has 10.0.2.2 ?\n");
+    if (!arp_request(gw)) {
+        printf("ARP: send failed (TX ring full?)\n");
+        return;
+    }
+
+    printf("ARP: waiting for reply ~2s...\n");
+    unsigned char gw_mac[6];
+    unsigned int gw_ip;
+    for (int t = 0; t < 200; t++) {          // 200 * 10ms = 2s
+        if (arp_poll_reply(gw_mac, &gw_ip)) {
+            printf("ARP reply: %u.%u.%u.%u is at %x:%x:%x:%x:%x:%x\n",
+                   (gw_ip >> 24) & 0xFF, (gw_ip >> 16) & 0xFF,
+                   (gw_ip >> 8) & 0xFF, gw_ip & 0xFF,
+                   gw_mac[0], gw_mac[1], gw_mac[2],
+                   gw_mac[3], gw_mac[4], gw_mac[5]);
+            printf("nettest: SUCCESS - rings + Ethernet + ARP all work.\n");
+            return;
+        }
+        pit_sleep(10);
+    }
+    printf("ARP: no reply received\n");
+    printf("nettest done.\n");
+}
+
+// Parse a dotted-quad like "10.0.2.2" into a host-order IP. Returns 0 on bad
+// input. Empty/NULL yields the gateway default.
+static unsigned int parse_ip(const char* s) {
+    if (!s || !*s) return NET_GATEWAY;
+    unsigned int parts[4] = {0, 0, 0, 0};
+    int pi = 0, seen = 0;
+    unsigned int cur = 0;
+    for (const char* p = s; ; p++) {
+        if (*p >= '0' && *p <= '9') {
+            cur = cur * 10 + (unsigned int)(*p - '0');
+            if (cur > 255) return 0;
+            seen = 1;
+        } else if (*p == '.' || *p == '\0') {
+            if (!seen || pi > 3) return 0;
+            parts[pi++] = cur;
+            cur = 0; seen = 0;
+            if (*p == '\0') break;
+        } else {
+            return 0;   // invalid character
+        }
+    }
+    if (pi != 4) return 0;
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+static void cmd_ping(const char* args) {
+    if (!args || !*args) { ping(NET_GATEWAY, 4, 1000); return; }
+
+    // A leading digit means a dotted-quad; otherwise treat it as a hostname
+    // and resolve it via DNS first.
+    unsigned int ip;
+    if (args[0] >= '0' && args[0] <= '9') {
+        ip = parse_ip(args);
+        if (ip == 0) { printf("usage: ping [a.b.c.d | hostname]\n"); return; }
+    } else {
+        printf("resolving %s ...\n", args);
+        if (!dns_resolve(args, &ip)) {
+            printf("ping: could not resolve %s\n", args);
+            return;
+        }
+        printf("%s -> %u.%u.%u.%u\n", args,
+               (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    }
+    ping(ip, 4, 1000);
+}
+
+static void cmd_resolve(const char* args) {
+    if (!args || !*args) { printf("usage: resolve <hostname>\n"); return; }
+    unsigned int ip;
+    if (!dns_resolve(args, &ip)) {
+        printf("could not resolve %s\n", args);
+        return;
+    }
+    printf("%s -> %u.%u.%u.%u\n", args,
+           (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+// Fetch http://<host>/ over TCP port 80 and print the first chunk of the
+// response. Proves the TCP client end to end: DNS -> connect -> send -> recv.
+static void cmd_http(const char* args) {
+    if (!args || !*args) { printf("usage: http <hostname>\n"); return; }
+
+    unsigned int ip;
+    if (args[0] >= '0' && args[0] <= '9') {
+        ip = parse_ip(args);
+        if (!ip) { printf("bad address\n"); return; }
+    } else {
+        printf("resolving %s ...\n", args);
+        if (!dns_resolve(args, &ip)) { printf("http: could not resolve %s\n", args); return; }
+        printf("%s -> %u.%u.%u.%u\n", args,
+               (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    }
+
+    printf("connecting to port 80...\n");
+    tcp_conn_t* c = tcp_connect(ip, 80);
+    if (!c) { printf("http: connect failed\n"); return; }
+    printf("connected. sending GET.\n");
+
+    // Build a minimal HTTP/1.0 request. Host header uses the literal arg.
+    char req[256];
+    int n = 0;
+    const char* g = "GET / HTTP/1.0\r\nHost: ";
+    for (const char* p = g; *p; p++) req[n++] = *p;
+    for (const char* p = args; *p; p++) req[n++] = *p;
+    const char* tail = "\r\nConnection: close\r\n\r\n";
+    for (const char* p = tail; *p; p++) req[n++] = *p;
+
+    if (tcp_send(c, req, (unsigned int)n) < 0) { printf("http: send failed\n"); tcp_close(c); return; }
+
+    printf("--- response ---\n");
+    char buf[1024];
+    int total = 0;
+    for (;;) {
+        int r = tcp_recv(c, buf, sizeof(buf) - 1, 3000);
+        if (r > 0) {
+            buf[r] = '\0';
+            printf("%s", buf);
+            total += r;
+            if (total > 4000) { printf("\n...(truncated)\n"); break; }
+        } else if (r < 0) {
+            break;   // peer closed
+        } else {
+            break;   // timeout
+        }
+    }
+    printf("\n--- done (%d bytes) ---\n", total);
+    tcp_close(c);
+}
+
 // ---- Bochs VBE framebuffer test ------------------------------------------
 // Sets 1024x768x32 and paints a test pattern straight into the linear
 // framebuffer: vertical RGB gradient bars and a white border. This proves the
@@ -1291,6 +1440,10 @@ static void execute(char* line) {
     else if (strcmp(line, "uptime")   == 0) cmd_uptime();
     else if (strcmp(line, "sleep")    == 0) cmd_sleep(args);
     else if (strcmp(line, "meminfo")  == 0) cmd_meminfo();
+    else if (strcmp(line, "nettest")  == 0) cmd_nettest();
+    else if (strcmp(line, "ping")     == 0) cmd_ping(args);
+    else if (strcmp(line, "resolve")  == 0) cmd_resolve(args);
+    else if (strcmp(line, "http")     == 0) cmd_http(args);
     else if (strcmp(line, "pmemstat") == 0) cmd_pmemstat();
     else if (strcmp(line, "palloc")   == 0) cmd_palloc();
     else if (strcmp(line, "vmap")     == 0) cmd_vmap(args);

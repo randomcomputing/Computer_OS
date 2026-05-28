@@ -13,6 +13,11 @@
 
 #define E1000_REG_CTRL       0x0000
 #define E1000_REG_STATUS     0x0008
+#define E1000_REG_MTA        0x5200    // multicast table array (128 regs)
+
+// CTRL bits.
+#define CTRL_ASDE            0x00000020  // auto-speed detect enable
+#define CTRL_SLU             0x00000040  // set link up
 #define E1000_REG_ICR        0x00C0
 #define E1000_REG_IMC        0x00D8
 #define E1000_REG_RCTL       0x0100
@@ -32,6 +37,8 @@
 #define E1000_REG_RAH        0x5404
 
 #define RCTL_EN              (1 << 1)
+#define RCTL_UPE             (1 << 3)    // unicast promiscuous
+#define RCTL_MPE             (1 << 4)    // multicast promiscuous
 #define RCTL_BAM             (1 << 15)
 #define RCTL_SECRC           (1 << 26)
 
@@ -140,7 +147,7 @@ static int e1000_setup_rx(void) {
     e1000_write(E1000_REG_RDH, 0);
     e1000_write(E1000_REG_RDT, NUM_RX_DESC - 1);
     rx_cur = 0;
-    e1000_write(E1000_REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    e1000_write(E1000_REG_RCTL, RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
     return 1;
 }
 
@@ -233,6 +240,20 @@ int e1000_init(void) {
     e1000_read_mac_from_registers();
     printf("e1000: MAC = %x:%x:%x:%x:%x:%x\n",
            e1000_mac[0], e1000_mac[1], e1000_mac[2], e1000_mac[3], e1000_mac[4], e1000_mac[5]);
+
+    // Bring the link up BEFORE enabling the receiver/transmitter. Without
+    // CTRL.SLU the PHY link never comes up, so frames silently go nowhere and
+    // none are ever received — set link up + auto-speed-detect first.
+    {
+        unsigned int ctrl = e1000_read(E1000_REG_CTRL);
+        ctrl |= CTRL_SLU | CTRL_ASDE;
+        e1000_write(E1000_REG_CTRL, ctrl);
+    }
+
+    // Clear the multicast table array (128 registers) — it holds garbage at
+    // reset and can otherwise interfere with receive filtering.
+    for (int i = 0; i < 128; i++)
+        e1000_write(E1000_REG_MTA + i * 4, 0);
 
     dma_next = 0;
     if (!e1000_setup_rx()) { printf("e1000: RX setup failed\n"); return 0; }

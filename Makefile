@@ -53,6 +53,9 @@ DISK_IMG     = disk.img
 UACCESS_O    = uaccess.o
 PCI_O        = pci.o
 E1000_O      = e1000.o
+ARP_O        = arp.o
+NET_O        = net.o
+TCP_O        = tcp.o
 BVBE_O       = bochs_vbe.o
 FBCON_O      = fbcon.o
 BANNER_O     = boot_banner.o
@@ -67,7 +70,7 @@ KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(CONSOLE_O) $(PRINTF_O)
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
-			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O) $(FONT_O) $(PCI_O) $(E1000_O) $(BVBE_O) $(FBCON_O) $(BANNER_O)
+			  $(LOADER_O) $(EDITOR_O) $(RTC_O) $(UACCESS_O) $(GFX_O) $(FONT_O) $(PCI_O) $(E1000_O) $(ARP_O) $(NET_O) $(TCP_O) $(BVBE_O) $(FBCON_O) $(BANNER_O)
 ISO_DIR = isodir
 
 all: $(ISO_FILE)
@@ -144,7 +147,7 @@ $(SERIAL_O): src/serial.c include/serial.h include/io.h
 	@echo "Compiling serial driver..."
 	$(CC) $(CFLAGS) src/serial.c -o $(SERIAL_O)
 
-$(SHELL_O): src/shell.c include/shell.h include/console.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h
+$(SHELL_O): src/shell.c include/shell.h include/console.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h include/e1000.h
 	@echo "Compiling shell..."
 	$(CC) $(CFLAGS) src/shell.c -o $(SHELL_O)
 
@@ -297,7 +300,7 @@ $(PCI_O): src/pci.c include/pci.h include/io.h include/printf.h
 	@echo "Compiling PCI bus driver..."
 	$(CC) $(CFLAGS) src/pci.c -o $(PCI_O)
 
-$(E1000_O): src/e1000.c include/e1000.h include/pci.h include/vmm.h include/printf.h
+$(E1000_O): src/e1000.c include/e1000.h include/pci.h include/vmm.h include/pmm.h include/string.h include/printf.h
 	@echo "Compiling e1000 network driver..."
 	$(CC) $(CFLAGS) src/e1000.c -o $(E1000_O)
 
@@ -320,3 +323,14 @@ $(FBCON_O): src/fbcon.c include/fbcon.h include/console_backend.h include/bochs_
 $(BANNER_O): src/boot_banner.c include/boot_banner.h include/console.h include/printf.h
 	@echo "Compiling boot banner..."
 	$(CC) $(CFLAGS) src/boot_banner.c -o $(BANNER_O)
+$(ARP_O): src/arp.c include/arp.h include/e1000.h include/string.h
+	@echo "Compiling ARP..."
+	$(CC) $(CFLAGS) src/arp.c -o $(ARP_O)
+
+$(NET_O): src/net.c include/net.h include/net_internal.h include/arp.h include/e1000.h include/string.h include/pit.h include/printf.h
+	@echo "Compiling IP/ICMP..."
+	$(CC) $(CFLAGS) src/net.c -o $(NET_O)
+
+$(TCP_O): src/tcp.c include/tcp.h include/net.h include/net_internal.h include/e1000.h include/string.h include/pit.h include/printf.h
+	@echo "Compiling TCP..."
+	$(CC) $(CFLAGS) src/tcp.c -o $(TCP_O)

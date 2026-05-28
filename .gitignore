@@ -4,7 +4,9 @@
 .VSCodeCounter/
 .vscode/
 
+#others
 
+issues.txt
 # Build artifacts - object files
 *.o
 *.obj

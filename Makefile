@@ -278,19 +278,26 @@ $(FAT_IMG): userprogs/hello.asm userprogs/count.asm \
 
 run: $(ISO_FILE) $(FAT_IMG)
 	@echo "Booting OS in QEMU..."
-	$(QEMU) -cdrom $(ISO_FILE) \
-	        -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk \
+	$(QEMU) \
+	        -drive file=$(FAT_IMG),format=raw,if=ide,bus=0,unit=0,media=disk \
+	        -drive file=$(ISO_FILE),format=raw,if=ide,bus=1,unit=0,media=cdrom \
 	        -netdev user,id=net0 \
 	        -device e1000,netdev=net0 \
-	        -boot d -display cocoa,zoom-to-fit=on
+	        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+	        -boot d \
+	        -display cocoa,zoom-to-fit=on
 
 debug: $(ISO_FILE) $(FAT_IMG)
 	@echo "Booting OS in QEMU (debug mode)..."
-	$(QEMU) -cdrom $(ISO_FILE) \
-	        -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk \
+	$(QEMU) \
+	        -drive file=$(FAT_IMG),format=raw,if=ide,bus=0,unit=0,media=disk \
+	        -drive file=$(ISO_FILE),format=raw,if=ide,bus=1,unit=0,media=cdrom \
 	        -netdev user,id=net0 \
 	        -device e1000,netdev=net0 \
-	        -boot d -serial stdio -no-reboot -display cocoa,zoom-to-fit=on
+	        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+	        -boot d \
+	        -serial stdio \
+	        -display cocoa,zoom-to-fit=on
 
 clean:
 	rm -f *.o *.bin *.iso disk.img $(FAT_IMG)

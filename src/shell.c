@@ -1291,30 +1291,95 @@ static void cmd_shutdown(void) {
     printf("You can safely power off the machine.\n");
 }
 
+
 static void cmd_reboot(void) {
-    printf("Rebooting...\n");
-    pit_sleep(200);
+    con_puts("Rebooting...\n");
+
+    /*
+     * Give serial/VGA/framebuffer output a tiny moment to flush.
+     * Do this BEFORE cli, because pit_sleep usually needs timer IRQs.
+     */
+    pit_sleep(20);
+
     __asm__ volatile ("cli");
-    #define REBOOT_DELAY() do { \
-        for (volatile int _i = 0; _i < 1000000; _i++) { } \
-    } while (0)
-    volatile unsigned short* vga = (volatile unsigned short*)0xB8000;
-    vga[0] = 0x0F31;
-    for (int i = 0; i < 16; i++) {
-        if ((inb(0x64) & 0x01) == 0) break;
-        (void)inb(0x60);
-    }
-    for (int i = 0; i < 100000; i++) {
-        if ((inb(0x64) & 0x02) == 0) break;
-    }
-    vga[1] = 0x0F32;
+
+    /*
+     * Method 1: PCI reset control register.
+     *
+     * Common on QEMU/Bochs/real chipsets.
+     *
+     * 0x02 = system reset enable
+     * 0x06 = system reset enable + full reset
+     */
+    outb(0xCF9, 0x02);
+    io_wait();
+    io_wait();
+    outb(0xCF9, 0x06);
+    io_wait();
+    io_wait();
+
+    /*
+     * Method 2: ACPI reset register used by many QEMU i440fx/PIIX setups.
+     *
+     * QEMU often exposes ACPI reset at I/O port 0x604.
+     * Value 0x2000 requests reset.
+     *
+     * This is safe as a fallback. If unsupported, it usually does nothing.
+     */
+    outw(0x604, 0x2000);
+    io_wait();
+    io_wait();
+
+    /*
+     * Method 3: Keyboard controller pulse reset line.
+     *
+     * Do NOT wait forever for the controller. Just try it.
+     * Your old code likely froze because the KBC status never became what
+     * the reboot code expected.
+     */
     outb(0x64, 0xFE);
-    REBOOT_DELAY();
-    vga[2] = 0x0F33;
-    struct { unsigned short limit; unsigned int base; } __attribute__((packed))
-        null_idt = { 0, 0 };
-    __asm__ volatile ("lidt (%0); int $0x3" : : "r"(&null_idt));
-    for (;;) __asm__ volatile ("hlt");
+    io_wait();
+    io_wait();
+
+    /*
+     * Method 4: triple fault.
+     *
+     * This should reset the CPU on QEMU if -no-reboot is not present.
+     */
+    struct idtr32 {
+        unsigned short limit;
+        unsigned int base;
+    } __attribute__((packed));
+
+    struct idtr32 bad_idt;
+    bad_idt.limit = 0;
+    bad_idt.base = 0;
+
+    __asm__ volatile (
+        "lidt (%0)\n\t"
+        "int $0x03\n\t"
+        "ud2\n\t"
+        :
+        : "r"(&bad_idt)
+        : "memory"
+    );
+
+    /*
+     * Method 5: QEMU debug-exit fallback.
+     *
+     * This requires adding:
+     *
+     *   -device isa-debug-exit,iobase=0xf4,iosize=0x04
+     *
+     * to your QEMU command.
+     *
+     * If real reboot still does not work, this at least prevents a frozen VM.
+     */
+    outb(0xF4, 0x10);
+
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
 }
 
 static void cmd_ps(void)    { task_list_print(); }

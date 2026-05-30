@@ -159,6 +159,10 @@ uint64_t vmm_current(void) {
     return cr3 & ~0xFFFULL;
 }
 
+uint64_t vmm_kernel_pd(void) {
+    return g_kernel_pml4;
+}
+
 /*
  * Create a new user PML4.
  *

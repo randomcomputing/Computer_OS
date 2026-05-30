@@ -1,18 +1,7 @@
 /*
- * user.ld — linker script for Computer_OS ELF32 user programs.
+ * user.ld — 64-bit user program linker script.
  *
- * Lays out .text, .rodata, .data, and .bss starting at 0x01000000
- * (LOADER_CODE_VIRT in include/loader.h).  The kernel ELF loader
- * parses the resulting PT_LOAD segments and maps each one at its
- * p_vaddr with the appropriate R/W permissions.
- *
- * Key invariants:
- *  - Entry symbol _start lives at 0x01000000.  crt0.s places _start
- *    in .text.start, which we emit before the rest of .text.
- *  - .bss is flagged in the PT_LOAD segment as memsz > filesz.  The
- *    loader zeros the gap, so uninitialized globals are zero.
- *  - Total program size should stay under LOADER_CODE_BYTES (64 KB).
- *    Bump LOADER_CODE_PAGES in loader.h if you need more.
+ * User programs are loaded at 0x01000000 and run in long mode ring 3.
  */
 
 ENTRY(_start)
@@ -21,26 +10,23 @@ SECTIONS
 {
     . = 0x01000000;
 
-    /* crt0 puts the entry point in .text.start so it lands at offset 0. */
-    .text : ALIGN(4) {
+    .text : ALIGN(0x1000) {
         *(.text.start)
         *(.text)
         *(.text.*)
     }
 
-    .rodata : ALIGN(4) {
+    .rodata : ALIGN(0x1000) {
         *(.rodata)
         *(.rodata.*)
     }
 
-    .data : ALIGN(4) {
+    .data : ALIGN(0x1000) {
         *(.data)
         *(.data.*)
     }
 
-    /* .bss is NOT included in the file image (memsz > filesz in the
-     * PT_LOAD segment).  The ELF loader zeros the gap explicitly. */
-    .bss : ALIGN(4) {
+    .bss : ALIGN(0x1000) {
         __bss_start = .;
         *(.bss)
         *(.bss.*)
@@ -48,7 +34,6 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Drop everything the loader doesn't map (debug info, eh_frame, etc.). */
     /DISCARD/ : {
         *(.comment)
         *(.note*)

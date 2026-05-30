@@ -17,6 +17,15 @@ int strncmp(const char* a, const char* b, size_t n) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+int memcmp(const void* a, const void* b, size_t n) {
+    const unsigned char* p = (const unsigned char*)a;
+    const unsigned char* q = (const unsigned char*)b;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] != q[i]) return (int)p[i] - (int)q[i];
+    }
+    return 0;
+}
+
 void* memset(void* dst, int value, size_t n) {
     unsigned char* p = (unsigned char*)dst;
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)value;
@@ -31,9 +40,7 @@ void* memcpy(void* dst, const void* src, size_t n) {
 }
 
 unsigned int atou(const char* s) {
-    // Skip leading whitespace (just spaces — we don't have isspace).
     while (*s == ' ') s++;
-
     unsigned int n = 0;
     while (*s >= '0' && *s <= '9') {
         n = n * 10 + (unsigned int)(*s - '0');

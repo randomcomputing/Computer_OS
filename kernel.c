@@ -22,6 +22,7 @@
 #include "task.h"
 #include "ata.h"
 #include "fat12.h"
+#include "fat32.h"
 #include "vfs.h"
 #include "ramfs.h"
 #include "syscall.h"
@@ -254,24 +255,32 @@ void kmain(void) {
     if (ata_init()) {
         print_status(1, "ATA primary master detected");
 
-        if (fat12_mount() == 0) {
-            vfs_init();
+        vfs_init();
 
+        // Try FAT32 first; fall back to FAT12 for the 1.44 MB floppy image.
+        if (fat32_mount() == 0) {
+            if (vfs_mount("/", fat32_vfs_ops(), "fat32") == 0) {
+                print_status(1, "FAT32 mounted at /");
+                g_fs_ok = 1;
+            } else {
+                print_status(0, "FAT32 mount failed");
+            }
+        } else if (fat12_mount() == 0) {
             if (vfs_mount("/", fat12_vfs_ops(), "fat12") == 0) {
                 print_status(1, "FAT12 mounted at /");
                 g_fs_ok = 1;
             } else {
                 print_status(0, "FAT12 mount failed");
             }
-
-            ramfs_init();
-            if (vfs_mount("/tmp", ramfs_vfs_ops(), "ramfs") == 0) {
-                print_status(1, "ramfs mounted at /tmp");
-            } else {
-                print_status(0, "ramfs mount failed");
-            }
         } else {
-            print_status(0, "No FAT12 filesystem");
+            print_status(0, "No FAT filesystem");
+        }
+
+        ramfs_init();
+        if (vfs_mount("/tmp", ramfs_vfs_ops(), "ramfs") == 0) {
+            print_status(1, "ramfs mounted at /tmp");
+        } else {
+            print_status(0, "ramfs mount failed");
         }
     } else {
         print_status(0, "No ATA disk");

@@ -630,47 +630,83 @@ static void readline(char* buf, unsigned int max,
 // =====================================================================
 
 static void cmd_help(void) {
-    printf("Available commands:\n");
-    printf("  help          show this help\n");
-    printf("  clear         clear the screen\n");
-    printf("  echo <text>   print text\n");
-    printf("  about         about this OS\n");
-    printf("  uptime        show time since boot\n");
-    printf("  sleep <ms>    pause for N milliseconds\n");
-    printf("  meminfo       show physical memory map\n");
-    printf("  pmemstat      show physical page allocator stats\n");
-    printf("  palloc        allocate one page and print its address\n");
-    printf("  vmap <virt>   resolve a virtual address to physical\n");
-    printf("  kmstat        show kernel heap stats\n");
-    printf("  kmtest        run a quick heap sanity test\n");
-    printf("  lspci         list devices on the PCI bus\n");
-    printf("  vbe           set 1024x768x32 framebuffer (test pattern)\n");
-    printf("  ps            list tasks\n");
-    printf("  spawn <kind>  launch a demo task: counter | spinner\n");
-    printf("  yield         voluntarily yield the CPU once\n");
-    printf("  preempt <on|off>   toggle preemptive scheduling\n");
-    printf("  ls [<path>]   list files in a directory\n");
-    printf("  cat <file>    print a file's contents\n");
-    printf("  write <file> <text>  create/overwrite a file\n");
-    printf("  rm <file>     delete a file\n");
-    printf("  cp <src> <dst>   copy a file\n");
-    printf("  mv <src> <dst>   rename or move a file/directory\n");
-    printf("  mkdir <path>  create a directory\n");
-    printf("  rmdir <path>  remove an empty directory\n");
-    printf("  cd [<path>]   change directory (no arg = root)\n");
-    printf("  pwd           print working directory\n");
-    printf("  history       show command history\n");
-    printf("  date          show current date and time\n");
-    printf("  tz [<n>]      show or set timezone (e.g. tz PST)\n");
-    printf("  user          run the ring-3 demo program\n");
-    printf("  run <file>    load and run an ELF32 or flat-binary program from FAT12\n");
-    printf("                  e.g.  run ECHO.ELF    run HELLO.BIN\n");
-    printf("  edit [<file>]  open a file in the full-screen text editor\n");
-    printf("  reboot        restart the machine\n");
-    printf("  shutdown      power off (ACPI S5)\n");
-    printf("Editing: Tab=complete, Up/Down=history, Left/Right=move,\n");
-    printf("         Home/End=line ends, Delete=del char,\n");
-    printf("         PgUp/PgDn=scroll output history.\n");
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("Computer OS help\n");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    printf("\n");
+
+    printf("General:\n");
+    printf("  help                 show this help screen\n");
+    printf("  about                show OS version and features\n");
+    printf("  clear                clear the screen\n");
+    printf("  echo <text>          print text\n");
+    printf("  uptime               show time since boot\n");
+    printf("  sleep <ms>           pause for N milliseconds\n");
+    printf("  reboot               restart the machine\n");
+    printf("  shutdown             power off using ACPI S5\n");
+    printf("\n");
+
+    printf("Files and disks:\n");
+    printf("  mount                show mounted filesystems\n");
+    printf("  ls [path]            list files in a directory\n");
+    printf("  cat <file>           print a file\n");
+    printf("  write <file> <text>  create or overwrite a file\n");
+    printf("  rm <file>            delete a file\n");
+    printf("  cp <src> <dst>       copy a file\n");
+    printf("  mv <src> <dst>       rename or move a file/directory\n");
+    printf("  mkdir <path>         create a directory\n");
+    printf("  rmdir <path>         remove an empty directory\n");
+    printf("  cd [path]            change directory; no arg goes to /\n");
+    printf("  pwd                  print working directory\n");
+    printf("\n");
+
+    printf("Programs and tasks:\n");
+    printf("  run <file>           load and run an ELF64 or flat binary\n");
+    printf("  user                 run the built-in ring-3 demo\n");
+    printf("  ps                   list tasks\n");
+    printf("  spawn <kind>         start demo task: counter | spinner\n");
+    printf("  yield                voluntarily yield the CPU once\n");
+    printf("  preempt <on|off>     toggle preemptive scheduling\n");
+    printf("\n");
+
+    printf("Memory and kernel debug:\n");
+    printf("  meminfo              show Limine memory map summary\n");
+    printf("  pmemstat             show physical page allocator stats\n");
+    printf("  palloc               allocate one physical page\n");
+    printf("  vmap <virt>          resolve virtual address to physical\n");
+    printf("  kmstat               show kernel heap stats\n");
+    printf("  kmtest               run a heap sanity test\n");
+    printf("\n");
+
+    printf("Hardware and networking:\n");
+    printf("  lspci                list PCI devices\n");
+    printf("  nettest              show network interface state\n");
+    printf("  ping <ip>            send a simple ping/ARP test\n");
+    printf("  resolve <host>       resolve a built-in/test hostname\n");
+    printf("  http <host/path>     send a tiny HTTP test request\n");
+    printf("\n");
+
+    printf("Graphics and editor:\n");
+    printf("  vbe                  switch to 1024x768x32 framebuffer test\n");
+    printf("  gfx                  draw graphics demo\n");
+    printf("  gfxmouse             mouse graphics demo\n");
+    printf("  paint                open paint program\n");
+    printf("  edit [file]          open text editor\n");
+    printf("\n");
+
+    printf("Time:\n");
+    printf("  date                 show current date and time\n");
+    printf("  time                 same as date\n");
+    printf("  tz [name|offset]     show or set timezone, e.g. tz PST\n");
+    printf("\n");
+
+    printf("Shell controls:\n");
+    printf("  Tab                  autocomplete command/file\n");
+    printf("  Up/Down              command history\n");
+    printf("  Left/Right           move cursor\n");
+    printf("  Home/End             jump to line start/end\n");
+    printf("  Delete/Backspace     delete characters\n");
+    printf("  PgUp/PgDn            scroll output history\n");
 }
 
 static void cmd_clear(void) { con_clear(); }
@@ -682,10 +718,33 @@ static void cmd_echo(const char* args) {
 
 static void cmd_about(void) {
     con_set_color(CON_LIGHT_GREEN, CON_BLACK);
-    printf("Computer OS\n");
+    printf("Computer OS 64-bit\n");
     con_set_color(CON_LIGHT_GREY, CON_BLACK);
-    printf("A tiny hobby kernel built from scratch.\n");
-    printf("Bootloader -> protected mode -> C kernel -> IDT -> PIC -> keyboard -> shell.\n");
+    printf("A tiny x86_64 hobby OS built from scratch in C and assembly.\n");
+    printf("Boot path: Limine UEFI -> long mode -> higher-half kernel -> shell.\n");
+    printf("\n");
+
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("Core features:\n");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    printf("  - 64-bit kernel with 4-level paging\n");
+    printf("  - GDT, IDT, PIC, IRQ/ISR handlers, PIT timer\n");
+    printf("  - PMM, VMM, kernel heap, tasking, syscalls\n");
+    printf("  - Limine framebuffer / VBE console with colored status lines\n");
+    printf("  - ATA PIO disk, FAT12 root filesystem, ramfs at /tmp\n");
+    printf("  - PCI scan, e1000 network driver, ARP/IP/TCP experiments\n");
+    printf("  - Shell, editor, graphics demos, paint, and user programs\n");
+    printf("\n");
+
+    printf("Status colors: ");
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("[OK]");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    printf(" means working, ");
+    con_set_color(CON_LIGHT_RED, CON_BLACK);
+    printf("[!!]");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    printf(" means missing or failed.\n");
 }
 
 static void cmd_uptime(void) {

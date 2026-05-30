@@ -15,7 +15,11 @@ extern void enter_user_resume(struct registers* frame);
 #define STACK_SIZE 8192
 
 static inline void switch_pd(task_t* t) {
-    uint64_t target = t->pd_phys ? t->pd_phys : vmm_current();
+    /* Kernel tasks must always run on the real kernel PML4.
+     * Do not use vmm_current() here: if we are switching away from
+     * a ring-3 task, CR3 is still that task's user PML4.
+     */
+    uint64_t target = t->pd_phys ? t->pd_phys : vmm_kernel_pd();
     vmm_switch(target);
 }
 

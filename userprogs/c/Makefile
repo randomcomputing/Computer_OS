@@ -1,28 +1,18 @@
-# Makefile for Computer_OS C user programs.
-#
-# Each .c at the top level becomes an ELF32 executable that the kernel's
-# ELF loader reads from the FAT12 disk.  Shared startup (crt0.s) and
-# library code (libuser.a) are built from sources in lib/.
+# Makefile for Computer_OS 64-bit C user programs.
 
-CC      = i686-elf-gcc
-LD      = i686-elf-ld
-AR      = i686-elf-ar
+CC      = x86_64-elf-gcc
+LD      = x86_64-elf-ld
+AR      = x86_64-elf-ar
 AS_NASM = nasm
 
-# Host fallback: uncomment if you don't have the cross-toolchain.
-# CC      = gcc
-# LD      = ld
-# AR      = ar
-# CFLAGS_EXTRA = -m32
-# LDFLAGS_EXTRA = -m elf_i386
-
 CFLAGS = -ffreestanding -fno-asynchronous-unwind-tables -fno-pie \
-         -fno-stack-protector -nostdlib -nostdinc -Iinclude \
-         -O2 -Wall -Wextra $(CFLAGS_EXTRA)
-LDFLAGS = -T user.ld $(LDFLAGS_EXTRA)
+         -fno-stack-protector -mno-red-zone -nostdlib -nostdinc \
+         -mcmodel=small -mno-sse -mno-sse2 -mno-mmx \
+         -Iinclude -O2 -Wall -Wextra
+
+LDFLAGS = -T user.ld
 ARFLAGS = rcs
 
-# Sources for the user-side libc.
 LIB_C_SRCS  := lib/stdio.c lib/string.c lib/malloc.c
 LIB_S_SRCS  := lib/crt0.s
 
@@ -36,6 +26,7 @@ PROGRAMS_C := $(wildcard *.c)
 PROGRAMS   := $(PROGRAMS_C:.c=.elf)
 
 .PHONY: all clean install
+
 all: $(PROGRAMS)
 
 %.elf: %.o $(CRT0) $(LIBUSER) user.ld
@@ -56,7 +47,7 @@ lib/%.o: lib/%.c
 
 lib/crt0.o: lib/crt0.s
 	@echo "Assembling $<..."
-	$(AS_NASM) -f elf32 $< -o $@
+	$(AS_NASM) -f elf64 $< -o $@
 
 clean:
 	rm -f *.o *.elf lib/*.o $(LIBUSER)

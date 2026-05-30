@@ -23,14 +23,14 @@ typedef fat12_dirent_t vfs_dirent_t;
 // Operations a filesystem provides. All paths are absolute *within the
 // mount*. A NULL pointer means "unsupported" and the VFS returns -1.
 typedef struct vfs_ops {
-    int (*list)(const char* path, vfs_dirent_t* out, int max); // list dir by path
-    int (*is_dir)(const char* path);                           // 1 if dir, else 0
+    int (*list)(const char* path, vfs_dirent_t* out, int max);
+    int (*is_dir)(const char* path);
     int (*read_file)(const char* path, void* buf, unsigned int max);
     int (*write_file)(const char* path, const void* data, unsigned int size);
     int (*delete_file)(const char* path);
     int (*mkdir)(const char* path);
     int (*rmdir)(const char* path);
-    int (*cp)(const char* src, const char* dst);   // both within this mount
+    int (*cp)(const char* src, const char* dst);
     int (*mv)(const char* src, const char* dst);
 } vfs_ops_t;
 
@@ -60,11 +60,12 @@ int  vfs_mv(const char* src, const char* dst);
 int  vfs_chdir(const char* path);
 int  vfs_getcwd(char* out, unsigned int max);
 
-// Normalize `path` (relative to the cwd) into an absolute path. Exposed
-// for diagnostics. Returns 0 on success, -1 if out is too small.
+// Normalize `path` (relative to the cwd) into an absolute path.
+// Returns 0 on success, -1 if out is too small.
 int  vfs_resolve(const char* path, char* out, unsigned int outsz);
 
-// ---- FAT12 binding -----------------------------------------------------
+// ---- filesystem bindings -----------------------------------------------
 const vfs_ops_t* fat12_vfs_ops(void);
+const vfs_ops_t* fat32_vfs_ops(void);
 
 #endif

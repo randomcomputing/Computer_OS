@@ -1,19 +1,7 @@
 #ifndef _USER_SYSCALLS_H
 #define _USER_SYSCALLS_H
 
-// Raw kernel-syscall stubs for Computer_OS user programs.
-//
-// These mirror the dispatch table in src/syscall.c. Calling convention
-// is fixed by the kernel:
-//
-//   eax  -> syscall number
-//   ebx  -> arg 1
-//   ecx  -> arg 2
-//   edx  -> arg 3
-//   int $0x80
-//   eax  <- return value
-
-typedef unsigned int size_t;
+typedef unsigned long size_t;
 
 #define SYS_EXIT      0
 #define SYS_WRITE     1
@@ -26,7 +14,6 @@ typedef unsigned int size_t;
 #define SYS_EXEC      8
 #define SYS_WAIT      9
 
-// VGA color values (mirror of kernel's enum vga_color).
 #define COLOR_BLACK         0
 #define COLOR_BLUE          1
 #define COLOR_GREEN         2
@@ -44,8 +31,8 @@ typedef unsigned int size_t;
 #define COLOR_YELLOW        14
 #define COLOR_WHITE         15
 
-static inline int _syscall0(int num) {
-    int ret;
+static inline long _syscall0(long num) {
+    long ret;
     __asm__ volatile ("int $0x80"
                       : "=a"(ret)
                       : "a"(num)
@@ -53,8 +40,8 @@ static inline int _syscall0(int num) {
     return ret;
 }
 
-static inline int _syscall1(int num, int a) {
-    int ret;
+static inline long _syscall1(long num, long a) {
+    long ret;
     __asm__ volatile ("int $0x80"
                       : "=a"(ret)
                       : "a"(num), "b"(a)
@@ -62,8 +49,8 @@ static inline int _syscall1(int num, int a) {
     return ret;
 }
 
-static inline int _syscall3(int num, int a, int b, int c) {
-    int ret;
+static inline long _syscall3(long num, long a, long b, long c) {
+    long ret;
     __asm__ volatile ("int $0x80"
                       : "=a"(ret)
                       : "a"(num), "b"(a), "c"(b), "d"(c)
@@ -71,34 +58,29 @@ static inline int _syscall3(int num, int a, int b, int c) {
     return ret;
 }
 
-// Convenience wrappers — match the kernel's signature exactly.
-
 static inline void exit(int code) {
     _syscall1(SYS_EXIT, code);
     for (;;) { }
 }
 
 static inline int write(int fd, const void* buf, size_t len) {
-    return _syscall3(SYS_WRITE, fd, (int)buf, (int)len);
+    return (int)_syscall3(SYS_WRITE, fd, (long)buf, (long)len);
 }
 
 static inline int read(int fd, void* buf, size_t len) {
-    return _syscall3(SYS_READ, fd, (int)buf, (int)len);
+    return (int)_syscall3(SYS_READ, fd, (long)buf, (long)len);
 }
 
 static inline int getpid(void) {
-    return _syscall0(SYS_GETPID);
+    return (int)_syscall0(SYS_GETPID);
 }
 
 static inline void sched_yield(void) {
     _syscall0(SYS_YIELD);
 }
 
-// Grow the user heap by `delta` bytes. Returns a pointer to the start
-// of the newly allocated region (i.e. the OLD break) on success, or
-// (void*)-1 on failure. Mirrors POSIX sbrk.
-static inline void* sbrk(int delta) {
-    int ret = _syscall1(SYS_SBRK, delta);
+static inline void* sbrk(long delta) {
+    long ret = _syscall1(SYS_SBRK, delta);
     return (void*)ret;
 }
 
@@ -110,24 +92,16 @@ static inline void reset_color(void) {
     set_color(COLOR_WHITE, COLOR_BLACK);
 }
 
-// fork(): create a child process that is a copy of the caller. Returns
-// the child's pid in the parent, 0 in the child, or -1 on failure.
 static inline int fork(void) {
-    return _syscall0(SYS_FORK);
+    return (int)_syscall0(SYS_FORK);
 }
 
-// exec(): replace the current process image with the program at `path`
-// (e.g. "ECHO.ELF"). On success it does not return — the new program
-// runs in place. On failure returns -1 and the caller keeps running.
 static inline int exec(const char* path) {
-    return _syscall1(SYS_EXEC, (int)path);
+    return (int)_syscall1(SYS_EXEC, (long)path);
 }
 
-// wait(): block until a child exits. If `status` is non-NULL, the
-// child's exit code is stored there. Returns the exited child's pid, or
-// -1 if the caller has no children.
 static inline int wait(int* status) {
-    return _syscall1(SYS_WAIT, (int)status);
+    return (int)_syscall1(SYS_WAIT, (long)status);
 }
 
 #endif

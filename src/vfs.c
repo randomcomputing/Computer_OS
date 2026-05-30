@@ -46,9 +46,7 @@ const vfs_mount_t* vfs_mount_at(int i) {
     return &mounts[i];
 }
 
-// ---- path normalization (host-tested) ---------------------------------
-// Join cwd (if `path` is relative) with `path`, collapse "." / ".." and
-// duplicate slashes, producing a clean absolute path. ".." at root clamps.
+// ---- path normalization -----------------------------------------------
 int vfs_resolve(const char* path, char* out, unsigned int outsz) {
     char buf[256];
     unsigned int len = 0;
@@ -101,8 +99,7 @@ int vfs_resolve(const char* path, char* out, unsigned int outsz) {
     return 0;
 }
 
-// ---- mount routing (host-tested) --------------------------------------
-// Is `path` under mount `prefix`, matching on a component boundary?
+// ---- mount routing ----------------------------------------------------
 static int under(const char* prefix, const char* path) {
     if (strcmp(prefix, "/") == 0) return 1;
     unsigned int pl = strlen(prefix);
@@ -110,8 +107,6 @@ static int under(const char* prefix, const char* path) {
     return path[pl] == '/' || path[pl] == '\0';
 }
 
-// Find the longest-prefix mount for an absolute path; write the sub-path
-// within that mount into `sub`. Returns the mount, or NULL if none.
 static const vfs_mount_t* route(const char* abspath, char* sub, unsigned int subsz) {
     int best = -1; unsigned int bestlen = 0;
     for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
@@ -140,7 +135,6 @@ static const vfs_mount_t* route(const char* abspath, char* sub, unsigned int sub
     return &mounts[best];
 }
 
-// Resolve a user path to (mount, subpath). Returns the mount or NULL.
 static const vfs_mount_t* resolve_route(const char* path, char* sub, unsigned int subsz) {
     char abspath[256];
     if (vfs_resolve(path, abspath, sizeof(abspath)) < 0) return 0;
@@ -191,9 +185,6 @@ int vfs_rmdir(const char* path) {
     return m->ops->rmdir(sub);
 }
 
-// cp/mv: if source and destination land on the same mount, delegate to the
-// filesystem (fast path, preserves its semantics). If they cross mounts,
-// fall back to a generic read-then-write copy (and delete for mv).
 int vfs_cp(const char* src, const char* dst) {
     char ssub[256], dsub[256];
     const vfs_mount_t* sm = resolve_route(src, ssub, sizeof(ssub));
@@ -203,7 +194,6 @@ int vfs_cp(const char* src, const char* dst) {
         if (!sm->ops->cp) return -1;
         return sm->ops->cp(ssub, dsub);
     }
-    // Cross-mount: read whole source, write to dest.
     static unsigned char xbuf[65536];
     if (!sm->ops->read_file || !dm->ops->write_file) return -1;
     int n = sm->ops->read_file(ssub, xbuf, sizeof(xbuf));
@@ -220,20 +210,18 @@ int vfs_mv(const char* src, const char* dst) {
         if (!sm->ops->mv) return -1;
         return sm->ops->mv(ssub, dsub);
     }
-    // Cross-mount move = cross-mount copy + delete source.
     if (vfs_cp(src, dst) < 0) return -1;
     if (!sm->ops->delete_file) return -1;
     return sm->ops->delete_file(ssub);
 }
 
-// ---- working directory -------------------------------------------------
+// ---- working directory ------------------------------------------------
 int vfs_chdir(const char* path) {
     char abspath[256], sub[256];
     if (vfs_resolve(path, abspath, sizeof(abspath)) < 0) return -1;
     const vfs_mount_t* m = route(abspath, sub, sizeof(sub));
     if (!m || !m->ops->is_dir) return -1;
     if (!m->ops->is_dir(sub)) return -1;
-    // Commit the new cwd.
     unsigned int i = 0;
     for (; abspath[i] && i < sizeof(cwd) - 1; i++) cwd[i] = abspath[i];
     cwd[i] = '\0';
@@ -249,11 +237,8 @@ int vfs_getcwd(char* out, unsigned int max) {
 }
 
 // ---- FAT12 shim --------------------------------------------------------
-// FAT12's ops are path-based wrappers (see fat12.c additions). The VFS
-// hands FAT12 absolute paths within its mount ("/" mount = the whole disk),
-// which FAT12 resolves from its root independent of its internal cwd.
-extern int          fat12_vfs_list(const char* path, vfs_dirent_t* out, int max);
-extern int          fat12_vfs_is_dir(const char* path);
+extern int fat12_vfs_list(const char* path, vfs_dirent_t* out, int max);
+extern int fat12_vfs_is_dir(const char* path);
 
 static const vfs_ops_t fat12_ops = {
     .list        = fat12_vfs_list,
@@ -268,3 +253,28 @@ static const vfs_ops_t fat12_ops = {
 };
 
 const vfs_ops_t* fat12_vfs_ops(void) { return &fat12_ops; }
+
+// ---- FAT32 shim --------------------------------------------------------
+extern int fat32_read_file(const char* path, void* buf, unsigned int max);
+extern int fat32_write_file(const char* path, const void* data, unsigned int size);
+extern int fat32_delete_file(const char* path);
+extern int fat32_mkdir(const char* path);
+extern int fat32_rmdir(const char* path);
+extern int fat32_cp(const char* src, const char* dst);
+extern int fat32_mv(const char* src, const char* dst);
+extern int fat32_vfs_list(const char* path, vfs_dirent_t* out, int max);
+extern int fat32_vfs_is_dir(const char* path);
+
+static const vfs_ops_t fat32_ops = {
+    .list        = fat32_vfs_list,
+    .is_dir      = fat32_vfs_is_dir,
+    .read_file   = fat32_read_file,
+    .write_file  = fat32_write_file,
+    .delete_file = fat32_delete_file,
+    .mkdir       = fat32_mkdir,
+    .rmdir       = fat32_rmdir,
+    .cp          = fat32_cp,
+    .mv          = fat32_mv,
+};
+
+const vfs_ops_t* fat32_vfs_ops(void) { return &fat32_ops; }

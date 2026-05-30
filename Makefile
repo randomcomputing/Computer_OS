@@ -22,6 +22,7 @@ LIMINE_DIR ?= limine
 KERNEL_ELF  = kernel.elf
 DISK_IMG    = disk.img
 FAT_IMG     = fatdisk.img
+FAT32_IMG   = fat32disk.img
 
 # -----------------------------------------------------------------------
 # Object files
@@ -51,6 +52,7 @@ KHEAP_O    = $(OBJDIR)/kheap.o
 TASK_O     = $(OBJDIR)/task.o
 ATA_O      = $(OBJDIR)/ata.o
 FAT12_O    = $(OBJDIR)/fat12.o
+FAT32_O    = $(OBJDIR)/fat32.o
 VFS_O      = $(OBJDIR)/vfs.o
 RAMFS_O    = $(OBJDIR)/ramfs.o
 SYSCALL_O  = $(OBJDIR)/syscall.o
@@ -83,7 +85,7 @@ KERNEL_OBJS = \
     $(KERNEL_O) $(GDT_O) $(IDT_O) $(ISR_O) $(PIC_O) $(IRQ_O) \
     $(KEYBOARD_O) $(MOUSE_O) $(PIT_O) $(SERIAL_O) \
     $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
-    $(TASK_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
+    $(TASK_O) $(ATA_O) $(FAT12_O) $(FAT32_O) $(VFS_O) $(RAMFS_O) \
     $(SYSCALL_O) $(USERPROG_O) $(LOADER_O) $(EDITOR_O) \
     $(RTC_O) $(GFX_O) $(FONT_O) $(UACCESS_O) \
     $(PCI_O) $(E1000_O) $(ARP_O) $(NET_O) $(TCP_O) \
@@ -138,6 +140,7 @@ $(KHEAP_O):   src/kheap.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(TASK_O):    src/task.c | $(OBJDIR);     $(CC) $(CFLAGS) $< -o $@
 $(ATA_O):     src/ata.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(FAT12_O):   src/fat12.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
+$(FAT32_O):   src/fat32.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(VFS_O):     src/vfs.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(RAMFS_O):   src/ramfs.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(SYSCALL_O): src/syscall.c | $(OBJDIR);  $(CC) $(CFLAGS) $< -o $@
@@ -172,7 +175,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 # Disk image
 # -----------------------------------------------------------------------
 
-$(DISK_IMG): $(KERNEL_ELF) $(FAT_IMG) limine.conf
+$(DISK_IMG): $(KERNEL_ELF) $(FAT32_IMG) limine.conf
 	@echo "Creating UEFI disk image..."
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=128 2>/dev/null
 	sgdisk -n 1:2048:67583   -t 1:ef00 \
@@ -183,11 +186,42 @@ $(DISK_IMG): $(KERNEL_ELF) $(FAT_IMG) limine.conf
 	mcopy  -i $(DISK_IMG)@@1M $(LIMINE_DIR)/BOOTX64.EFI   ::/EFI/BOOT/
 	mcopy  -i $(DISK_IMG)@@1M limine.conf                 ::/
 	mcopy  -i $(DISK_IMG)@@1M $(KERNEL_ELF)               ::/
-	dd if=$(FAT_IMG) of=$(DISK_IMG) bs=512 seek=67584 conv=notrunc 2>/dev/null
+	dd if=$(FAT32_IMG) of=$(DISK_IMG) bs=512 seek=67584 conv=notrunc 2>/dev/null
 	@echo "Disk image ready: $(DISK_IMG)"
 
 # -----------------------------------------------------------------------
-# FAT12 data disk
+# FAT32 data disk
+# -----------------------------------------------------------------------
+
+$(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
+              userprogs/c/testc.c userprogs/c/echo.c \
+              userprogs/c/lib/stdio.c userprogs/c/lib/string.c \
+              userprogs/c/lib/crt0.s userprogs/c/user.ld \
+              userprogs/c/Makefile
+	@echo "Building FAT32 data disk..."
+	dd if=/dev/zero of=$(FAT32_IMG) bs=1M count=64 2>/dev/null
+	mkfs.fat -F 32 -n COMPUTEROS $(FAT32_IMG)
+	@echo "Hello World" > /tmp/_helloworld.txt
+	@printf "Computer_OS\nA 64-bit operating system.\n" > /tmp/_readme.txt
+	$(AS) -f bin userprogs/hello.asm -o /tmp/_hello.bin
+	$(AS) -f bin userprogs/count.asm -o /tmp/_count.bin
+	$(MAKE) -C userprogs/c all
+	mcopy -i $(FAT32_IMG) /tmp/_helloworld.txt    ::HELLO.TXT
+	mcopy -i $(FAT32_IMG) /tmp/_readme.txt         ::README.TXT
+	mcopy -i $(FAT32_IMG) /tmp/_hello.bin          ::HELLO.BIN
+	mcopy -i $(FAT32_IMG) /tmp/_count.bin          ::COUNT.BIN
+	mcopy -i $(FAT32_IMG) userprogs/c/testc.elf    ::TESTC.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/echo.elf     ::ECHO.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/maltest.elf  ::MALTEST.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/colors.elf   ::COLORS.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/game.elf     ::GAME.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/calc.elf     ::CALC.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/forktest.elf ::FORKTEST.ELF
+	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
+	@echo "FAT32 disk ready: $(FAT32_IMG)"
+
+# -----------------------------------------------------------------------
+# FAT12 data disk (kept for reference / fallback testing)
 # -----------------------------------------------------------------------
 
 $(FAT_IMG): userprogs/hello.asm userprogs/count.asm \
@@ -248,5 +282,5 @@ debug: $(DISK_IMG)
 	    -display cocoa,zoom-to-fit=on
 
 clean:
-	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT_IMG)
+	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT_IMG) $(FAT32_IMG)
 	$(MAKE) -C userprogs/c clean

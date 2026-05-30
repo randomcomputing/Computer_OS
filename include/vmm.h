@@ -24,6 +24,7 @@ void     vmm_free_user_pd(uint64_t pml4_phys);
 int      vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags);
 void     vmm_switch(uint64_t pml4_phys);
 uint64_t vmm_current(void);
+uint64_t vmm_kernel_pd(void);
 
 int      vmm_page_fault(struct registers* regs);
 

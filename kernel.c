@@ -1,3 +1,4 @@
+#include "acpi.h"
 #include "console.h"
 #include "printf.h"
 #include "idt.h"
@@ -38,7 +39,7 @@ void kmain(void) {
     printf("[OK] Higher-half kernel at 0xC0000000\n");
 
     // Replace the bootloader's GDT with our own (kcode/kdata + ucode/udata
-    // + TSS) before we touch the IDT — the syscall gate we install later
+    // + TSS) before we touch the IDT -- the syscall gate we install later
     // points at a stub that loads 0x10 into ds, which is meaningful only
     // if 0x10 is the kernel data selector in the *currently loaded* GDT.
     gdt_init();
@@ -70,10 +71,12 @@ void kmain(void) {
     printf("[OK] VMM online (bootstrap PD adopted, PSE demoted)\n");
 
     // Heap lives in the high half well above the kernel image. 0xC1000000
-    // is 16 MB into the high half — kernel image ends around 0xC001_5000,
+    // is 16 MB into the high half -- kernel image ends around 0xC001_5000,
     // so plenty of headroom.
     kheap_init(0xC1000000, 64, 256);     // 256 KB initial, 1 MB max
     printf("[OK] Kernel heap ready (%u KB)\n", kheap_free() / 1024);
+
+    acpi_init();
 
     tasking_init();
     printf("[OK] Tasking online (kmain = task 0)\n");
@@ -98,7 +101,7 @@ void kmain(void) {
     // Storage stack: ATA driver first, then mount FAT12 on top of it.
     // Both are best-effort: if there's no -hda image attached or it's
     // not a FAT12 disk, we just print a warning and the shell still
-    // boots — `ls` and `cat` will report no filesystem.
+    // boots -- `ls` and `cat` will report no filesystem.
     int g_fs_ok = 0;   // did the root filesystem mount? (used in the FB recap)
     if (ata_init()) {
         printf("[OK] ATA primary master detected\n");
@@ -149,7 +152,7 @@ void kmain(void) {
             con_set_color(CON_LIGHT_GREY, CON_BLACK);
             printf("\n");
         } else {
-            // Framebuffer unavailable — make it visible and stay in text mode.
+            // Framebuffer unavailable -- make it visible and stay in text mode.
             print_status(0, "Framebuffer unavailable - staying in VGA text mode");
         }
     }

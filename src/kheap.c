@@ -2,6 +2,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
+#include "serial.h"
 
 // Block layout: each block (free or used) starts with a header.
 //   [ header | user bytes .................. ]

@@ -28,6 +28,8 @@ KEYBOARD_O   = keyboard.o
 MOUSE_O      = mouse.o
 STRING_O     = string.o
 SHELL_O      = shell.o
+REBOOT_O     = reboot.o
+ACPI_O       = acpi.o
 PIT_O        = pit.o
 SERIAL_O     = serial.o
 MEMMAP_O     = memmap.o
@@ -66,7 +68,7 @@ ISO_FILE     = Computer_OS.iso
 KERNEL_OBJS = $(ENTRY_O) $(KERNEL_O) $(HALT_O) $(VGA_O) $(CONSOLE_O) $(PRINTF_O) \
               $(IDT_O) $(ISR_O) $(ISR_ASM_O) \
               $(PIC_O) $(IRQ_O) $(IRQ_ASM_O) $(KEYBOARD_O) $(MOUSE_O) \
-              $(STRING_O) $(SHELL_O) $(PIT_O) $(SERIAL_O) \
+              $(STRING_O) $(SHELL_O) $(REBOOT_O) $(ACPI_O) $(PIT_O) $(SERIAL_O) \
               $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
               $(TASK_O) $(TASK_ASM_O) $(ATA_O) $(FAT12_O) $(VFS_O) $(RAMFS_O) \
               $(GDT_O) $(SYSCALL_O) $(SYSCALL_ASM_O) $(USERPROG_O) \
@@ -150,6 +152,14 @@ $(SERIAL_O): src/serial.c include/serial.h include/io.h
 $(SHELL_O): src/shell.c include/shell.h include/console.h include/vga.h include/printf.h include/keyboard.h include/string.h include/pit.h include/memmap.h include/pmm.h include/vmm.h include/kheap.h include/task.h include/fat12.h include/io.h include/userprog.h include/rtc.h include/loader.h include/editor.h include/pci.h include/e1000.h
 	@echo "Compiling shell..."
 	$(CC) $(CFLAGS) src/shell.c -o $(SHELL_O)
+
+$(REBOOT_O): src/reboot.c include/reboot.h include/console.h include/serial.h include/io.h
+	@echo "Compiling reboot..."
+	$(CC) $(CFLAGS) src/reboot.c -o $(REBOOT_O)
+
+$(ACPI_O): src/acpi.c include/acpi.h include/io.h include/printf.h include/serial.h include/vmm.h
+	@echo "Compiling ACPI..."
+	$(CC) $(CFLAGS) src/acpi.c -o $(ACPI_O)
 
 $(MEMMAP_O): src/memmap.c include/memmap.h include/printf.h
 	@echo "Compiling memory map..."
@@ -285,6 +295,7 @@ run: $(ISO_FILE) $(FAT_IMG)
 	        -device e1000,netdev=net0 \
 	        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 	        -boot d \
+	        -accel tcg \
 	        -display cocoa,zoom-to-fit=on
 
 debug: $(ISO_FILE) $(FAT_IMG)
@@ -297,6 +308,7 @@ debug: $(ISO_FILE) $(FAT_IMG)
 	        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 	        -boot d \
 	        -serial stdio \
+	        -accel tcg \
 	        -display cocoa,zoom-to-fit=on
 
 clean:

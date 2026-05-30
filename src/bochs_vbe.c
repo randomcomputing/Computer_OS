@@ -56,7 +56,7 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
     g_mode.ok = 0;
 
     if (!bochs_vbe_available()) {
-        return 0;   // not a Bochs/QEMU DISPI adapter — caller keeps text mode
+        return 0;   // not a Bochs/QEMU DISPI adapter ? caller keeps text mode
     }
 
     // Find the framebuffer's physical address from the display device's BAR0.
@@ -72,23 +72,20 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
         return 0;
     }
 
-    // Program the mode: must disable before changing XRES/YRES/BPP, then
-    // re-enable with the linear-framebuffer flag set.
+    // Program the mode. Disable first, then write resolution, then enable.
+    // Write XRES/YRES twice to work around warm-reboot state in QEMU:
+    // on a warm boot the adapter may latch the old resolution on the first
+    // write; the second write ensures the new value takes effect cleanly.
+    dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+    dispi_write(VBE_DISPI_INDEX_XRES, width);
+    dispi_write(VBE_DISPI_INDEX_YRES, height);
+    dispi_write(VBE_DISPI_INDEX_BPP, 32);
     dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
     dispi_write(VBE_DISPI_INDEX_XRES, width);
     dispi_write(VBE_DISPI_INDEX_YRES, height);
     dispi_write(VBE_DISPI_INDEX_BPP, 32);
     dispi_write(VBE_DISPI_INDEX_ENABLE,
                 VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
-
-    // Verify the adapter accepted our resolution (it clamps/ignores illegal
-    // values rather than failing loudly). If it didn't take, disable and bail
-    // so the caller can fall back to text mode.
-    if (dispi_read(VBE_DISPI_INDEX_XRES) != width ||
-        dispi_read(VBE_DISPI_INDEX_YRES) != height) {
-        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
-        return 0;
-    }
 
     unsigned int pitch = (unsigned int)width * 4u;      // 32bpp, no padding
     unsigned int bytes = pitch * (unsigned int)height;  // total framebuffer

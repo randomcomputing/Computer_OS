@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "reboot.h"
 #include "console.h"
 #include "printf.h"
 #include "keyboard.h"
@@ -1272,116 +1273,6 @@ static void cmd_edit(const char* args) {
     con_clear();
 }
 
-static void cmd_shutdown(void) {
-    printf("Shutting down...\n");
-    pit_sleep(200);
-    __asm__ volatile ("cli");
-
-    // ACPI S5 (power off): set SLP_TYP=0 and SLP_EN=1 in PM1a_CNT.
-    // Port 0x604 is QEMU's PIIX4 ACPI PM1a control block.
-    outw(0x604, 0x2000);
-
-    // If still running, the port address may differ by QEMU version —
-    // try the Bochs/older-QEMU address as a fallback.
-    outw(0xB004, 0x2000);
-
-    // Still here — hardware didn't honour it (real machine, wrong port).
-    __asm__ volatile ("sti");
-    printf("Shutdown not supported on this hardware.\n");
-    printf("You can safely power off the machine.\n");
-}
-
-
-static void cmd_reboot(void) {
-    con_puts("Rebooting...\n");
-
-    /*
-     * Give serial/VGA/framebuffer output a tiny moment to flush.
-     * Do this BEFORE cli, because pit_sleep usually needs timer IRQs.
-     */
-    pit_sleep(20);
-
-    __asm__ volatile ("cli");
-
-    /*
-     * Method 1: PCI reset control register.
-     *
-     * Common on QEMU/Bochs/real chipsets.
-     *
-     * 0x02 = system reset enable
-     * 0x06 = system reset enable + full reset
-     */
-    outb(0xCF9, 0x02);
-    io_wait();
-    io_wait();
-    outb(0xCF9, 0x06);
-    io_wait();
-    io_wait();
-
-    /*
-     * Method 2: ACPI reset register used by many QEMU i440fx/PIIX setups.
-     *
-     * QEMU often exposes ACPI reset at I/O port 0x604.
-     * Value 0x2000 requests reset.
-     *
-     * This is safe as a fallback. If unsupported, it usually does nothing.
-     */
-    outw(0x604, 0x2000);
-    io_wait();
-    io_wait();
-
-    /*
-     * Method 3: Keyboard controller pulse reset line.
-     *
-     * Do NOT wait forever for the controller. Just try it.
-     * Your old code likely froze because the KBC status never became what
-     * the reboot code expected.
-     */
-    outb(0x64, 0xFE);
-    io_wait();
-    io_wait();
-
-    /*
-     * Method 4: triple fault.
-     *
-     * This should reset the CPU on QEMU if -no-reboot is not present.
-     */
-    struct idtr32 {
-        unsigned short limit;
-        unsigned int base;
-    } __attribute__((packed));
-
-    struct idtr32 bad_idt;
-    bad_idt.limit = 0;
-    bad_idt.base = 0;
-
-    __asm__ volatile (
-        "lidt (%0)\n\t"
-        "int $0x03\n\t"
-        "ud2\n\t"
-        :
-        : "r"(&bad_idt)
-        : "memory"
-    );
-
-    /*
-     * Method 5: QEMU debug-exit fallback.
-     *
-     * This requires adding:
-     *
-     *   -device isa-debug-exit,iobase=0xf4,iosize=0x04
-     *
-     * to your QEMU command.
-     *
-     * If real reboot still does not work, this at least prevents a frozen VM.
-     */
-    outb(0xF4, 0x10);
-
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
-}
-
 static void cmd_ps(void)    { task_list_print(); }
 
 static void cmd_spawn(const char* args) {
@@ -1541,8 +1432,8 @@ static void execute(char* line) {
     else if (strcmp(line, "gfx")      == 0) cmd_gfx();
     else if (strcmp(line, "gfxmouse") == 0) cmd_gfxmouse();
     else if (strcmp(line, "paint")    == 0) cmd_paint();
-    else if (strcmp(line, "reboot")   == 0) cmd_reboot();
-    else if (strcmp(line, "shutdown") == 0) cmd_shutdown();
+    else if (strcmp(line, "reboot")   == 0) reboot();
+    else if (strcmp(line, "shutdown") == 0) shutdown();
     else {
         con_set_color(CON_LIGHT_RED, CON_BLACK);
         printf("unknown command: %s\n", line);

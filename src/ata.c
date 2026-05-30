@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "io.h"
 #include "printf.h"
+#include "console_backend.h"
 
 /*
  * Simple polling ATA PIO driver for the primary IDE channel.
@@ -64,6 +65,20 @@ static void ata_400ns_delay(void) {
     inb(ATA_CTRL);
     inb(ATA_CTRL);
     inb(ATA_CTRL);
+}
+
+static void ata_print_ok(const char* msg, const char* name) {
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("[OK]");
+    con_set_color(CON_WHITE, CON_BLACK);
+    printf(" %s: %s\n", msg, name);
+}
+
+static void ata_print_fail(const char* msg) {
+    con_set_color(CON_LIGHT_RED, CON_BLACK);
+    printf("[!!]");
+    con_set_color(CON_WHITE, CON_BLACK);
+    printf(" %s\n", msg);
 }
 
 static int ata_wait_not_busy(unsigned char* out_status) {
@@ -168,7 +183,7 @@ static int ata_probe_one(unsigned char chs_drive,
     }
 
     if (ata_wait_not_busy(&status) < 0) {
-        printf("ata: %s stuck BUSY after IDENTIFY\n", name);
+        ata_print_fail("ATA stuck BUSY after IDENTIFY");
         return 0;
     }
 
@@ -184,12 +199,11 @@ static int ata_probe_one(unsigned char chs_drive,
     unsigned char hi  = inb(ATA_LBA_HI);
 
     if (mid != 0 || hi != 0) {
-        printf("ata: %s is not ATA disk, sig=%x:%x\n", name, hi, mid);
         return 0;
     }
 
     if (ata_wait_drq() < 0) {
-        printf("ata: %s IDENTIFY never produced data\n", name);
+        ata_print_fail("ATA IDENTIFY never produced data");
         return 0;
     }
 
@@ -202,7 +216,7 @@ static int ata_probe_one(unsigned char chs_drive,
     selected_lba_drive = lba_drive;
     present = 1;
 
-    printf("[OK] ATA disk found: %s\n", name);
+    ata_print_ok("ATA disk found", name);
 
     return 1;
 }
@@ -231,7 +245,7 @@ int ata_init(void) {
         return 1;
     }
 
-    printf("ata: no primary ATA disk found\n");
+    ata_print_fail("No primary ATA disk found");
 
     present = 0;
     return 0;

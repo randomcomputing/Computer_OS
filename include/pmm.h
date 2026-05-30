@@ -1,29 +1,14 @@
 #ifndef PMM_H
 #define PMM_H
 
+#include <stdint.h>
+
 #define PAGE_SIZE 4096
 
-// Initialize the physical memory manager. Must be called after memmap is
-// readable (i.e. after the kernel is running — the bootloader already
-// populated the E820 data).
-void pmm_init(void);
-
-// Allocate a single 4 KB physical page. Returns the physical address of
-// the page, or 0 if out of memory. The returned page's contents are
-// undefined — zero it yourself if you need that.
-unsigned int pmm_alloc(void);
-unsigned int pmm_alloc_low(void);  // frame < 4MB, for VMM page tables
-
-// Mark the page starting at `addr` as free. `addr` must be page-aligned
-// and must have been returned by pmm_alloc(). Freeing an already-free
-// page is a bug but we don't detect it.
-void pmm_free(unsigned int addr);
-
-// Stats.
-unsigned int pmm_free_pages(void);
-unsigned int pmm_total_pages(void);
-
-// Debug: print a summary of PMM state.
-void pmm_print(void);
+void     pmm_init(void);
+uint64_t pmm_alloc(void);        /* returns physical address or 0 on failure */
+void     pmm_free(uint64_t phys);
+uint64_t pmm_free_pages(void);
+uint64_t pmm_total_pages(void);
 
 #endif

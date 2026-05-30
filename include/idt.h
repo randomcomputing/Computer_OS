@@ -1,8 +1,9 @@
 #ifndef IDT_H
 #define IDT_H
 
-// Build the 256-entry IDT, fill in the 32 CPU exception handlers,
-// and load it with the `lidt` instruction. Call once from kmain.
+#include "stdint.h"
+
 void idt_init(void);
+void idt_set_user_gate(int num, uint64_t handler);
 
 #endif

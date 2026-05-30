@@ -1,52 +1,62 @@
 #include "gdt.h"
+#include <stdint.h>
 
-// --- GDT entry layout -------------------------------------------------
-// Same packed-bitfield layout as IDT entries. A "segment descriptor" in
-// 32-bit protected mode is 8 bytes describing a base+limit+access. For
-// flat memory we set base=0 and limit=4 GB, varying only the access byte
-// to distinguish kcode / kdata / ucode / udata. The TSS is a system
-// descriptor with a real base (the TSS struct address) and limit (sizeof).
+/*
+ * 64-bit GDT.
+ *
+ * In long mode, most of the base/limit fields are ignored for code and data
+ * segments — the CPU treats everything as flat 64-bit. The access byte and
+ * the L (long-mode) flag in the granularity byte are what matter.
+ *
+ * The TSS is an exception: it needs a real base address (the address of our
+ * tss_entry struct) and it uses a 16-byte descriptor (two GDT slots).
+ */
 
+/* Standard 8-byte GDT entry. */
 struct gdt_entry {
-    unsigned short limit_low;
-    unsigned short base_low;
-    unsigned char  base_mid;
-    unsigned char  access;
-    unsigned char  granularity;   // limit_high (low nibble) | flags (high nibble)
-    unsigned char  base_high;
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  granularity;   /* limit_high[3:0] | flags[7:4] */
+    uint8_t  base_high;
+} __attribute__((packed));
+
+/* Upper 8 bytes of the 16-byte 64-bit TSS descriptor. */
+struct gdt_entry_high {
+    uint32_t base_upper;    /* bits 63:32 of TSS base */
+    uint32_t reserved;
 } __attribute__((packed));
 
 struct gdt_ptr {
-    unsigned short limit;
-    unsigned int   base;
+    uint16_t limit;
+    uint64_t base;
 } __attribute__((packed));
 
-// 6 entries: null, kcode, kdata, ucode, udata, tss.
-#define GDT_ENTRIES 6
-static struct gdt_entry gdt[GDT_ENTRIES];
-static struct gdt_ptr   gdtp;
-
-// --- TSS layout -------------------------------------------------------
-// We only ever use ss0/esp0 (kernel stack on ring transition). Everything
-// else is here because the CPU expects 104 bytes; we leave them zero.
+/*
+ * 64-bit TSS.  We only use rsp0 (kernel stack on ring-3 → ring-0 transition)
+ * and iomap_base. Everything else stays zero.
+ */
 struct tss_entry {
-    unsigned int  prev_tss;
-    unsigned int  esp0;     // kernel stack pointer used on int from ring 3
-    unsigned int  ss0;      // kernel stack segment used on int from ring 3
-    unsigned int  esp1, ss1, esp2, ss2;
-    unsigned int  cr3;
-    unsigned int  eip, eflags;
-    unsigned int  eax, ecx, edx, ebx;
-    unsigned int  esp, ebp, esi, edi;
-    unsigned int  es, cs, ss, ds, fs, gs;
-    unsigned int  ldt;
-    unsigned short trap, iomap_base;
+    uint32_t reserved0;
+    uint64_t rsp0;          /* kernel stack for ring-3 → ring-0 */
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist[7];        /* interrupt stack table — leave zero */
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
 } __attribute__((packed));
 
-static struct tss_entry tss;
+/* 7 entries: null, kcode, kdata, udata, ucode, tss-low, tss-high */
+#define GDT_ENTRIES 7
+static struct gdt_entry     gdt[GDT_ENTRIES];
+static struct gdt_ptr       gdtp;
+static struct tss_entry     tss;
 
-static void gdt_set(int i, unsigned int base, unsigned int limit,
-                    unsigned char access, unsigned char gran) {
+static void gdt_set(int i, uint32_t base, uint32_t limit,
+                    uint8_t access, uint8_t gran) {
     gdt[i].base_low    =  base        & 0xFFFF;
     gdt[i].base_mid    = (base >> 16) & 0xFF;
     gdt[i].base_high   = (base >> 24) & 0xFF;
@@ -55,74 +65,91 @@ static void gdt_set(int i, unsigned int base, unsigned int limit,
     gdt[i].access      = access;
 }
 
-// Reload all six segment registers and the GDTR. Order matters:
-//   1. lgdt loads the new GDT, but the segment registers still hold
-//      "shadow" descriptors cached from the *old* GDT.
-//   2. We can't reload CS with a plain mov — only a far jump (or far
-//      call/ret) reloads it. So we lgdt, reload the data segs (which
-//      reads new descriptors from the new GDT into their shadows),
-//      then ljmp to reload CS.
-//
-// Both the bootloader GDT and our new GDT happen to put kernel data
-// at selector 0x10, so even the in-between window is harmless — but
-// doing it in the right order means we don't depend on that.
+/*
+ * The 64-bit TSS descriptor is 16 bytes.  The lower 8 bytes look like a
+ * normal GDT entry (with type=0x9 = available 64-bit TSS), but the upper
+ * 8 bytes hold bits 63:32 of the base address plus a reserved dword.
+ * We alias slots 5 and 6 to a struct gdt_entry_high to write the upper half.
+ */
+static void gdt_set_tss(uint64_t base, uint32_t limit) {
+    /* Lower 8 bytes: normal descriptor, type 0x9, DPL=0, present. */
+    gdt[5].limit_low   =  limit       & 0xFFFF;
+    gdt[5].base_low    =  base        & 0xFFFF;
+    gdt[5].base_mid    = (base >> 16) & 0xFF;
+    gdt[5].access      = 0x89;         /* P=1, DPL=0, Type=9 (64-bit TSS avail) */
+    gdt[5].granularity = ((limit >> 16) & 0x0F);
+    gdt[5].base_high   = (base >> 24) & 0xFF;
+
+    /* Upper 8 bytes: bits 63:32 of base + reserved. */
+    struct gdt_entry_high* hi = (struct gdt_entry_high*)&gdt[6];
+    hi->base_upper = (uint32_t)(base >> 32);
+    hi->reserved   = 0;
+}
+
+/*
+ * Reload CS via a far return (lretq) and reload the other segment registers.
+ * We can't ljmp in 64-bit inline asm easily, so we push the new CS and the
+ * return address, then lretq — that's the standard long-mode way to reload CS.
+ *
+ * In 64-bit mode DS/ES/FS/GS are mostly vestigial (base=0, ignored by the
+ * CPU for most purposes), but we load GDT_KDATA into them anyway for
+ * correctness and to keep the null selector out of them.
+ */
 static void gdt_flush(struct gdt_ptr* p) {
     __asm__ volatile (
-        "lgdt (%0)               \n"
-        "ljmp $0x08, $1f         \n"   // reload CS via far jump
-        "1:                      \n"
-        "mov $0x10, %%ax         \n"
-        "mov %%ax, %%ds          \n"
-        "mov %%ax, %%es          \n"
-        "mov %%ax, %%fs          \n"
-        "mov %%ax, %%gs          \n"
-        "mov %%ax, %%ss          \n"
-        : : "r"(p) : "ax", "memory"
+        "lgdt (%0)              \n"
+        /* Push new CS and the address of the label '1f', then lretq. */
+        "lea  1f(%%rip), %%rax  \n"
+        "push %1                \n"   /* new CS = GDT_KCODE */
+        "push %%rax             \n"
+        "lretq                  \n"
+        "1:                     \n"
+        "mov  %2, %%ax          \n"
+        "mov  %%ax, %%ds        \n"
+        "mov  %%ax, %%es        \n"
+        "mov  %%ax, %%fs        \n"
+        "mov  %%ax, %%gs        \n"
+        "mov  %%ax, %%ss        \n"
+        :
+        : "r"(p), "i"((uint64_t)GDT_KCODE), "i"((uint64_t)GDT_KDATA)
+        : "rax", "memory"
     );
 }
 
-// Load the task register with our TSS selector. ltr is privileged but
-// we're in ring 0 here. Once loaded, the CPU consults tss.esp0 on every
-// transition from ring 3 to ring 0.
 static void tss_flush(void) {
-    __asm__ volatile ("ltr %%ax" : : "a"(GDT_TSS));
+    __asm__ volatile ("ltr %%ax" : : "a"((uint16_t)GDT_TSS));
 }
 
 void gdt_init(void) {
-    // Zero the TSS up front, then point ss0 at the kernel data segment.
-    // esp0 is patched in by tss_set_kernel_stack() — it must be set
-    // before the first IRET to ring 3, but we don't have a kernel stack
-    // pointer to put there yet.
-    unsigned char* tssp = (unsigned char*)&tss;
-    for (unsigned int i = 0; i < sizeof(tss); i++) tssp[i] = 0;
-    tss.ss0        = GDT_KDATA;
-    tss.esp0       = 0;
-    tss.iomap_base = sizeof(tss);   // no I/O permission map
+    /* Zero TSS. */
+    uint8_t* p = (uint8_t*)&tss;
+    for (uint32_t i = 0; i < sizeof(tss); i++) p[i] = 0;
+    tss.iomap_base = sizeof(tss);   /* no I/O permission map */
 
-    // Access byte breakdown (high to low bits):
-    //   P  | DPL[1:0] | S | Type[3:0]
-    //   P=1 (present), S=1 (code/data, not system), DPL=0 or 3.
-    //   Type 0xA = code, executable+readable; 0x2 = data, writable.
-    // Granularity byte: G=1 (4 KB), D/B=1 (32-bit), L=0, AVL=0 -> 0xC.
-    //
-    // For the TSS, S=0 and Type=0x9 (available 32-bit TSS); G=0 (limit
-    // in bytes, fine for 104 bytes); D/B=0 -> granularity nibble 0x0.
-
-    gdt_set(0, 0, 0,           0x00, 0x00);       // null
-    gdt_set(1, 0, 0xFFFFF,     0x9A, 0xCF);       // kernel code, DPL=0
-    gdt_set(2, 0, 0xFFFFF,     0x92, 0xCF);       // kernel data, DPL=0
-    gdt_set(3, 0, 0xFFFFF,     0xFA, 0xCF);       // user code,   DPL=3
-    gdt_set(4, 0, 0xFFFFF,     0xF2, 0xCF);       // user data,   DPL=3
-    gdt_set(5, (unsigned int)&tss,
-               sizeof(tss) - 1, 0x89, 0x00);      // TSS, available 32-bit
+    /*
+     * Access byte for 64-bit code/data:
+     *   P=1, S=1 (non-system), DPL=0 or 3
+     *   Code: Type=0xA (exec+read), L=1 (64-bit), D=0  -> gran=0xA0
+     *   Data: Type=0x2 (read/write)                    -> gran=0x00
+     *         (limit/base ignored in 64-bit flat mode)
+     *
+     * For code segments the L bit (bit 5 of the granularity byte) MUST be 1.
+     * For data segments L=0, but the CPU doesn't care in 64-bit mode.
+     */
+    gdt_set(0, 0, 0,       0x00, 0x00);   /* null */
+    gdt_set(1, 0, 0xFFFFF, 0x9A, 0xA0);   /* kernel code, DPL=0, L=1 */
+    gdt_set(2, 0, 0xFFFFF, 0x92, 0x00);   /* kernel data, DPL=0 */
+    gdt_set(3, 0, 0xFFFFF, 0xF2, 0x00);   /* user data,   DPL=3 */
+    gdt_set(4, 0, 0xFFFFF, 0xFA, 0xA0);   /* user code,   DPL=3, L=1 */
+    gdt_set_tss((uint64_t)&tss, sizeof(tss) - 1);
 
     gdtp.limit = sizeof(gdt) - 1;
-    gdtp.base  = (unsigned int)&gdt;
+    gdtp.base  = (uint64_t)&gdt;
 
     gdt_flush(&gdtp);
     tss_flush();
 }
 
-void tss_set_kernel_stack(unsigned int esp0) {
-    tss.esp0 = esp0;
+void tss_set_kernel_stack(uint64_t rsp0) {
+    tss.rsp0 = rsp0;
 }

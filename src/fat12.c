@@ -160,11 +160,21 @@ static int name_eq_83(const dirent_t* d, const char target[11]) {
 // Mount
 // ============================================================
 
+/* LBA offset of the FAT12 data partition (partition 2 in our GPT disk). */
+#define FAT12_PART_LBA 67584u
+
+static int fat_read(unsigned int lba, unsigned int count, void* buf) {
+    return ata_read(FAT12_PART_LBA + lba, count, buf);
+}
+static int fat_write(unsigned int lba, unsigned int count, const void* buf) {
+    return ata_write(FAT12_PART_LBA + lba, count, buf);
+}
+
 int fat12_mount(void) {
     if (mounted) return 0;
 
     unsigned char sector[512];
-    if (ata_read(0, 1, sector) < 0) {
+    if (fat_read(0, 1, sector) < 0) {
         printf("fat12: cannot read boot sector\n");
         return -1;
     }
@@ -190,7 +200,7 @@ int fat12_mount(void) {
         printf("fat12: out of heap to cache FAT\n");
         return -1;
     }
-    if (ata_read(fat_start, bpb.sectors_per_fat, fat) < 0) {
+    if (fat_read(fat_start, bpb.sectors_per_fat, fat) < 0) {
         printf("fat12: cannot read FAT\n");
         kfree(fat); fat = 0;
         return -1;
@@ -220,7 +230,7 @@ static unsigned int total_clusters(void) {
 static int fat12_flush_fat(void) {
     for (unsigned int i = 0; i < bpb.num_fats; i++) {
         unsigned int lba = fat_start + i * bpb.sectors_per_fat;
-        if (ata_write(lba, bpb.sectors_per_fat, fat) < 0) return -1;
+        if (fat_write(lba, bpb.sectors_per_fat, fat) < 0) return -1;
     }
     return 0;
 }
@@ -273,9 +283,9 @@ static int dir_read_chunk(unsigned int dir_cluster,
                           unsigned char* buf) {
     if (dir_cluster == 0) {
         unsigned int sectors = (bpb.root_entries * 32 + 511) / 512;
-        return ata_read(root_start, sectors, buf);
+        return fat_read(root_start, sectors, buf);
     } else {
-        return ata_read(cluster_to_lba(chunk_cluster),
+        return fat_read(cluster_to_lba(chunk_cluster),
                         bpb.sectors_per_cluster, buf);
     }
 }
@@ -285,9 +295,9 @@ static int dir_write_chunk(unsigned int dir_cluster,
                            const unsigned char* buf) {
     if (dir_cluster == 0) {
         unsigned int sectors = (bpb.root_entries * 32 + 511) / 512;
-        return ata_write(root_start, sectors, (void*)buf);
+        return fat_write(root_start, sectors, (void*)buf);
     } else {
-        return ata_write(cluster_to_lba(chunk_cluster),
+        return fat_write(cluster_to_lba(chunk_cluster),
                          bpb.sectors_per_cluster, (void*)buf);
     }
 }
@@ -732,7 +742,7 @@ static int dir_alloc_slot(unsigned int dir_cluster,
     unsigned char* zero = (unsigned char*)kmalloc(bytes_per_cluster);
     if (!zero) { fat12_free_chain(new_c); return -1; }
     memset(zero, 0, bytes_per_cluster);
-    if (ata_write(cluster_to_lba(new_c), bpb.sectors_per_cluster, zero) < 0) {
+    if (fat_write(cluster_to_lba(new_c), bpb.sectors_per_cluster, zero) < 0) {
         kfree(zero); fat12_free_chain(new_c); return -1;
     }
     kfree(zero);
@@ -815,7 +825,7 @@ int fat12_read_file(const char* path, void* buf, unsigned int max) {
     unsigned char* out       = (unsigned char*)buf;
 
     while (remaining > 0 && cluster >= 2 && !is_end_of_chain(cluster)) {
-        if (ata_read(cluster_to_lba(cluster), bpb.sectors_per_cluster,
+        if (fat_read(cluster_to_lba(cluster), bpb.sectors_per_cluster,
                      cluster_buf) < 0) {
             kfree(cluster_buf); return -1;
         }
@@ -893,7 +903,7 @@ int fat12_write_file(const char* path, const void* data, unsigned int size) {
                                    ? remaining : bytes_per_cluster;
             for (unsigned int i = 0; i < chunk; i++) cb[i] = in[i];
             for (unsigned int i = chunk; i < bytes_per_cluster; i++) cb[i] = 0;
-            if (ata_write(cluster_to_lba(cluster),
+            if (fat_write(cluster_to_lba(cluster),
                           bpb.sectors_per_cluster, cb) < 0) {
                 kfree(cb); fat12_free_chain(first_cluster); return -1;
             }
@@ -994,7 +1004,7 @@ int fat12_mkdir(const char* path) {
     // ".." cluster_lo is parent; FAT convention: 0 if parent is root.
     make_dirent(dotdot, dotdot11, ATTR_DIRECTORY, parent, 0);
 
-    if (ata_write(cluster_to_lba(new_c),
+    if (fat_write(cluster_to_lba(new_c),
                   bpb.sectors_per_cluster, buf) < 0) {
         kfree(buf); fat12_free_chain(new_c); return -1;
     }

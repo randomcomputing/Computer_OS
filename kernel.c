@@ -1,6 +1,13 @@
-#include "acpi.h"
+/*
+ * kernel.c — 64-bit kernel main entry point (Limine/UEFI).
+ */
+
+#include "stdint.h"
+#include "stddef.h"
+
 #include "console.h"
 #include "printf.h"
+#include "gdt.h"
 #include "idt.h"
 #include "pic.h"
 #include "keyboard.h"
@@ -17,149 +24,262 @@
 #include "fat12.h"
 #include "vfs.h"
 #include "ramfs.h"
-#include "gdt.h"
 #include "syscall.h"
 #include "pci.h"
-#include "bochs_vbe.h"
 #include "boot_banner.h"
 #include "e1000.h"
+#include "acpi.h"
+#include "bochs_vbe.h"
 
 void halt(void);
 
-void kmain(void) {
-    con_init();
-    serial_init();
-    serial_write("Serial[OK]\n");
+/* ------------------------------------------------------------------ */
+/* Limine protocol structures                                          */
+/* ------------------------------------------------------------------ */
 
+#define LIMINE_COMMON_MAGIC  0xc7b1dd30df4c8b88ULL, 0x0a82e883a194f07bULL
 
-    
-    boot_banner();
+struct limine_framebuffer {
+    void*    address;
+    uint64_t width;
+    uint64_t height;
+    uint64_t pitch;
+    uint16_t bpp;
+    uint8_t  memory_model;
+    uint8_t  red_mask_size,   red_mask_shift;
+    uint8_t  green_mask_size, green_mask_shift;
+    uint8_t  blue_mask_size,  blue_mask_shift;
+    uint8_t  unused[7];
+    uint64_t edid_size;
+    void*    edid;
+    uint64_t mode_count;
+    void**   modes;
+};
+
+struct limine_framebuffer_response {
+    uint64_t revision;
+    uint64_t framebuffer_count;
+    struct limine_framebuffer** framebuffers;
+};
+
+struct limine_framebuffer_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_framebuffer_response* response;
+};
+
+struct limine_memmap_entry {
+    uint64_t base;
+    uint64_t length;
+    uint64_t type;
+};
+
+struct limine_memmap_response {
+    uint64_t revision;
+    uint64_t entry_count;
+    struct limine_memmap_entry** entries;
+};
+
+struct limine_memmap_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_memmap_response* response;
+};
+
+struct limine_hhdm_response {
+    uint64_t revision;
+    uint64_t offset;
+};
+
+struct limine_hhdm_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_hhdm_response* response;
+};
+
+/* ------------------------------------------------------------------ */
+/* Limine requests                                                     */
+/* ------------------------------------------------------------------ */
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_framebuffer_request fb_request = {
+    .id       = { LIMINE_COMMON_MAGIC,
+                  0x9d5827dcd881dd75ULL, 0xa3148604f6fab11bULL },
+    .revision = 0,
+    .response = NULL,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request mm_request = {
+    .id       = { LIMINE_COMMON_MAGIC,
+                  0x67cf3d9d378a806fULL, 0xe304acdfc50c3c62ULL },
+    .revision = 0,
+    .response = NULL,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id       = { LIMINE_COMMON_MAGIC,
+                  0x48dcf1cb8ad2b852ULL, 0x63984e959a98244bULL },
+    .revision = 0,
+    .response = NULL,
+};
+
+/* ------------------------------------------------------------------ */
+/* Colored status helpers                                              */
+/* ------------------------------------------------------------------ */
+
+static void print_status_u64(const char* text, uint64_t value, const char* suffix) {
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("[OK]");
     con_set_color(CON_WHITE, CON_BLACK);
-    printf("[OK] Bootloader  [OK] Protected Mode  [OK] Kernel Running\n");
-    printf("[OK] Higher-half kernel at 0xC0000000\n");
 
-    // Replace the bootloader's GDT with our own (kcode/kdata + ucode/udata
-    // + TSS) before we touch the IDT -- the syscall gate we install later
-    // points at a stub that loads 0x10 into ds, which is meaningful only
-    // if 0x10 is the kernel data selector in the *currently loaded* GDT.
-    gdt_init();
-    printf("[OK] GDT loaded (ring-0 + ring-3 + TSS)\n");
+    if (suffix) {
+        printf(" %s%llu%s\n", text, value, suffix);
+    } else {
+        printf(" %s%llu\n", text, value);
+    }
+}
 
-    idt_init();
-    printf("[OK] IDT loaded\n");
+static void print_status_hex64(const char* text, uint64_t value) {
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("[OK]");
+    con_set_color(CON_WHITE, CON_BLACK);
+    printf(" %s0x%llx\n", text, value);
+}
 
-    pic_remap();
-    printf("[OK] PIC remapped\n");
+/* ------------------------------------------------------------------ */
+/* kmain                                                               */
+/* ------------------------------------------------------------------ */
 
-    keyboard_init();
-    printf("[OK] Keyboard ready\n");
+void kmain(void) {
+    serial_init();
+    serial_write("Serial [OK]\n");
 
-    mouse_init();
-    printf("[OK] Mouse ready (scroll = wheel / two-finger)\n");
+    uint64_t hhdm_offset = hhdm_request.response
+                         ? hhdm_request.response->offset
+                         : 0xFFFF800000000000ULL;
 
-    pit_init(100);   // 100 Hz = one tick every 10 ms
-    printf("[OK] Timer running at 100 Hz\n");
+    /* Memory subsystem. */
+    memmap_init(mm_request.response);
 
-    printf("[OK] Memory map: %d regions, %u MB usable\n",
+    extern void pmm_set_hhdm_offset(uint64_t);
+    pmm_set_hhdm_offset(hhdm_offset);
+    pmm_init();
+
+    vmm_init(hhdm_offset);
+
+    kheap_init(0xFFFFFFFF40000000ULL, 64, 1024);
+
+    /* Console: try the Limine framebuffer, fall back to VGA text. */
+    con_init();
+    if (fb_request.response && fb_request.response->framebuffer_count > 0) {
+        struct limine_framebuffer* fb = fb_request.response->framebuffers[0];
+
+        bochs_vbe_set_from_limine(fb->address,
+                                  (unsigned int)fb->width,
+                                  (unsigned int)fb->height,
+                                  (unsigned int)fb->pitch,
+                                  (unsigned char)fb->bpp);
+
+        if (con_use_framebuffer()) {
+            serial_write("[fb] framebuffer console active\n");
+        } else {
+            serial_write("[fb] con_use_framebuffer failed\n");
+        }
+    } else {
+        serial_write("[fb] no Limine framebuffer response\n");
+    }
+
+    boot_banner();
+
+    print_status(1, "Limine UEFI boot");
+    print_status(1, "Long mode");
+    print_status(1, "Kernel running");
+    print_status(1, "Higher-half kernel");
+    print_status_hex64("HHDM offset: ", hhdm_offset);
+
+    con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+    printf("[OK]");
+    con_set_color(CON_WHITE, CON_BLACK);
+    printf(" Memory map: %d regions, %llu MB usable\n",
            memmap_count(), memmap_total_usable() / (1024 * 1024));
 
-    pmm_init();
-    printf("[OK] PMM: %u pages free (%u KB)\n",
-           pmm_free_pages(), pmm_free_pages() * 4);
+    print_status_u64("PMM: ", pmm_free_pages(), " pages free");
+    print_status(1, "VMM online 4-level paging");
+    print_status(1, "Kernel heap ready");
 
-    vmm_init(0);     // adopt the bootstrap page directory from entry.asm
-    printf("[OK] VMM online (bootstrap PD adopted, PSE demoted)\n");
+    gdt_init();
+    print_status(1, "GDT loaded");
 
-    // Heap lives in the high half well above the kernel image. 0xC1000000
-    // is 16 MB into the high half -- kernel image ends around 0xC001_5000,
-    // so plenty of headroom.
-    kheap_init(0xC1000000, 64, 256);     // 256 KB initial, 1 MB max
-    printf("[OK] Kernel heap ready (%u KB)\n", kheap_free() / 1024);
+    idt_init();
+    print_status(1, "IDT loaded");
+
+    pic_remap();
+    print_status(1, "PIC remapped");
+
+    keyboard_init();
+    print_status(1, "Keyboard ready");
+
+    mouse_init();
+    print_status(1, "Mouse ready");
+
+    pit_init(100);
+    print_status(1, "Timer at 100 Hz");
 
     acpi_init();
 
     tasking_init();
-    printf("[OK] Tasking online (kmain = task 0)\n");
+    print_status(1, "Tasking online");
 
     syscall_init();
-    printf("[OK] Syscall gate (int 0x80) installed\n");
+    print_status(1, "Syscall gate installed");
 
-    // Enumerate the PCI bus. This just discovers what hardware is plugged in
-    // (storage controllers, the NIC we'll drive later); it doesn't program
-    // anything yet. `lspci` at the shell lists what this found.
     {
         int n = pci_init();
-        printf("[OK] PCI scan: %d device%s found\n", n, n == 1 ? "" : "s");
+
+        con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+        printf("[OK]");
+        con_set_color(CON_WHITE, CON_BLACK);
+        printf(" PCI: %d device%s\n", n, n == 1 ? "" : "s");
 
         if (e1000_init()) {
-            printf("[OK] e1000 network card initialized\n");
+            print_status(1, "e1000 NIC initialized");
         } else {
-            printf("[..] e1000 network card not initialized\n");
+            print_status(0, "e1000 NIC not available");
         }
     }
 
-    // Storage stack: ATA driver first, then mount FAT12 on top of it.
-    // Both are best-effort: if there's no -hda image attached or it's
-    // not a FAT12 disk, we just print a warning and the shell still
-    // boots -- `ls` and `cat` will report no filesystem.
-    int g_fs_ok = 0;   // did the root filesystem mount? (used in the FB recap)
+    int g_fs_ok = 0;
     if (ata_init()) {
-        printf("[OK] ATA primary master detected\n");
+        print_status(1, "ATA primary master detected");
+
         if (fat12_mount() == 0) {
-            // Bring up the VFS and mount FAT12 as the root filesystem.
-            // From here on, the rest of the kernel talks to vfs_* instead
-            // of fat12_* directly.
             vfs_init();
+
             if (vfs_mount("/", fat12_vfs_ops(), "fat12") == 0) {
-                printf("[OK] FAT12 mounted at / via VFS\n");
+                print_status(1, "FAT12 mounted at /");
                 g_fs_ok = 1;
             } else {
-                printf("[..] VFS mount table full\n");
+                print_status(0, "FAT12 mount failed");
             }
-            // Mount an in-memory filesystem at /tmp to demonstrate the VFS
-            // hosting two filesystems at once. Contents vanish on reboot.
+
             ramfs_init();
             if (vfs_mount("/tmp", ramfs_vfs_ops(), "ramfs") == 0) {
-                printf("[OK] ramfs mounted at /tmp\n");
+                print_status(1, "ramfs mounted at /tmp");
+            } else {
+                print_status(0, "ramfs mount failed");
             }
         } else {
-            printf("[..] No FAT12 filesystem found\n");
+            print_status(0, "No FAT12 filesystem");
         }
     } else {
-        printf("[..] No ATA disk attached (boot with -hda <image>)\n");
+        print_status(0, "No ATA disk");
     }
+    (void)g_fs_ok;
+
     printf("\n");
-
-    // Switch the console to the high-res framebuffer for the shell. Boot ran
-    // in VGA text mode (above); now we move to graphics. On success we repaint
-    // the banner and a green [OK] recap in the framebuffer console; on failure
-    // we report it in red and stay in VGA text so the shell still works.
-    {
-        bochs_vbe_mode_t m;
-        if (bochs_vbe_set_mode(1024, 768, &m) && con_use_framebuffer()) {
-            // Now drawing into the framebuffer console. Repaint the boot screen.
-            boot_banner();
-            print_status(1, "Bootloader / Protected Mode / Kernel running");
-            print_status(1, "Higher-half kernel at 0xC0000000");
-            print_status(1, "GDT / IDT / PIC / syscall gate");
-            print_status(1, "Keyboard, mouse, timer (100 Hz)");
-            print_status(1, "PMM / VMM / kernel heap online");
-            print_status(1, "Tasking online (kmain = task 0)");
-            print_status(1, "PCI bus enumerated");
-            print_status(g_fs_ok, g_fs_ok ? "FAT12 mounted at / via VFS"
-                                          : "No filesystem (running without disk)");
-            print_status(1, "Framebuffer console 1024x768x32");
-            con_set_color(CON_LIGHT_GREY, CON_BLACK);
-            printf("\n");
-        } else {
-            // Framebuffer unavailable -- make it visible and stay in text mode.
-            print_status(0, "Framebuffer unavailable - staying in VGA text mode");
-        }
-    }
-
     __asm__ volatile ("sti");
-
     shell_run();
-
     halt();
 }

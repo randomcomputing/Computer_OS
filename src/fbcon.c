@@ -1,7 +1,9 @@
 #include "console_backend.h"
+#include "stdint.h"
 #include "bochs_vbe.h"
 #include "font8x16.h"
 #include "serial.h"
+#include "printf.h"
 
 /*
  * Framebuffer text console.
@@ -334,25 +336,21 @@ const console_backend_t* fbcon_init(void) {
     const bochs_vbe_mode_t* m = bochs_vbe_current();
 
     if (!m || !m->ok) {
+        serial_write("[fbcon] no mode or not ok\n");
         return 0;
     }
 
+    serial_write("[fbcon] init ok\n");
     g_fb     = (volatile unsigned int*)m->virt;
-    g_stride = m->pitch / 4;
+    g_stride = m->pitch / 4;   /* convert bytes -> pixels */
     g_cols   = m->width / CELL_W;
     g_rows   = m->height / CELL_H;
 
-    if (g_cols > MAX_COLS) {
-        g_cols = MAX_COLS;
-    }
-
-    if (g_rows > MAX_ROWS) {
-        g_rows = MAX_ROWS;
-    }
-
-    if (g_cols <= 0 || g_rows <= 0) {
-        return 0;
-    }
+    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+    if (g_rows > MAX_ROWS) g_rows = MAX_ROWS;
+    if (g_cols <= 0 || g_rows <= 0) { serial_write("[fbcon] bad cols/rows\n"); return 0; }
+    printf("[fbcon] %dx%d cells, stride=%u, fb=0x%llx\n",
+           g_cols, g_rows, g_stride, (uint64_t)g_fb);
 
     g_fg = 7;
     g_bg = 0;

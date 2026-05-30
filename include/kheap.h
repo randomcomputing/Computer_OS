@@ -1,6 +1,8 @@
 #ifndef KHEAP_H
 #define KHEAP_H
 
+#include "stdint.h"
+
 // Kernel heap built on top of vmm + pmm.
 // Simple first-fit linked-list allocator with coalescing on free.
 // Grows on demand: when kmalloc can't find a fit, maps more pages
@@ -11,7 +13,7 @@
 // frames. The heap may later grow up to `max_pages` total via kheap_grow().
 // Pass max_pages == initial_pages to disable growth.
 // Must be called AFTER vmm_init().
-void kheap_init(unsigned int base,
+void kheap_init(uint64_t base,
                 unsigned int initial_pages,
                 unsigned int max_pages);
 

@@ -1,4 +1,5 @@
 #include "e1000.h"
+#include "stdint.h"
 #include "pci.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -8,7 +9,7 @@
 #define E1000_VENDOR_ID 0x8086
 #define E1000_DEVICE_ID 0x100E
 
-#define E1000_MMIO_VIRT_BASE 0xE1000000u
+#define E1000_MMIO_VIRT_BASE 0xFFFFFFFF81000000ULL
 #define E1000_MMIO_SIZE      0x20000u
 
 #define E1000_REG_CTRL       0x0000
@@ -84,38 +85,37 @@ typedef struct {
 static volatile unsigned int* e1000_mmio = 0;
 static unsigned char e1000_mac[6];
 
-#define DMA_VIRT_BASE 0xE2000000u
-static unsigned int dma_next = 0;
+#define DMA_VIRT_BASE 0xFFFFFFFF82000000ULL
+static uint64_t dma_next = 0;
 
 static volatile rx_desc_t* rx_ring;
 static volatile tx_desc_t* tx_ring;
-static unsigned int rx_buf_phys[NUM_RX_DESC];
-static unsigned int tx_buf_phys[NUM_TX_DESC];
-static unsigned int rx_buf_virt[NUM_RX_DESC];
-static unsigned int tx_buf_virt[NUM_TX_DESC];
+static uint64_t rx_buf_phys[NUM_RX_DESC];
+static uint64_t tx_buf_phys[NUM_TX_DESC];
+static uint64_t rx_buf_virt[NUM_RX_DESC];
+static uint64_t tx_buf_virt[NUM_TX_DESC];
 static unsigned int rx_cur = 0;
 static unsigned int tx_cur = 0;
 
 static unsigned int e1000_read(unsigned int reg) { return e1000_mmio[reg / 4]; }
 static void e1000_write(unsigned int reg, unsigned int value) { e1000_mmio[reg / 4] = value; }
 
-static int e1000_map_mmio(unsigned int phys) {
+static int e1000_map_mmio(uint64_t phys) {
     unsigned int pages = E1000_MMIO_SIZE / PAGE_SIZE;
     for (unsigned int i = 0; i < pages; i++) {
-        unsigned int off = i * PAGE_SIZE;
+        uint64_t off = i * PAGE_SIZE;
         if (!vmm_map(E1000_MMIO_VIRT_BASE + off, phys + off, VMM_PRESENT | VMM_WRITE)) {
-            printf("e1000: failed to map MMIO page %u\n", i);
             return 0;
         }
     }
-    e1000_mmio = (volatile unsigned int*)E1000_MMIO_VIRT_BASE;
+    e1000_mmio = (volatile unsigned int*)((uint64_t)E1000_MMIO_VIRT_BASE);
     return 1;
 }
 
-static unsigned int dma_alloc_page(unsigned int* phys_out) {
-    unsigned int phys = pmm_alloc();
+static uint64_t dma_alloc_page(uint64_t* phys_out) {
+    uint64_t phys = pmm_alloc();
     if (!phys) return 0;
-    unsigned int virt = DMA_VIRT_BASE + dma_next;
+    uint64_t virt = DMA_VIRT_BASE + dma_next;
     if (!vmm_map(virt, phys, VMM_PRESENT | VMM_WRITE)) return 0;
     dma_next += PAGE_SIZE;
     memset((void*)virt, 0, PAGE_SIZE);
@@ -124,13 +124,13 @@ static unsigned int dma_alloc_page(unsigned int* phys_out) {
 }
 
 static int e1000_setup_rx(void) {
-    unsigned int ring_phys, ring_virt;
+    uint64_t ring_phys, ring_virt;
     ring_virt = dma_alloc_page(&ring_phys);
     if (!ring_virt) return 0;
     rx_ring = (volatile rx_desc_t*)ring_virt;
 
     for (int i = 0; i < NUM_RX_DESC; i += 2) {
-        unsigned int p, v;
+        uint64_t p, v;
         v = dma_alloc_page(&p);
         if (!v) return 0;
         rx_buf_virt[i] = v; rx_buf_phys[i] = p;
@@ -152,13 +152,13 @@ static int e1000_setup_rx(void) {
 }
 
 static int e1000_setup_tx(void) {
-    unsigned int ring_phys, ring_virt;
+    uint64_t ring_phys, ring_virt;
     ring_virt = dma_alloc_page(&ring_phys);
     if (!ring_virt) return 0;
     tx_ring = (volatile tx_desc_t*)ring_virt;
 
     for (int i = 0; i < NUM_TX_DESC; i += 2) {
-        unsigned int p, v;
+        uint64_t p, v;
         v = dma_alloc_page(&p);
         if (!v) return 0;
         tx_buf_virt[i] = v; tx_buf_phys[i] = p;
@@ -225,40 +225,37 @@ void e1000_get_mac(unsigned char mac_out[6]) {
 
 int e1000_init(void) {
     const pci_device_t* dev = pci_find(E1000_VENDOR_ID, E1000_DEVICE_ID);
-    if (!dev) { printf("e1000: not found\n"); return 0; }
-    printf("e1000: found at %u:%u:%u irq %u\n", dev->bus, dev->device, dev->function, dev->irq_line);
+    if (!dev) return 0;
 
     pci_enable_bus_mastering(dev);
-    if (pci_bar_is_io(dev, 0)) { printf("e1000: BAR0 is I/O, expected MMIO\n"); return 0; }
-    unsigned int bar0_phys = pci_bar_addr(dev, 0);
-    if (!bar0_phys) { printf("e1000: BAR0 is zero\n"); return 0; }
-    if (!e1000_map_mmio(bar0_phys)) { printf("e1000: MMIO map failed\n"); return 0; }
+
+    if (pci_bar_is_io(dev, 0)) return 0;
+
+    uint64_t bar0_phys = pci_bar_addr(dev, 0);
+    if (!bar0_phys) return 0;
+
+    if (!e1000_map_mmio(bar0_phys)) return 0;
 
     e1000_write(E1000_REG_IMC, 0xFFFFFFFF);
     e1000_read(E1000_REG_ICR);
 
     e1000_read_mac_from_registers();
-    printf("e1000: MAC = %x:%x:%x:%x:%x:%x\n",
-           e1000_mac[0], e1000_mac[1], e1000_mac[2], e1000_mac[3], e1000_mac[4], e1000_mac[5]);
 
-    // Bring the link up BEFORE enabling the receiver/transmitter. Without
-    // CTRL.SLU the PHY link never comes up, so frames silently go nowhere and
-    // none are ever received — set link up + auto-speed-detect first.
+    /* Bring the link up before enabling RX/TX. */
     {
         unsigned int ctrl = e1000_read(E1000_REG_CTRL);
         ctrl |= CTRL_SLU | CTRL_ASDE;
         e1000_write(E1000_REG_CTRL, ctrl);
     }
 
-    // Clear the multicast table array (128 registers) — it holds garbage at
-    // reset and can otherwise interfere with receive filtering.
+    /* Clear the multicast table array. */
     for (int i = 0; i < 128; i++)
         e1000_write(E1000_REG_MTA + i * 4, 0);
 
     dma_next = 0;
-    if (!e1000_setup_rx()) { printf("e1000: RX setup failed\n"); return 0; }
-    if (!e1000_setup_tx()) { printf("e1000: TX setup failed\n"); return 0; }
 
-    printf("e1000: RX/TX rings ready (%d/%d desc)\n", NUM_RX_DESC, NUM_TX_DESC);
+    if (!e1000_setup_rx()) return 0;
+    if (!e1000_setup_tx()) return 0;
+
     return 1;
 }

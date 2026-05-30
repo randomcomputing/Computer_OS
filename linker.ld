@@ -1,67 +1,54 @@
-OUTPUT_FORMAT("binary")
-
 /*
- * Higher-half kernel layout.
+ * 64-bit higher-half kernel linker script.
  *
- * The bootloader loads the kernel image as a flat binary at physical 0x10000.
- * But we want kernel code and data to live at virtual 0xC0010000 once paging
- * is on. The trick: AT(...) sets the *load* address (where the image goes in
- * the binary file / where the bootloader places it in RAM), while `. = ...`
- * sets the *virtual* address the linker uses when resolving symbols and
- * fixing up absolute references.
+ * Limine loads our ELF64 kernel and relocates it. We ask for the kernel
+ * to be mapped at the standard higher-half base (0xFFFFFFFF80000000),
+ * but Limine handles the actual page-table setup and passes us the HHDM
+ * offset via the Limine requests API. We just need correct VMA placement
+ * and proper section alignment.
  *
- * So every call/jump in the kernel resolves to a 0xC00..... address, but the
- * bytes themselves sit at physical 0x10000. Before we turn paging on, any
- * code that executes must not depend on those symbols being reachable — that
- * is entry.asm's job: it runs with paging off, builds a page directory that
- * maps 0xC0000000..0xC0400000 -> 0x00000000..0x00400000 (and also keeps the
- * low region identity-mapped so the EIP remains valid the instant after PG
- * is set), enables paging, then jumps to a high-half label.
+ * The physical load address is chosen by Limine (it puts the kernel
+ * somewhere sensible above 1 MB). We don't need an AT() trick here
+ * because Limine gives us an ELF-aware loader — symbols resolve to the
+ * higher-half VMAs and Limine builds the mappings to match.
  */
 
-KERNEL_VMA = 0xC0000000;
-KERNEL_LMA = 0x00010000;
+KERNEL_VMA = 0xFFFFFFFF80000000;
+
+ENTRY(kernel_entry)
 
 SECTIONS
 {
-    . = KERNEL_VMA + KERNEL_LMA;
+    . = KERNEL_VMA;
 
-    .text : AT(KERNEL_LMA) {
-        *(.text.boot)       /* entry.asm's bootstrap — runs before paging */
+    .text ALIGN(4096) : {
+        *(.text.boot)
         *(.text*)
     }
 
-    .rodata : {
+    .rodata ALIGN(4096) : {
+        /* Limine request structures must be in a special section so the
+           bootloader can find them by scanning the ELF. */
+        KEEP(*(.limine_requests))
         *(.rodata*)
     }
 
-    .data : {
+    .data ALIGN(4096) : {
         *(.data*)
     }
 
-    .bss : {
+    .bss ALIGN(4096) : {
         bss_start = .;
         *(.bss*)
         *(COMMON)
         bss_end = .;
     }
 
-    /* End of the kernel image as seen by the PMM when placing its bitmap.
-       Virtual form for code that wants to write to kernel_end (the bitmap
-       lives right after the kernel). Physical form for code that wants to
-       reserve the kernel's physical footprint. */
     kernel_end      = .;
+    /* Physical end: subtract the VMA base to get physical offset from
+       where Limine loaded us. We use this for PMM reservations. */
     kernel_phys_end = . - KERNEL_VMA;
 
-    /* Drop sections that don't belong in a flat binary. Without this,
-       OUTPUT_FORMAT("binary") will lay them out at file offsets matching
-       their VMAs, but they sit between .rodata and .data — pushing .data
-       in the on-disk image out of sync with where the linker says .data
-       lives in memory. The .eh_frame section is the worst offender:
-       GCC emits it for exception unwinding (which a kernel doesn't use)
-       and it's typically a few KB. -fno-asynchronous-unwind-tables in
-       CFLAGS suppresses most of these at compile time; this rule is the
-       safety net for any that slip through. */
     /DISCARD/ : {
         *(.eh_frame)
         *(.eh_frame_hdr)

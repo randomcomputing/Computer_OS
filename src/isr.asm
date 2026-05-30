@@ -1,50 +1,63 @@
-[BITS 32]
+; isr.asm — 64-bit exception stubs
+;
+; In 64-bit mode:
+;   - pushad/popad are GONE; we push/pop each register individually
+;   - The CPU always pushes SS:RSP on an interrupt (no more conditional
+;     on privilege level — the stack frame is always 40 bytes)
+;   - Segment registers DS/ES/FS/GS are mostly ignored in 64-bit mode
+;     (CS and SS still matter for privilege, but DS/ES are flat zero-base)
+;   - We use the System V AMD64 calling convention: first arg in rdi
+;
+; Stack frame on entry to the common stub (top = low address):
+;   [CPU]    rip, cs, rflags, rsp, ss   (always 5 * 8 = 40 bytes)
+;   [stub]   int_no (8 bytes)
+;   [stub]   err_code (real or fake 0) — ALREADY pushed before int_no
+;            on ERR variants, CPU pushes it before we push int_no
+;   [us]     r15..rax (15 GP regs * 8 = 120 bytes)
+;
+; We then call isr_handler(struct registers*)  with rdi = rsp.
+
+[BITS 64]
 
 extern isr_handler
-
-; Exceptions 8, 10..14, 17 push an error code onto the stack themselves.
-; The others don't — we push a fake 0 so the C handler always sees the
-; same stack layout.
 
 %macro ISR_NOERR 1
     global isr%1
 isr%1:
-    cli
-    push dword 0          ; fake error code
-    push dword %1         ; interrupt number
+    push qword 0          ; fake error code
+    push qword %1         ; interrupt number
     jmp isr_common
 %endmacro
 
 %macro ISR_ERR 1
     global isr%1
 isr%1:
-    cli
-    push dword %1         ; interrupt number (error code already on stack)
+    push qword %1         ; interrupt number (error code already on stack)
     jmp isr_common
 %endmacro
 
-ISR_NOERR 0     ; Divide-by-zero
-ISR_NOERR 1     ; Debug
-ISR_NOERR 2     ; NMI
-ISR_NOERR 3     ; Breakpoint
-ISR_NOERR 4     ; Overflow
-ISR_NOERR 5     ; Bound range exceeded
-ISR_NOERR 6     ; Invalid opcode
-ISR_NOERR 7     ; Device not available
-ISR_ERR   8     ; Double fault
-ISR_NOERR 9     ; Coprocessor segment overrun (legacy)
-ISR_ERR   10    ; Invalid TSS
-ISR_ERR   11    ; Segment not present
-ISR_ERR   12    ; Stack-segment fault
-ISR_ERR   13    ; General protection fault
-ISR_ERR   14    ; Page fault
-ISR_NOERR 15    ; Reserved
-ISR_NOERR 16    ; x87 floating-point exception
-ISR_ERR   17    ; Alignment check
-ISR_NOERR 18    ; Machine check
-ISR_NOERR 19    ; SIMD floating-point exception
-ISR_NOERR 20    ; Virtualization exception
-ISR_ERR   21    ; Control protection exception
+ISR_NOERR 0
+ISR_NOERR 1
+ISR_NOERR 2
+ISR_NOERR 3
+ISR_NOERR 4
+ISR_NOERR 5
+ISR_NOERR 6
+ISR_NOERR 7
+ISR_ERR   8
+ISR_NOERR 9
+ISR_ERR   10
+ISR_ERR   11
+ISR_ERR   12
+ISR_ERR   13
+ISR_ERR   14
+ISR_NOERR 15
+ISR_NOERR 16
+ISR_ERR   17
+ISR_NOERR 18
+ISR_NOERR 19
+ISR_NOERR 20
+ISR_ERR   21
 ISR_NOERR 22
 ISR_NOERR 23
 ISR_NOERR 24
@@ -56,30 +69,44 @@ ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
 
-; Common handler: save CPU state, call C, restore state, iret.
 isr_common:
-    pusha                 ; edi,esi,ebp,esp,ebx,edx,ecx,eax
-    mov ax, ds
-    push eax              ; save data segment
+    ; Save all general-purpose registers. Order must match struct registers.
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
 
-    mov ax, 0x10          ; kernel data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    mov eax, esp          ; pointer to saved state
-    push eax              ; pass to C handler
+    ; rdi = pointer to the saved state (struct registers*)
+    mov  rdi, rsp
     call isr_handler
-    add esp, 4
 
-    pop eax               ; restore data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    ; Restore registers in reverse order.
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
 
-    popa
-    add esp, 8            ; drop int_no and error_code
-    sti
-    iret
+    add rsp, 16           ; drop int_no and err_code
+    iretq

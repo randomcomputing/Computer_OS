@@ -1,85 +1,84 @@
 #include "memmap.h"
 #include "printf.h"
+#include <stddef.h>
 
-// These addresses must match MEMMAP_COUNT / MEMMAP_ENTRIES in boot.asm.
-// We put them below the bootloader (0x7C00) because the protected-mode
-// kernel copy at 0x7E00 -> 0x10000 (32 KB) would trample anything we
-// stashed above the bootloader.
-#define MEMMAP_COUNT_ADDR    0x500
-#define MEMMAP_ENTRIES_ADDR  0x504
+/*
+ * Limine memmap response layout (from the Limine spec).
+ * We reproduce the relevant structs here so we don't need
+ * the full Limine header in every file.
+ */
+struct limine_memmap_entry {
+    uint64_t base;
+    uint64_t length;
+    uint64_t type;
+};
 
-static const int*            g_count_ptr   = (const int*)MEMMAP_COUNT_ADDR;
-static const memmap_entry_t* g_entries_ptr = (const memmap_entry_t*)MEMMAP_ENTRIES_ADDR;
+struct limine_memmap_response {
+    uint64_t revision;
+    uint64_t entry_count;
+    struct limine_memmap_entry** entries;
+};
 
-int memmap_count(void) {
-    int n = *g_count_ptr;
-    // Sanity: if something went wrong and we got a huge bogus count,
-    // clamp so a broken map can't crash the kernel.
-    if (n < 0 || n > 128) return 0;
-    return n;
+#define MAX_ENTRIES 128
+
+static memmap_entry_t  g_entries[MAX_ENTRIES];
+static int             g_count = 0;
+
+void memmap_init(void* resp_ptr) {
+    struct limine_memmap_response* resp =
+        (struct limine_memmap_response*)resp_ptr;
+
+    if (!resp) return;
+
+    uint64_t n = resp->entry_count;
+    if (n > MAX_ENTRIES) n = MAX_ENTRIES;
+
+    for (uint64_t i = 0; i < n; i++) {
+        struct limine_memmap_entry* e = resp->entries[i];
+        g_entries[g_count].base   = e->base;
+        g_entries[g_count].length = e->length;
+        g_entries[g_count].type   = (uint32_t)e->type;
+        g_entries[g_count].pad    = 0;
+        g_count++;
+    }
 }
+
+int memmap_count(void) { return g_count; }
 
 const memmap_entry_t* memmap_get(int i) {
-    if (i < 0 || i >= memmap_count()) return 0;
-    return &g_entries_ptr[i];
+    if (i < 0 || i >= g_count) return 0;
+    return &g_entries[i];
 }
 
-unsigned int memmap_total_usable(void) {
-    unsigned int total = 0;
-    int n = memmap_count();
-    for (int i = 0; i < n; i++) {
-        const memmap_entry_t* e = &g_entries_ptr[i];
-        if (e->type != MEMMAP_TYPE_USABLE) continue;
-
-        // Anything starting at or above 4 GB is unusable to a 32-bit kernel.
-        if (e->base_high != 0) continue;
-
-        // Cap length so we don't overflow adding it in.
-        unsigned int len = e->length_low;
-        if (e->length_high != 0) {
-            // Region extends past 4 GB; clamp to 4 GB - base.
-            len = 0xFFFFFFFFu - e->base_low;
-        }
-        // Clamp again in case base + len would wrap.
-        if (len > 0xFFFFFFFFu - e->base_low) {
-            len = 0xFFFFFFFFu - e->base_low;
-        }
-        total += len;
+uint64_t memmap_total_usable(void) {
+    uint64_t total = 0;
+    for (int i = 0; i < g_count; i++) {
+        if (g_entries[i].type == MEMMAP_TYPE_USABLE)
+            total += g_entries[i].length;
     }
     return total;
 }
 
-static const char* type_name(unsigned int type) {
-    switch (type) {
-        case MEMMAP_TYPE_USABLE:       return "USABLE";
-        case MEMMAP_TYPE_RESERVED:     return "RESERVED";
-        case MEMMAP_TYPE_ACPI_RECLAIM: return "ACPI_RECLAIM";
-        case MEMMAP_TYPE_ACPI_NVS:     return "ACPI_NVS";
-        case MEMMAP_TYPE_BAD:          return "BAD";
-        default:                       return "UNKNOWN";
+static const char* type_name(uint32_t t) {
+    switch (t) {
+        case MEMMAP_TYPE_USABLE:               return "USABLE";
+        case MEMMAP_TYPE_RESERVED:             return "RESERVED";
+        case MEMMAP_TYPE_ACPI_RECLAIM:         return "ACPI_RECLAIM";
+        case MEMMAP_TYPE_ACPI_NVS:             return "ACPI_NVS";
+        case MEMMAP_TYPE_BAD:                  return "BAD";
+        case MEMMAP_TYPE_BOOTLOADER_RECLAIM:   return "BOOTLOADER_RECLAIM";
+        case MEMMAP_TYPE_KERNEL_AND_MODULES:   return "KERNEL_AND_MODULES";
+        default:                               return "UNKNOWN";
     }
 }
 
 void memmap_print(void) {
-    int n = memmap_count();
-    if (n == 0) {
-        printf("No memory map available (E820 unsupported).\n");
-        return;
+    printf("Memory map (%d entries):\n", g_count);
+    for (int i = 0; i < g_count; i++) {
+        printf("  [%d] base=0x%llx len=0x%llx type=%s\n",
+               i, g_entries[i].base, g_entries[i].length,
+               type_name(g_entries[i].type));
     }
-
-    printf("E820 memory map (%d entries):\n", n);
-    for (int i = 0; i < n; i++) {
-        const memmap_entry_t* e = &g_entries_ptr[i];
-        // We print the low 32 bits of base and length. Any high bits being
-        // nonzero mean the region touches territory a 32-bit kernel can't
-        // address; we flag those.
-        printf("  [%d] base=0x%x len=0x%x type=%s",
-               i, e->base_low, e->length_low, type_name(e->type));
-        if (e->base_high || e->length_high) {
-            printf(" (64-bit)");
-        }
-        printf("\n");
-    }
-    unsigned int kb = memmap_total_usable() / 1024;
-    printf("Total usable: %u KB (%u MB)\n", kb, kb / 1024);
+    uint64_t mb = memmap_total_usable() / (1024 * 1024);
+    printf("Total usable: %llu MB\n", mb);
 }

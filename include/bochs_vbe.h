@@ -1,6 +1,8 @@
 #ifndef BOCHS_VBE_H
 #define BOCHS_VBE_H
 
+#include "stdint.h"
+
 // Bochs / QEMU "DISPI" VBE interface.
 //
 // QEMU's standard VGA device (PCI 1234:1111 — the one the PCI scan reports as
@@ -21,7 +23,7 @@
 // 32-bit XRGB value; rows are `pitch` bytes apart (pitch == width*4 here).
 typedef struct {
     unsigned int  phys;     // framebuffer physical base (from PCI BAR0)
-    unsigned int  virt;     // where vmm mapped it for the kernel to write
+    uint64_t      virt;     // where vmm mapped it for the kernel to write
     unsigned int  pitch;    // bytes per scanline
     unsigned short width;
     unsigned short height;
@@ -41,5 +43,10 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
 
 // The mode set by the last successful bochs_vbe_set_mode (ok=0 if none).
 const bochs_vbe_mode_t* bochs_vbe_current(void);
+
+// Populate the mode struct from a Limine framebuffer (bypasses DISPI hardware).
+void bochs_vbe_set_from_limine(void* fb_addr, unsigned int width,
+                               unsigned int height, unsigned int pitch,
+                               unsigned char bpp);
 
 #endif

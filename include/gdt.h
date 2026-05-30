@@ -1,32 +1,31 @@
 #ifndef GDT_H
 #define GDT_H
 
-// Kernel-side GDT with ring-3 entries and a TSS so we can drop to userspace.
-//
-// Layout (selectors):
-//   0x00  null
-//   0x08  ring-0 code   (kernel)
-//   0x10  ring-0 data   (kernel)
-//   0x1B  ring-3 code   (user)        index 3, RPL 3
-//   0x23  ring-3 data   (user)        index 4, RPL 3
-//   0x28  TSS                         index 5
-//
-// The bootloader's GDT only has the first three; this replaces it. Call
-// gdt_init() before any int 0x80 from ring 3 can fire, i.e. before we
-// ever IRET to userspace.
+#include <stdint.h>
 
-#define GDT_KCODE  0x08
-#define GDT_KDATA  0x10
-#define GDT_UCODE  0x1B
-#define GDT_UDATA  0x23
-#define GDT_TSS    0x28
+/*
+ * GDT selectors (64-bit flat model).
+ *
+ * Index 0: null
+ * Index 1: kernel code  (0x08) — 64-bit, DPL=0
+ * Index 2: kernel data  (0x10) — 64-bit, DPL=0
+ * Index 3: user data    (0x18) — 64-bit, DPL=3  (must come before user code for SYSRET)
+ * Index 4: user code    (0x20) — 64-bit, DPL=3
+ * Index 5: TSS low      (0x28) — 16-byte system descriptor
+ * Index 6: TSS high     (0x30) — upper 8 bytes of 64-bit TSS descriptor
+ */
+#define GDT_NULL    0x00
+#define GDT_KCODE   0x08
+#define GDT_KDATA   0x10
+#define GDT_UDATA   0x18
+#define GDT_UCODE   0x20
+#define GDT_TSS     0x28
 
-void gdt_init(void);
+/* User selectors with RPL=3 set (for iretq frames). */
+#define GDT_UCODE_RPL3  (GDT_UCODE | 3)   /* 0x23 */
+#define GDT_UDATA_RPL3  (GDT_UDATA | 3)   /* 0x1B */
 
-// Update the kernel stack pointer the CPU will load on a privilege-level
-// transition into ring 0 (e.g. user-mode int 0x80, page fault, IRQ from
-// userspace). Called by the scheduler whenever it switches to a task whose
-// kernel stack is different from the previous one's.
-void tss_set_kernel_stack(unsigned int esp0);
+void     gdt_init(void);
+void     tss_set_kernel_stack(uint64_t rsp0);
 
 #endif

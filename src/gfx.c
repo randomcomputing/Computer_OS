@@ -5,6 +5,7 @@
 #include "pit.h"
 #include "font8x16.h"
 #include "bochs_vbe.h"
+#include "stdint.h"
 
 // Linear framebuffer for mode 13h. One byte per pixel, row-major.
 #define GFX_FRAMEBUFFER ((volatile unsigned char*)0xA0000)

@@ -1,4 +1,5 @@
 #include "acpi.h"
+#include "stdint.h"
 #include "io.h"
 #include "printf.h"
 #include "serial.h"
@@ -109,9 +110,9 @@ static unsigned char table_checksum(const unsigned char* p, unsigned int len) {
 // ---- RSDP search ---------------------------------------------------------
 
 // Search a memory range for the RSDP signature "RSD PTR ".
-static rsdp_t* find_rsdp_in(unsigned int base, unsigned int end) {
-    for (unsigned int p = base; p < end; p += 16) {
-        rsdp_t* r = (rsdp_t*)p;
+static rsdp_t* find_rsdp_in(uint64_t base, uint64_t end) {
+    for (uint64_t p = base; p < end; p += 16) {
+        rsdp_t* r = (rsdp_t*)vmm_phys_to_virt(p);
         if (!sig_match(r->sig, "RSD PTR ", 8)) continue;
         // Verify ACPI 1.0 checksum (first 20 bytes).
         if (table_checksum((unsigned char*)r, 20) != 0) continue;
@@ -121,17 +122,13 @@ static rsdp_t* find_rsdp_in(unsigned int base, unsigned int end) {
 }
 
 static rsdp_t* find_rsdp(void) {
-    // QEMU always places the RSDP in the BIOS ROM area 0xE0000-0xFFFFF.
-    // This range is within the 4MB identity map so no vmm_map needed.
-    // Skip EBDA scanning -- EBDA can be above 4MB on some configurations
-    // and would require mapping before access.
     return find_rsdp_in(0xE0000, 0x100000);
 }
 
 // ---- S5 sleep type extraction --------------------------------------------
 // Walk DSDT looking for the _S5_ package to find the SLP_TYP value for S5.
 // This is a minimal pattern scan -- not a full AML interpreter.
-static void extract_s5(unsigned int dsdt_phys) {
+static void extract_s5(uint64_t dsdt_phys) {
     sdt_header_t* dsdt = (sdt_header_t*)dsdt_phys;
     if (!sig_match(dsdt->sig, "DSDT", 4)) return;
 
@@ -175,23 +172,15 @@ int acpi_init(void) {
 
     // Map RSDT physical address into kernel virtual space before accessing.
     // ACPI tables may be above the 4MB identity map, so we must vmm_map them.
-    unsigned int rsdt_phys = rsdp->rsdt_addr;
-    // Map 2 pages covering the RSDT header + entry array.
-    unsigned int rsdt_virt = 0xCFF00000u;
-    vmm_map(rsdt_virt,        rsdt_phys & 0xFFFFF000u, VMM_PRESENT);
-    vmm_map(rsdt_virt + 4096, (rsdt_phys & 0xFFFFF000u) + 4096, VMM_PRESENT);
-    unsigned int rsdt_off = rsdt_phys & 0xFFFu;
-    sdt_header_t* rsdt    = (sdt_header_t*)(rsdt_virt + rsdt_off);
+    uint64_t rsdt_phys = rsdp->rsdt_addr;
+    sdt_header_t* rsdt = (sdt_header_t*)vmm_phys_to_virt(rsdt_phys);
     unsigned int  entries = (rsdt->length - sizeof(sdt_header_t)) / 4;
     unsigned int* ptrs    = (unsigned int*)((unsigned char*)rsdt + sizeof(sdt_header_t));
 
     for (unsigned int i = 0; i < entries; i++) {
         // Map each RSDT entry before reading it -- physical address may be > 4MB.
-        unsigned int fadt_phys = ptrs[i];
-        unsigned int fadt_virt = 0xCFF02000u;
-        vmm_map(fadt_virt,        fadt_phys & 0xFFFFF000u, VMM_PRESENT);
-        vmm_map(fadt_virt + 4096, (fadt_phys & 0xFFFFF000u) + 4096, VMM_PRESENT);
-        sdt_header_t* h = (sdt_header_t*)(fadt_virt + (fadt_phys & 0xFFFu));
+        uint64_t fadt_phys = ptrs[i];
+        sdt_header_t* h = (sdt_header_t*)vmm_phys_to_virt(fadt_phys);
         if (!sig_match(h->sig, "FACP", 4)) continue;
 
         g_fadt = (fadt_t*)h;
@@ -207,14 +196,8 @@ int acpi_init(void) {
         g_pm1a_cnt = (unsigned short)g_fadt->pm1a_cnt_blk;
 
         // Map DSDT pages (DSDT can be large -- map 4 pages).
-        unsigned int dsdt_phys = g_fadt->dsdt;
-        unsigned int dsdt_virt = 0xCFF04000u;
-        for (int pg = 0; pg < 8; pg++)
-            vmm_map(dsdt_virt + (unsigned int)pg*4096,
-                    (dsdt_phys & 0xFFFFF000u) + (unsigned int)pg*4096,
-                    VMM_PRESENT);
-        // Extract S5 sleep type from DSDT.
-        extract_s5(dsdt_virt + (dsdt_phys & 0xFFFu));
+        uint64_t dsdt_phys = g_fadt->dsdt;
+        extract_s5(vmm_phys_to_virt(dsdt_phys));
         return 1;
     }
 
@@ -232,7 +215,7 @@ void acpi_reboot(void) {
             outb((unsigned short)reg->address, g_fadt->reset_val);
         } else if (reg->addr_space == 0) {
             // Memory-mapped.
-            volatile unsigned char* p = (volatile unsigned char*)(unsigned int)reg->address;
+            volatile unsigned char* p = (volatile unsigned char*)reg->address;
             *p = g_fadt->reset_val;
         }
         // Short spin to let the reset propagate.
@@ -253,7 +236,7 @@ void acpi_reboot(void) {
 
     // Triple fault last resort.
     serial_write("[acpi] fallback: triple fault\n");
-    struct { unsigned short limit; unsigned int base; }
+    struct { unsigned short limit; uint64_t base; }
         __attribute__((packed)) null_idt = { 0, 0 };
     __asm__ volatile (
         "lidt (%0)\n\t"

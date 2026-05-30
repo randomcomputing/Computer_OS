@@ -1,48 +1,59 @@
-[BITS 32]
+; syscall_asm.asm — 64-bit syscall entry
+;
+; We keep int 0x80 for now (same as 32-bit), which keeps the user-space
+; ABI unchanged and means syscall.c needs no changes. A later pass can
+; swap to the SYSCALL/SYSRET fast path.
+;
+; On entry from ring 3 (int 0x80, DPL=3 gate):
+;   CPU pushes: ss, rsp, rflags, cs, rip  (40 bytes — always in 64-bit)
+;   We push: err_code (fake 0), int_no (0x80), then all GP regs.
+;
+; The C handler receives a pointer to struct registers (rdi = rsp).
+; It can write the return value into regs->rax; we restore rax from there.
+
+[BITS 64]
 
 extern syscall_handler
 
-; int 0x80 entry point.
-;
-; On entry from ring 3, the CPU has already:
-;   - switched ESP to tss.esp0 (kernel stack)
-;   - pushed (in order): user SS, user ESP, EFLAGS, user CS, return EIP
-;
-; We then push a fake error code and the int number, pusha, save DS,
-; load kernel data segments, hand the C handler a pointer to the saved
-; state, then unwind exactly the way ISR/IRQ stubs do. We deliberately
-; reuse the same `struct registers` layout used by ISRs so the syscall
-; handler can read args from regs->ebx, regs->ecx, etc., and write its
-; return value back into regs->eax — popa restores eax from the stack
-; we wrote, so the user program sees the return value when it resumes.
-
 global syscall_stub
 syscall_stub:
-    cli
-    push dword 0          ; fake error code (layout uniformity)
-    push dword 0x80       ; vector number
+    push qword 0          ; fake error code
+    push qword 0x80       ; vector number
 
-    pusha                 ; edi,esi,ebp,esp_dummy,ebx,edx,ecx,eax
-    mov ax, ds
-    push eax              ; saved DS
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
 
-    mov ax, 0x10          ; kernel data segment (GDT_KDATA)
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    mov eax, esp          ; pointer to registers struct
-    push eax
+    mov  rdi, rsp         ; first arg = pointer to saved state
     call syscall_handler
-    add esp, 4
 
-    pop eax               ; restore caller's DS
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax               ; syscall return value (written by C handler)
 
-    popa                  ; restores eax with whatever C handler wrote
-    add esp, 8            ; drop int_no and error_code
-    iret                  ; back to userspace; CPU pops EIP/CS/EFLAGS/ESP/SS
+    add rsp, 16           ; drop int_no and err_code
+    iretq

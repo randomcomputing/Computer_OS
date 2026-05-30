@@ -46,10 +46,39 @@ void con_set_backend(const console_backend_t* backend) {
     if (backend) g_backend = backend;
 }
 
+/* Null backend — discards screen output.
+ * printf still reaches serial via serial_putc so nothing is lost. */
+static void  nb_clear(void)                              {}
+static void  nb_set_color(enum con_color a, enum con_color b) { (void)a; (void)b; }
+static void  nb_putchar(char c)                          { (void)c; }
+static void  nb_puts(const char* s)                      { (void)s; }
+static void  nb_get_cursor(int* r, int* c)               { if(r)*r=0; if(c)*c=0; }
+static void  nb_set_cursor(int r, int c)                 { (void)r; (void)c; }
+static int   nb_rows(void)                               { return 25; }
+static int   nb_cols(void)                               { return 80; }
+static void  nb_scroll(int n)                            { (void)n; }
+static int   nb_is_scrolled(void)                        { return 0; }
+
+static const console_backend_t null_backend = {
+    nb_clear,          /* clear            */
+    nb_set_color,      /* set_color        */
+    nb_putchar,        /* putchar          */
+    nb_puts,           /* puts             */
+    nb_get_cursor,     /* get_cursor       */
+    nb_set_cursor,     /* set_cursor       */
+    nb_putchar,        /* putchar_at_cursor */
+    nb_rows,           /* rows             */
+    nb_cols,           /* cols             */
+    nb_scroll,         /* scroll_up        */
+    nb_scroll,         /* scroll_down      */
+    nb_clear,          /* scroll_reset     */
+    nb_is_scrolled,    /* is_scrolled      */
+};
+
 void con_init(void) {
-    // The VGA backend is the boot default; initialize the hardware text mode.
-    vga_init();
-    g_backend = &vga_backend;
+    /* Skip VGA text mode under UEFI/Limine — use null backend until
+       the framebuffer console is ready. Serial output is unaffected. */
+    g_backend = &null_backend;
 }
 
 void con_clear(void)                                   { g_backend->clear(); }

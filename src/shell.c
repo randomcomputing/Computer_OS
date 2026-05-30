@@ -8,6 +8,7 @@
 #include "memmap.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "stdint.h"
 #include "kheap.h"
 #include "task.h"
 #include "vfs.h"
@@ -709,10 +710,14 @@ static void cmd_sleep(const char* args) {
 }
 
 static void cmd_meminfo(void)  { memmap_print(); }
-static void cmd_pmemstat(void) { pmm_print(); }
+static void cmd_pmemstat(void) {
+    printf("PMM: %llu pages free (%llu MB), %llu total\n",
+           pmm_free_pages(), pmm_free_pages() * 4096 / (1024*1024),
+           pmm_total_pages());
+}
 
 static void cmd_palloc(void) {
-    unsigned int p = pmm_alloc();
+    uint64_t p = pmm_alloc();
     if (p == 0) { printf("pmm_alloc failed (out of memory)\n"); return; }
     printf("allocated page at 0x%x  (%u pages free)\n", p, pmm_free_pages());
 }
@@ -963,11 +968,11 @@ static void cmd_kmtest(void) {
     void* a = kmalloc(64);
     void* b = kmalloc(128);
     void* c = kmalloc(256);
-    printf("a=0x%x  b=0x%x  c=0x%x\n",
-           (unsigned int)a, (unsigned int)b, (unsigned int)c);
+    printf("a=0x%llx  b=0x%llx  c=0x%llx\n",
+           (uint64_t)a, (uint64_t)b, (uint64_t)c);
     kfree(b);
     void* d = kmalloc(64);
-    printf("freed b, new 64-byte alloc at d=0x%x\n", (unsigned int)d);
+    printf("freed b, new 64-byte alloc at d=0x%llx\n", (uint64_t)d);
     kfree(a); kfree(c); kfree(d);
     printf("all freed. %u bytes free, %u blocks\n",
            kheap_free(), kheap_blocks());

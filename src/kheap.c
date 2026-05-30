@@ -1,4 +1,5 @@
 #include "kheap.h"
+#include "stdint.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "printf.h"
@@ -16,9 +17,9 @@ typedef struct block {
 } block_t;
 
 static block_t*     heap_head   = 0;
-static unsigned int heap_start  = 0;
-static unsigned int heap_end    = 0;  // one past last currently-mapped byte
-static unsigned int heap_limit  = 0;  // hard cap: heap_end will never exceed this
+static uint64_t     heap_start  = 0;
+static uint64_t     heap_end    = 0;
+static uint64_t     heap_limit  = 0;
 
 #define HEADER_SIZE      ((unsigned int) sizeof(block_t))
 #define ALIGN8(x)        (((x) + 7u) & ~7u)
@@ -29,22 +30,21 @@ static unsigned int heap_limit  = 0;  // hard cap: heap_end will never exceed th
 // Map `pages` fresh physical frames at [virt, virt + pages*4K).
 // Returns 1 on success, 0 on failure (and rolls back any partial work).
 // --------------------------------------------------------------------
-static int map_region(unsigned int virt, unsigned int pages) {
+static int map_region(uint64_t virt, unsigned int pages) {
     for (unsigned int i = 0; i < pages; i++) {
-        unsigned int phys = pmm_alloc();
+        uint64_t phys = pmm_alloc();
         if (phys == 0) goto fail;
 
         if (!vmm_map(virt + i * PAGE, phys, VMM_PRESENT | VMM_WRITE)) {
-            pmm_free(phys);   // we own this frame; give it back
+            pmm_free(phys);
             goto fail;
         }
         continue;
 
     fail:
-        // Roll back: unmap and free the i pages we already installed.
         for (unsigned int j = 0; j < i; j++) {
-            unsigned int v = virt + j * PAGE;
-            unsigned int p = vmm_resolve(v);
+            uint64_t v = virt + j * PAGE;
+            uint64_t p = vmm_resolve(v);
             vmm_unmap(v);
             if (p) pmm_free(p);
         }
@@ -62,7 +62,7 @@ static block_t* last_block(void) {
     return b;
 }
 
-void kheap_init(unsigned int base,
+void kheap_init(uint64_t base,
                 unsigned int initial_pages,
                 unsigned int max_pages) {
     if (max_pages < initial_pages) max_pages = initial_pages;
@@ -77,7 +77,7 @@ void kheap_init(unsigned int base,
     heap_limit = base + max_pages     * PAGE;
 
     // Start with one giant free block covering the whole region.
-    heap_head        = (block_t*) base;
+    heap_head        = (block_t*)base;
     heap_head->size  = initial_pages * PAGE - HEADER_SIZE;
     heap_head->used  = 0;
     heap_head->next  = 0;
@@ -101,7 +101,7 @@ unsigned int kheap_grow(unsigned int min_bytes) {
     if (needed_pages > room_pages) needed_pages = room_pages;
     if (needed_pages == 0) return 0;
 
-    unsigned int new_region_start = heap_end;
+    uint64_t new_region_start = heap_end;
     if (!map_region(new_region_start, needed_pages)) {
         printf("[kheap] grow: map_region failed (%u pages)\n", needed_pages);
         return 0;
@@ -120,7 +120,7 @@ unsigned int kheap_grow(unsigned int min_bytes) {
     } else {
         // Last block is used (or list is empty): make a new free block
         // at the start of the new region.
-        block_t* nb = (block_t*) new_region_start;
+        block_t* nb = (block_t*)new_region_start;
         nb->size = added - HEADER_SIZE;
         nb->used = 0;
         nb->next = 0;
@@ -219,7 +219,7 @@ unsigned int kheap_blocks(void) {
 }
 
 unsigned int kheap_size(void) {
-    return heap_end - heap_start;
+    return (unsigned int)(heap_end - heap_start);
 }
 
 void kheap_print(void) {
@@ -229,6 +229,6 @@ void kheap_print(void) {
     int i = 0;
     for (block_t* b = heap_head; b; b = b->next, i++) {
         printf("  [%d] 0x%x  size=%u  %s\n",
-               i, (unsigned int)b, b->size, b->used ? "USED" : "free");
+               i, (uint64_t)b, b->size, b->used ? "USED" : "free");
     }
 }

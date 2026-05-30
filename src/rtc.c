@@ -286,4 +286,3 @@ const char* rtc_tz_name_for_offset(int minutes) {
     }
     return 0;
 }
-

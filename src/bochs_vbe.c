@@ -1,4 +1,5 @@
 #include "bochs_vbe.h"
+#include "stdint.h"
 #include "io.h"
 #include "pci.h"
 #include "vmm.h"
@@ -67,7 +68,7 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
     if (!gpu) {
         return 0;
     }
-    unsigned int fb_phys = gpu->bar[0] & 0xFFFFFFF0u;
+    uint64_t fb_phys = gpu->bar[0] & 0xFFFFFFF0u;
     if (fb_phys == 0) {
         return 0;
     }
@@ -87,27 +88,27 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
     dispi_write(VBE_DISPI_INDEX_ENABLE,
                 VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
 
-    unsigned int pitch = (unsigned int)width * 4u;      // 32bpp, no padding
-    unsigned int bytes = pitch * (unsigned int)height;  // total framebuffer
+    uint32_t pitch = (uint32_t)width * 4u;      // 32bpp, no padding
+    uint32_t bytes = pitch * (uint32_t)height;  // total framebuffer
     unsigned int pages = (bytes + 0xFFF) >> 12;         // round up to pages
 
     // Map the framebuffer into kernel virtual space, one page at a time.
     // map writes its page tables from PMM low memory (identity-accessible),
     // so mapping a high physical BAR like 0xFD000000 is fine.
-    for (unsigned int i = 0; i < pages; i++) {
-        unsigned int off = i << 12;
+    for (uint32_t i = 0; i < pages; i++) {
+        uint64_t off = (uint64_t)i << 12;
         if (!vmm_map(VBE_FB_VIRT_BASE + off, fb_phys + off,
                      VMM_PRESENT | VMM_WRITE)) {
             // Out of frames for page tables: unwind and fall back to text.
-            for (unsigned int j = 0; j < i; j++)
-                vmm_unmap(VBE_FB_VIRT_BASE + (j << 12));
+            for (uint32_t j = 0; j < i; j++)
+                vmm_unmap(VBE_FB_VIRT_BASE + ((uint64_t)j << 12));
             dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
             return 0;
         }
     }
 
     g_mode.phys   = fb_phys;
-    g_mode.virt   = VBE_FB_VIRT_BASE;
+    g_mode.virt   = (uint64_t)VBE_FB_VIRT_BASE;
     g_mode.pitch  = pitch;
     g_mode.width  = width;
     g_mode.height = height;
@@ -120,4 +121,17 @@ int bochs_vbe_set_mode(unsigned short width, unsigned short height,
 
 const bochs_vbe_mode_t* bochs_vbe_current(void) {
     return &g_mode;
+}
+/* Populate g_mode from a Limine-provided framebuffer so fbcon_init()
+   works without going through the DISPI register path. */
+void bochs_vbe_set_from_limine(void* fb_addr, unsigned int width,
+                                unsigned int height, unsigned int pitch,
+                                unsigned char bpp) {
+    g_mode.phys   = 0;   /* physical addr not needed — we have the virtual */
+    g_mode.virt   = (uint64_t)fb_addr;
+    g_mode.pitch  = pitch;   /* pitch in bytes; fbcon divides by 4 */
+    g_mode.width  = (unsigned short)width;
+    g_mode.height = (unsigned short)height;
+    g_mode.bpp    = bpp;
+    g_mode.ok     = 1;
 }

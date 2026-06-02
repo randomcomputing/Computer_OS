@@ -193,14 +193,18 @@ static int format_83(const char* raw, char* out) {
     int n = 0;
 
     for (int i = 0; i < 8 && raw[i] != ' '; i++) {
-        out[n++] = raw[i];
+        char c = raw[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        out[n++] = c;
     }
 
     if (raw[8] != ' ') {
         out[n++] = '.';
 
         for (int i = 8; i < 11 && raw[i] != ' '; i++) {
-            out[n++] = raw[i];
+            char c = raw[i];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            out[n++] = c;
         }
     }
 
@@ -245,6 +249,39 @@ static int build_83(const char* name, char out[11]) {
     }
 
     return 0;
+}
+
+/* Returns 1 if name needs LFN (stem > 8 or ext > 3). */
+static int needs_lfn(const char* name) {
+    int dot = -1, len = 0;
+    for (int i = 0; name[i]; i++, len++)
+        if (name[i] == '.') dot = i;
+    int stem = (dot >= 0) ? dot : len;
+    int ext  = (dot >= 0) ? (len - dot - 1) : 0;
+    return (stem > 8 || ext > 3);
+}
+
+/* Build a numeric-tail 8.3 short name, e.g. "TESTTA~1.GZ" */
+static void build_83_tail(const char* name, int n, char out[11]) {
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int dot = -1;
+    for (int i = 0; name[i]; i++) if (name[i] == '.') dot = i;
+    if (dot >= 0) {
+        int elen = 0;
+        for (int i = dot + 1; name[i] && elen < 3; i++, elen++)
+            out[8 + elen] = upper(name[i]);
+    }
+    /* Build tail string "~N" */
+    char num[8]; int nlen = 0; int tmp = n;
+    if (tmp == 0) { num[nlen++] = '0'; }
+    else { while (tmp > 0) { num[nlen++] = (char)('0' + tmp % 10); tmp /= 10; } }
+    char tail[8]; tail[0] = '~'; int tlen = 1;
+    for (int i = nlen - 1; i >= 0; i--) tail[tlen++] = num[i];
+    int stem_max = 8 - tlen;
+    int stem_len = 0;
+    for (int i = 0; name[i] && (dot < 0 || i < dot) && stem_len < stem_max; i++, stem_len++)
+        out[stem_len] = upper(name[i]);
+    for (int i = 0; i < tlen; i++) out[stem_len + i] = tail[i];
 }
 
 // ============================================================
@@ -426,29 +463,129 @@ done:
 }
 
 // ============================================================
+// LFN-aware directory walker
+// ============================================================
+
+/*
+ * Like dir_each but accumulates LFN entries and passes the reconstructed
+ * long name to the callback as an extra parameter.
+ * Callback signature: int cb(dirent_t* e, unsigned int chunk, int idx,
+ *                            const char* lfn_name, void* ctx)
+ * lfn_name is "" if no LFN precedes the entry.
+ */
+typedef int (*dir_lfn_cb)(dirent_t* e, unsigned int chunk, int idx,
+                           const char* lfn_name, void* ctx);
+
+#define LFN_MAX_SEGS 20
+
+static int dir_each_lfn(unsigned int dir_cluster, dir_lfn_cb cb, void* ctx) {
+    unsigned char* buf = dir_alloc_chunk();
+    if (!buf) { printf("[fat32] dir_each_lfn: out of memory\n"); return -1; }
+
+    unsigned int epc   = dir_entries_per_cluster();
+    unsigned int chunk = dir_cluster;
+    int ret = 0;
+
+    /* LFN accumulator — heap allocated to avoid stack overflow */
+    dirent_t* lfn_segs = (dirent_t*)kmalloc(LFN_MAX_SEGS * sizeof(dirent_t));
+    if (!lfn_segs) { kfree(buf); return -1; }
+    int      lfn_count = 0;
+    char     lfn_name[256];
+    lfn_name[0] = '\0';
+
+    while (1) {
+        if (dir_read_chunk(chunk, buf) < 0) { ret = -1; break; }
+
+        dirent_t* entries = (dirent_t*)buf;
+
+        for (unsigned int i = 0; i < epc; i++) {
+            unsigned char first = (unsigned char)entries[i].name[0];
+
+            /* End of directory */
+            if (first == 0x00) { ret = 0; goto done; }
+
+            /* Deleted entry — reset LFN accumulator */
+            if (first == 0xE5) { lfn_count = 0; lfn_name[0] = '\0'; continue; }
+
+            /* LFN entry — accumulate */
+            if (entries[i].attr == ATTR_LFN) {
+                if (lfn_count < LFN_MAX_SEGS)
+                    lfn_segs[lfn_count++] = entries[i];
+                continue;
+            }
+
+            /* Regular entry — reconstruct LFN if we have segments */
+            if (lfn_count > 0) {
+                lfn_reconstruct(lfn_segs, lfn_count, lfn_name, sizeof(lfn_name));
+            } else {
+                lfn_name[0] = '\0';
+            }
+            lfn_count = 0;
+
+            int r = cb(&entries[i], chunk, (int)i, lfn_name, ctx);
+            lfn_name[0] = '\0';
+
+            if (r != 0) { ret = r; goto done; }
+        }
+
+        unsigned int next = fat32_get_entry(real_cluster(chunk));
+        if (is_end_of_chain(next)) break;
+        chunk = next;
+    }
+
+done:
+    kfree(lfn_segs);
+    kfree(buf);
+    return ret;
+}
+
+// ============================================================
 // Directory find / alloc / delete
 // ============================================================
 
 typedef struct {
     char         raw83[11];
+    char         lfn_name[256]; /* original name for LFN match */
     dirent_t     found;
     unsigned int found_chunk;
     int          found_idx;
     int          was_found;
 } find_ctx;
 
-static int find_cb(dirent_t* e, unsigned int chunk, int idx, void* ctx) {
+static int find_cb(dirent_t* e, unsigned int chunk, int idx,
+                   const char* lfn_name, void* ctx) {
     if ((unsigned char)e->name[0] == 0xE5) return 0;
     if (e->attr == ATTR_LFN) return 0;
 
     find_ctx* fc = (find_ctx*)ctx;
 
+    /* Match by 8.3 short name */
     if (memcmp(e->name, fc->raw83, 11) == 0) {
         fc->found = *e;
         fc->found_chunk = chunk;
         fc->found_idx = idx;
         fc->was_found = 1;
         return -1;
+    }
+
+    /* Match by LFN name (case-insensitive) */
+    if (fc->lfn_name[0] && lfn_name && lfn_name[0]) {
+        const char* a = lfn_name;
+        const char* b = fc->lfn_name;
+        int match = 1;
+        int j = 0;
+        for (; a[j] && b[j]; j++) {
+            char ca = (a[j] >= 'A' && a[j] <= 'Z') ? a[j] + 32 : a[j];
+            char cb = (b[j] >= 'A' && b[j] <= 'Z') ? b[j] + 32 : b[j];
+            if (ca != cb) { match = 0; break; }
+        }
+        if (match && !a[j] && !b[j]) {
+            fc->found = *e;
+            fc->found_chunk = chunk;
+            fc->found_idx = idx;
+            fc->was_found = 1;
+            return -1;
+        }
     }
 
     return 0;
@@ -460,18 +597,41 @@ static int dir_find(unsigned int dir_cluster,
                     unsigned int* found_chunk_out,
                     int* found_idx_out) {
     find_ctx fc;
-
     memset(&fc, 0, sizeof(fc));
     memcpy(fc.raw83, raw83, 11);
+    /* No LFN name for plain 8.3 lookups */
 
-    dir_each(dir_cluster, find_cb, &fc);
+    dir_each_lfn(dir_cluster, find_cb, &fc);
 
     if (!fc.was_found) return -1;
-
-    if (out) *out = fc.found;
+    if (out)             *out             = fc.found;
     if (found_chunk_out) *found_chunk_out = fc.found_chunk;
-    if (found_idx_out) *found_idx_out = fc.found_idx;
+    if (found_idx_out)   *found_idx_out   = fc.found_idx;
+    return 0;
+}
 
+/* dir_find_lfn: find by original (possibly long) name AND 8.3 short name. */
+static int dir_find_lfn(unsigned int dir_cluster,
+                        const char raw83[11],
+                        const char* original_name,
+                        dirent_t* out,
+                        unsigned int* found_chunk_out,
+                        int* found_idx_out) {
+    find_ctx fc;
+    memset(&fc, 0, sizeof(fc));
+    memcpy(fc.raw83, raw83, 11);
+    if (original_name) {
+        int i = 0;
+        while (i < 255 && original_name[i]) { fc.lfn_name[i] = original_name[i]; i++; }
+        fc.lfn_name[i] = '\0';
+    }
+
+    dir_each_lfn(dir_cluster, find_cb, &fc);
+
+    if (!fc.was_found) return -1;
+    if (out)             *out             = fc.found;
+    if (found_chunk_out) *found_chunk_out = fc.found_chunk;
+    if (found_idx_out)   *found_idx_out   = fc.found_idx;
     return 0;
 }
 
@@ -546,6 +706,56 @@ static int dir_alloc_slot(unsigned int dir_cluster,
     *chunk_out = new_c;
     *idx_out = 0;
 
+    return 0;
+}
+
+/* Allocate `count` consecutive free slots within one cluster. */
+static int dir_alloc_slots(unsigned int dir_cluster, int count,
+                            unsigned int* chunk_out, int* idx_out) {
+    unsigned char* buf = dir_alloc_chunk();
+    if (!buf) return -1;
+
+    unsigned int epc   = dir_entries_per_cluster();
+    unsigned int chunk = dir_cluster;
+
+    while (1) {
+        if (dir_read_chunk(chunk, buf) < 0) { kfree(buf); return -1; }
+        dirent_t* entries = (dirent_t*)buf;
+
+        int run = 0, run_start = -1;
+        for (unsigned int i = 0; i < epc; i++) {
+            unsigned char first = (unsigned char)entries[i].name[0];
+            if (first == 0xE5 || first == 0x00) {
+                if (run == 0) run_start = (int)i;
+                if (++run >= count) {
+                    *chunk_out = chunk;
+                    *idx_out   = run_start;
+                    kfree(buf);
+                    return 0;
+                }
+            } else {
+                run = 0; run_start = -1;
+            }
+        }
+
+        unsigned int real = real_cluster(chunk);
+        unsigned int next = fat32_get_entry(real);
+        if (is_end_of_chain(next)) break;
+        chunk = next;
+    }
+
+    /* Extend chain */
+    unsigned int last  = real_cluster(chunk);
+    unsigned int new_c = fat32_extend_chain(last);
+    if (!new_c) { kfree(buf); return -1; }
+
+    memset(buf, 0, bytes_per_cluster);
+    if (fat_write(cluster_to_lba(new_c), bpb.sectors_per_cluster, buf) < 0) {
+        kfree(buf); return -1;
+    }
+    kfree(buf);
+    *chunk_out = new_c;
+    *idx_out   = 0;
     return 0;
 }
 
@@ -771,14 +981,11 @@ static unsigned int resolve_component(unsigned int dir, const char* comp) {
     }
 
     char raw83[11];
-
-    if (build_83(comp, raw83) < 0) {
-        return 0xFFFFFFFFu;
-    }
+    build_83(comp, raw83);
 
     dirent_t e;
 
-    if (dir_find(dir, raw83, &e, 0, 0) < 0) {
+    if (dir_find_lfn(dir, raw83, comp, &e, 0, 0) < 0) {
         return 0xFFFFFFFFu;
     }
 
@@ -1007,7 +1214,8 @@ typedef struct {
     int             count;
 } list_ctx;
 
-static int list_cb(dirent_t* e, unsigned int chunk, int idx, void* ctx) {
+static int list_cb(dirent_t* e, unsigned int chunk, int idx,
+                   const char* lfn_name, void* ctx) {
     (void)chunk;
     (void)idx;
 
@@ -1023,7 +1231,14 @@ static int list_cb(dirent_t* e, unsigned int chunk, int idx, void* ctx) {
 
     fat32_dirent_t* d = &lc->out[lc->count++];
 
-    format_83(e->name, d->name);
+    /* Use the reconstructed LFN if available, otherwise 8.3 name. */
+    if (lfn_name && lfn_name[0]) {
+        int i = 0;
+        while (i < 255 && lfn_name[i]) { d->name[i] = lfn_name[i]; i++; }
+        d->name[i] = '\0';
+    } else {
+        format_83(e->name, d->name);
+    }
 
     d->size = e->size;
     d->attr = e->attr;
@@ -1038,7 +1253,7 @@ static int list_cb(dirent_t* e, unsigned int chunk, int idx, void* ctx) {
 int fat32_list_dir(unsigned int dir_cluster, fat32_dirent_t* out, int max) {
     list_ctx lc = { out, max, 0 };
 
-    dir_each(dir_cluster, list_cb, &lc);
+    dir_each_lfn(dir_cluster, list_cb, &lc);
 
     return lc.count;
 }
@@ -1060,14 +1275,11 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     }
 
     char raw83[11];
-
-    if (build_83(basename, raw83) < 0) {
-        return -1;
-    }
+    build_83(basename, raw83);
 
     dirent_t e;
 
-    if (dir_find(parent, raw83, &e, 0, 0) < 0) {
+    if (dir_find_lfn(parent, raw83, basename, &e, 0, 0) < 0) {
         return -1;
     }
 
@@ -1121,20 +1333,16 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
     }
 
     char raw83[11];
-
-    if (build_83(basename, raw83) < 0) {
-        return -1;
-    }
+    build_83(basename, raw83);
+    int use_lfn = needs_lfn(basename);
+    if (use_lfn) build_83_tail(basename, 1, raw83);
 
     dirent_t existing;
     unsigned int ex_chunk;
     int ex_idx;
 
-    int exists = (dir_find(parent,
-                           raw83,
-                           &existing,
-                           &ex_chunk,
-                           &ex_idx) == 0);
+    int exists = (dir_find_lfn(parent, raw83, basename,
+                              &existing, &ex_chunk, &ex_idx) == 0);
 
     if (exists && (existing.attr & ATTR_DIRECTORY)) {
         return -1;
@@ -1142,10 +1350,7 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
 
     if (exists) {
         unsigned int ec = entry_cluster(&existing);
-
-        if (ec >= 2) {
-            fat32_free_chain(ec);
-        }
+        if (ec >= 2) fat32_free_chain(ec);
     }
 
     unsigned int first = 0;
@@ -1209,20 +1414,36 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
     ne.cluster_hi = (first >> 16) & 0xFFFF;
 
     if (exists) {
-        if (dir_put_entry(parent, ex_chunk, ex_idx, &ne) < 0) {
+        if (dir_put_entry(parent, ex_chunk, ex_idx, &ne) < 0) return -1;
+    } else if (use_lfn) {
+        int namelen = (int)strlen(basename);
+        int n_lfn   = lfn_entry_count(namelen);
+        int total   = n_lfn + 1;
+
+        unsigned int slot_chunk;
+        int slot_idx;
+        if (dir_alloc_slots(parent, total, &slot_chunk, &slot_idx) < 0)
             return -1;
-        }
+
+        unsigned char* dbuf = dir_alloc_chunk();
+        if (!dbuf) return -1;
+        if (dir_read_chunk(slot_chunk, dbuf) < 0) { kfree(dbuf); return -1; }
+
+        unsigned char cksum = lfn_checksum(raw83);
+        unsigned int  epc   = dir_entries_per_cluster();
+        lfn_write_entries(dbuf, slot_idx, n_lfn, basename, cksum, epc);
+
+        int short_idx = slot_idx + n_lfn;
+        if ((unsigned int)short_idx < epc)
+            ((dirent_t*)dbuf)[short_idx] = ne;
+
+        if (dir_write_chunk(slot_chunk, dbuf) < 0) { kfree(dbuf); return -1; }
+        kfree(dbuf);
     } else {
         unsigned int slot_chunk;
         int slot_idx;
-
-        if (dir_alloc_slot(parent, &slot_chunk, &slot_idx) < 0) {
-            return -1;
-        }
-
-        if (dir_put_entry(parent, slot_chunk, slot_idx, &ne) < 0) {
-            return -1;
-        }
+        if (dir_alloc_slot(parent, &slot_chunk, &slot_idx) < 0) return -1;
+        if (dir_put_entry(parent, slot_chunk, slot_idx, &ne) < 0) return -1;
     }
 
     if (fat32_flush_fat() < 0) return -1;
@@ -1252,7 +1473,7 @@ int fat32_delete_file(const char* path) {
     unsigned int chunk;
     int idx;
 
-    if (dir_find(parent, raw83, &e, &chunk, &idx) < 0) {
+    if (dir_find_lfn(parent, raw83, basename, &e, &chunk, &idx) < 0) {
         return -1;
     }
 
@@ -1629,4 +1850,21 @@ int fat32_vfs_is_dir(const char* path) {
     unsigned int dir;
 
     return (fat32_resolve_dir(path, &dir) == 0) ? 1 : 0;
+}
+
+unsigned int fat32_free_clusters(void) {
+    if (!mounted || !fat) return 0;
+    unsigned int free = 0;
+    for (unsigned int c = 2; c < fat_entries; c++) {
+        if ((fat[c] & FAT32_MASK) == FAT32_FREE) free++;
+    }
+    return free;
+}
+
+unsigned int fat32_total_clusters(void) {
+    return total_clusters_count;
+}
+
+unsigned int fat32_cluster_size(void) {
+    return bytes_per_cluster;
 }

@@ -292,6 +292,13 @@ void task_exit_code(int code) {
     for (;;) __asm__ volatile ("hlt");
 }
 
+/* Called when a user task faults — cleans up and exits safely
+   from a non-ISR context. */
+void task_exit_trampoline(void) {
+    task_exit_code(-11); /* SIGSEGV */
+    for (;;) __asm__ volatile ("hlt");
+}
+
 void tasking_enable_preemption(void) { preempt_enabled = 1; }
 
 void scheduler_tick(void) {
@@ -372,6 +379,20 @@ void task_list_print(void) {
                         (p->state == TASK_BLOCKED) ? "block" : "dead ";
         printf("  %d   %s   %s%s\n",
                p->id, s, p->name, (p == current) ? "  *" : "");
+        p = p->next;
+    } while (p != ready);
+}
+
+void task_count_states(int* out_total, int* out_running,
+                       int* out_ready, int* out_blocked) {
+    *out_total = *out_running = *out_ready = *out_blocked = 0;
+    if (!ready) return;
+    task_t* p = ready;
+    do {
+        (*out_total)++;
+        if (p->state == TASK_RUNNING)      (*out_running)++;
+        else if (p->state == TASK_READY)   (*out_ready)++;
+        else if (p->state == TASK_BLOCKED) (*out_blocked)++;
         p = p->next;
     } while (p != ready);
 }

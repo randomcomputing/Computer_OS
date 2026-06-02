@@ -21,7 +21,6 @@ LIMINE_DIR ?= limine
 
 KERNEL_ELF  = kernel.elf
 DISK_IMG    = disk.img
-FAT_IMG     = fatdisk.img
 FAT32_IMG   = fat32disk.img
 
 # -----------------------------------------------------------------------
@@ -51,8 +50,11 @@ VMM_O      = $(OBJDIR)/vmm.o
 KHEAP_O    = $(OBJDIR)/kheap.o
 TASK_O     = $(OBJDIR)/task.o
 ATA_O      = $(OBJDIR)/ata.o
-FAT12_O    = $(OBJDIR)/fat12.o
-FAT32_O    = $(OBJDIR)/fat32.o
+FAT32_O         = $(OBJDIR)/fat32.o
+INFLATE_O       = $(OBJDIR)/inflate.o
+LINUX_SYSCALL_O = $(OBJDIR)/linux_syscall.o
+PROCFS_O        = $(OBJDIR)/procfs.o
+DEVFS_O         = $(OBJDIR)/devfs.o
 VFS_O      = $(OBJDIR)/vfs.o
 RAMFS_O    = $(OBJDIR)/ramfs.o
 SYSCALL_O  = $(OBJDIR)/syscall.o
@@ -77,6 +79,7 @@ REBOOT_O   = $(OBJDIR)/reboot.o
 ACPI_O     = $(OBJDIR)/acpi.o
 VGA_O      = $(OBJDIR)/vga.o
 SHELL_O    = $(OBJDIR)/shell.o
+TAR_O      = $(OBJDIR)/tar.o
 BANNER_O   = $(OBJDIR)/boot_banner.o
 
 KERNEL_OBJS = \
@@ -85,12 +88,13 @@ KERNEL_OBJS = \
     $(KERNEL_O) $(GDT_O) $(IDT_O) $(ISR_O) $(PIC_O) $(IRQ_O) \
     $(KEYBOARD_O) $(MOUSE_O) $(PIT_O) $(SERIAL_O) \
     $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
-    $(TASK_O) $(ATA_O) $(FAT12_O) $(FAT32_O) $(VFS_O) $(RAMFS_O) \
+    $(TASK_O) $(ATA_O) $(FAT32_O) $(VFS_O) $(RAMFS_O) \
+    $(INFLATE_O) $(LINUX_SYSCALL_O) $(PROCFS_O) $(DEVFS_O) \
     $(SYSCALL_O) $(USERPROG_O) $(LOADER_O) $(EDITOR_O) \
     $(RTC_O) $(GFX_O) $(FONT_O) $(UACCESS_O) \
     $(PCI_O) $(E1000_O) $(ARP_O) $(NET_O) $(TCP_O) \
     $(FBCON_O) $(BVBE_O) $(CONSOLE_O) $(STRING_O) $(PRINTF_O) \
-    $(REBOOT_O) $(ACPI_O) $(VGA_O) $(SHELL_O) $(BANNER_O)
+    $(REBOOT_O) $(ACPI_O) $(VGA_O) $(SHELL_O) $(TAR_O) $(BANNER_O)
 
 # -----------------------------------------------------------------------
 # Build rules
@@ -139,8 +143,11 @@ $(VMM_O):     src/vmm.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(KHEAP_O):   src/kheap.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(TASK_O):    src/task.c | $(OBJDIR);     $(CC) $(CFLAGS) $< -o $@
 $(ATA_O):     src/ata.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
-$(FAT12_O):   src/fat12.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
-$(FAT32_O):   src/fat32.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
+$(FAT32_O):         src/fat32.c | $(OBJDIR);         $(CC) $(CFLAGS) $< -o $@
+$(INFLATE_O):       src/inflate.c | $(OBJDIR);       $(CC) $(CFLAGS) $< -o $@
+$(LINUX_SYSCALL_O): src/linux_syscall.c | $(OBJDIR); $(CC) $(CFLAGS) $< -o $@
+$(PROCFS_O):        src/procfs.c | $(OBJDIR);        $(CC) $(CFLAGS) $< -o $@
+$(DEVFS_O):         src/devfs.c | $(OBJDIR);         $(CC) $(CFLAGS) $< -o $@
 $(VFS_O):     src/vfs.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(RAMFS_O):   src/ramfs.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(SYSCALL_O): src/syscall.c | $(OBJDIR);  $(CC) $(CFLAGS) $< -o $@
@@ -165,6 +172,7 @@ $(REBOOT_O):  src/reboot.c | $(OBJDIR);   $(CC) $(CFLAGS) $< -o $@
 $(ACPI_O):    src/acpi.c | $(OBJDIR);     $(CC) $(CFLAGS) $< -o $@
 $(VGA_O):     src/vga.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(SHELL_O):   src/shell.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
+$(TAR_O):     src/tar.c   | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(BANNER_O):  src/boot_banner.c | $(OBJDIR); $(CC) $(CFLAGS) $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
@@ -206,50 +214,33 @@ $(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
 	$(AS) -f bin userprogs/hello.asm -o /tmp/_hello.bin
 	$(AS) -f bin userprogs/count.asm -o /tmp/_count.bin
 	$(MAKE) -C userprogs/c all
-	mcopy -i $(FAT32_IMG) /tmp/_helloworld.txt    ::HELLO.TXT
-	mcopy -i $(FAT32_IMG) /tmp/_readme.txt         ::README.TXT
-	mcopy -i $(FAT32_IMG) /tmp/_hello.bin          ::HELLO.BIN
-	mcopy -i $(FAT32_IMG) /tmp/_count.bin          ::COUNT.BIN
-	mcopy -i $(FAT32_IMG) userprogs/c/testc.elf    ::TESTC.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/echo.elf     ::ECHO.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/maltest.elf  ::MALTEST.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/colors.elf   ::COLORS.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/game.elf     ::GAME.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/calc.elf     ::CALC.ELF
-	mcopy -i $(FAT32_IMG) userprogs/c/forktest.elf ::FORKTEST.ELF
+	@printf "hello world!\n" > /tmp/_helloworld2.txt
+	@printf "this is file 2 used for testing\n" > /tmp/_file2_testing.txt
+	COPYFILE_DISABLE=1 tar -cf /tmp/_test.tar -C /tmp _helloworld2.txt _file2_testing.txt
+	COPYFILE_DISABLE=1 tar -czf /tmp/_tarball.tar.gz -C /tmp _helloworld2.txt _file2_testing.txt
+	@printf '#include <unistd.h>\n#include <fcntl.h>\nvoid _start(void){write(1,"before open\\n",12);int fd=open("/tmp/test2.txt",O_WRONLY|O_CREAT|O_TRUNC,0644);write(1,"after open\\n",11);if(fd<0){write(1,"open failed\\n",12);_exit(1);}write(1,"before write\\n",13);write(fd,"hello from musl\\n",17);write(1,"after write\\n",12);close(fd);write(1,"done\\n",5);_exit(0);}\n' > /tmp/_fileio2.c
+	x86_64-linux-musl-gcc -static -nostartfiles -o /tmp/_fileio2 /tmp/_fileio2.c
+	@printf '#include <unistd.h>\nvoid _start(void){const char msg[]="Hello from musl!\\n";write(1,msg,sizeof(msg)-1);_exit(0);}\n' > /tmp/_hello_musl.c
+	x86_64-linux-musl-gcc -static -nostartfiles -o /tmp/_hello_musl /tmp/_hello_musl.c
+	mcopy -i $(FAT32_IMG) /tmp/_helloworld.txt       ::HELLO.TXT
+	mcopy -i $(FAT32_IMG) /tmp/_readme.txt            ::README.TXT
+	mcopy -i $(FAT32_IMG) /tmp/_hello.bin             ::HELLO.BIN
+	mcopy -i $(FAT32_IMG) /tmp/_count.bin             ::COUNT.BIN
+	mcopy -i $(FAT32_IMG) userprogs/c/testc.elf       ::TESTC.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/echo.elf        ::ECHO.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/maltest.elf     ::MALTEST.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/colors.elf      ::COLORS.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/game.elf        ::GAME.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/calc.elf        ::CALC.ELF
+	mcopy -i $(FAT32_IMG) userprogs/c/forktest.elf    ::FORKTEST.ELF
+	mcopy -i $(FAT32_IMG) /tmp/_test.tar              ::test.tar
+	mcopy -i $(FAT32_IMG) /tmp/_tarball.tar.gz        ::tarball.tar.gz
+	mcopy -i $(FAT32_IMG) /tmp/_fileio2               ::fileio2
+	mcopy -i $(FAT32_IMG) /tmp/_hello_musl            ::hello
 	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
+	@rm -f /tmp/_helloworld2.txt /tmp/_file2_testing.txt /tmp/_test.tar /tmp/_tarball.tar.gz
+	@rm -f /tmp/_fileio2.c /tmp/_fileio2 /tmp/_hello_musl.c /tmp/_hello_musl
 	@echo "FAT32 disk ready: $(FAT32_IMG)"
-
-# -----------------------------------------------------------------------
-# FAT12 data disk (kept for reference / fallback testing)
-# -----------------------------------------------------------------------
-
-$(FAT_IMG): userprogs/hello.asm userprogs/count.asm \
-            userprogs/c/testc.c userprogs/c/echo.c \
-            userprogs/c/lib/stdio.c userprogs/c/lib/string.c \
-            userprogs/c/lib/crt0.s userprogs/c/user.ld \
-            userprogs/c/Makefile
-	@echo "Building FAT12 data disk..."
-	dd if=/dev/zero of=$(FAT_IMG) bs=512 count=2880 2>/dev/null
-	mformat -i $(FAT_IMG) -f 1440 -v COMPUTEROS ::
-	@echo "Hello World" > /tmp/_helloworld.txt
-	@printf "Computer_OS\nA 64-bit operating system.\n" > /tmp/_readme.txt
-	$(AS) -f bin userprogs/hello.asm -o /tmp/_hello.bin
-	$(AS) -f bin userprogs/count.asm -o /tmp/_count.bin
-	$(MAKE) -C userprogs/c all
-	mcopy -i $(FAT_IMG) /tmp/_helloworld.txt    ::HELLO.TXT
-	mcopy -i $(FAT_IMG) /tmp/_readme.txt         ::README.TXT
-	mcopy -i $(FAT_IMG) /tmp/_hello.bin          ::HELLO.BIN
-	mcopy -i $(FAT_IMG) /tmp/_count.bin          ::COUNT.BIN
-	mcopy -i $(FAT_IMG) userprogs/c/testc.elf    ::TESTC.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/echo.elf     ::ECHO.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/maltest.elf  ::MALTEST.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/colors.elf   ::COLORS.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/game.elf     ::GAME.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/calc.elf     ::CALC.ELF
-	mcopy -i $(FAT_IMG) userprogs/c/forktest.elf ::FORKTEST.ELF
-	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
-	@echo "FAT12 disk ready: $(FAT_IMG)"
 
 # -----------------------------------------------------------------------
 # QEMU
@@ -264,7 +255,8 @@ run: $(DISK_IMG)
 	    -drive file=$(DISK_IMG),format=raw \
 	    -netdev user,id=net0 \
 	    -device e1000,netdev=net0 \
-	    -m 256M \
+	    -m 8G \
+	    -cpu max \
 	    -accel tcg \
 	    -display cocoa,zoom-to-fit=on
 
@@ -275,12 +267,11 @@ debug: $(DISK_IMG)
 	    -drive file=$(DISK_IMG),format=raw \
 	    -netdev user,id=net0 \
 	    -device e1000,netdev=net0 \
-	    -m 256M \
+	    -m 8G \
 	    -serial stdio \
 	    -no-reboot \
-	    -accel tcg \
 	    -display cocoa,zoom-to-fit=on
 
 clean:
-	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT_IMG) $(FAT32_IMG)
+	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT32_IMG)
 	$(MAKE) -C userprogs/c clean

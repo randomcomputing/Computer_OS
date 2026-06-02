@@ -2,6 +2,7 @@
 #include "console.h"
 #include "printf.h"
 #include "vmm.h"
+#include "task.h"
 
 void halt(void);
 
@@ -26,6 +27,24 @@ void isr_handler(struct registers* regs) {
     if (regs->int_no == 14) {
         if (vmm_page_fault(regs)) return;
         halt();
+    }
+
+    /* For user-space exceptions (CS=0x23), kill the task instead of halting */
+    if (regs->cs == 0x23) {
+        task_t* t = task_current();
+        if (t && t->is_user) {
+            printf("[exception %llu in task %d at rip=0x%llx rsp=0x%llx rbx=0x%llx err=0x%llx]\n",
+                   regs->int_no, t->id, regs->rip, regs->rsp, regs->rbx, regs->err_code);
+            /* Print more context */
+            printf("  rax=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx\n",
+                   regs->rax, regs->rcx, regs->rdx, regs->rsi, regs->rdi);
+            extern void task_exit_trampoline(void);
+            regs->rip = (uint64_t)task_exit_trampoline;
+            regs->rsp = t->kstack_top - 16;
+            regs->cs  = 0x08;
+            regs->ss  = 0x10;
+            return;
+        }
     }
 
     con_set_color(CON_LIGHT_RED, CON_BLACK);

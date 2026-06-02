@@ -21,11 +21,13 @@
 #include "kheap.h"
 #include "task.h"
 #include "ata.h"
-#include "fat12.h"
 #include "fat32.h"
 #include "vfs.h"
 #include "ramfs.h"
+#include "procfs.h"
+#include "devfs.h"
 #include "syscall.h"
+#include "linux_syscall.h"
 #include "pci.h"
 #include "boot_banner.h"
 #include "e1000.h"
@@ -170,7 +172,7 @@ void kmain(void) {
 
     vmm_init(hhdm_offset);
 
-    kheap_init(0xFFFFFFFF40000000ULL, 64, 1024);
+    kheap_init(0xFFFFFFFF40000000ULL, 64, 131072);
 
     /* Console: try the Limine framebuffer, fall back to VGA text. */
     con_init();
@@ -213,6 +215,21 @@ void kmain(void) {
     gdt_init();
     print_status(1, "GDT loaded");
 
+    /* Enable SSE/SSE2 in CR4 so user programs can use XMM registers */
+    {
+        uint64_t cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1 << 9);   /* OSFXSR — OS supports FXSAVE/FXRSTOR */
+        cr4 |= (1 << 10);  /* OSXMMEXCPT — OS handles SSE exceptions */
+        __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
+        /* Also clear EM and set MP bits in CR0 */
+        uint64_t cr0;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(1 << 2);  /* clear EM (emulation) */
+        cr0 |=  (1 << 1);  /* set MP (monitor coprocessor) */
+        __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0));
+    }
+
     idt_init();
     print_status(1, "IDT loaded");
 
@@ -234,6 +251,7 @@ void kmain(void) {
     print_status(1, "Tasking online");
 
     syscall_init();
+    linux_syscall_init();
     print_status(1, "Syscall gate installed");
 
     {
@@ -257,7 +275,7 @@ void kmain(void) {
 
         vfs_init();
 
-        // Try FAT32 first; fall back to FAT12 for the 1.44 MB floppy image.
+
         if (fat32_mount() == 0) {
             if (vfs_mount("/", fat32_vfs_ops(), "fat32") == 0) {
                 print_status(1, "FAT32 mounted at /");
@@ -265,15 +283,8 @@ void kmain(void) {
             } else {
                 print_status(0, "FAT32 mount failed");
             }
-        } else if (fat12_mount() == 0) {
-            if (vfs_mount("/", fat12_vfs_ops(), "fat12") == 0) {
-                print_status(1, "FAT12 mounted at /");
-                g_fs_ok = 1;
-            } else {
-                print_status(0, "FAT12 mount failed");
-            }
         } else {
-            print_status(0, "No FAT filesystem");
+            print_status(0, "FAT32 mount failed");
         }
 
         ramfs_init();
@@ -281,6 +292,20 @@ void kmain(void) {
             print_status(1, "ramfs mounted at /tmp");
         } else {
             print_status(0, "ramfs mount failed");
+        }
+
+        procfs_init();
+        if (vfs_mount("/proc", procfs_vfs_ops(), "procfs") == 0) {
+            print_status(1, "procfs mounted at /proc");
+        } else {
+            print_status(0, "procfs mount failed");
+        }
+
+        devfs_init();
+        if (vfs_mount("/dev", devfs_vfs_ops(), "devfs") == 0) {
+            print_status(1, "devfs mounted at /dev");
+        } else {
+            print_status(0, "devfs mount failed");
         }
     } else {
         print_status(0, "No ATA disk");

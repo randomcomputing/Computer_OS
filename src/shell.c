@@ -12,6 +12,7 @@
 #include "kheap.h"
 #include "task.h"
 #include "vfs.h"
+#include "tar.h"
 #include "io.h"
 #include "userprog.h"
 #include "rtc.h"
@@ -38,7 +39,7 @@ static const char* commands[] = {
     "lspci", "vbe", "nettest", "ping", "resolve", "http",
     "ps", "spawn", "yield", "preempt",
     "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
-    "cd", "pwd", "mount",
+    "cd", "pwd", "mount", "tar", "stats",
     "history", "date", "time", "tz",
     "user", "run", "edit", "reboot", "shutdown",
     "gfx",
@@ -189,9 +190,10 @@ static void print_command_matches(const char* prefix) {
 }
 
 static void print_dir_matches(const char* dirpath, const char* prefix) {
-    vfs_dirent_t entries[64];
+    vfs_dirent_t* entries = (vfs_dirent_t*)kmalloc(64 * sizeof(vfs_dirent_t));
+    if (!entries) return;
     int n = vfs_list(dirpath, entries, 64);
-    if (n <= 0) return;
+    if (n <= 0) { kfree(entries); return; }
     int col = 0;
     for (int i = 0; i < n; i++) {
         // Skip "." and ".." in the listing — they're useful for cd but
@@ -214,9 +216,10 @@ static void print_dir_matches(const char* dirpath, const char* prefix) {
 // the list — for unique completion we only need the LCP and one sample.
 // The caller separately calls print_dir_matches() if there are multiple.
 static int match_dir(const char* dirpath, const char* prefix, match_result_t* m) {
-    vfs_dirent_t entries[64];
+    vfs_dirent_t* entries = (vfs_dirent_t*)kmalloc(64 * sizeof(vfs_dirent_t));
+    if (!entries) return -1;
     int n = vfs_list(dirpath, entries, 64);
-    if (n < 0) return -1;
+    if (n < 0) { kfree(entries); return -1; }
     for (int i = 0; i < n; i++) {
         if (entries[i].name[0] == '.' &&
             (entries[i].name[1] == '\0' ||
@@ -520,6 +523,18 @@ static void readline(char* buf, unsigned int max,
             return;
         }
 
+        if ((unsigned char)c == 0x89) {  /* KEY_SHIFT_ENTER */
+            if (len < (int)max - 2) {
+                for (int i = len; i > pos; i--) buf[i] = buf[i-1];
+                buf[pos] = '\n'; len++; pos++;
+                con_putchar('\n'); printf("  ");
+                anchor_row++; anchor_col = 2;
+                row_cap = width - anchor_col;
+                for (int i = pos; i < len; i++) con_putchar(buf[i]);
+            }
+            continue;
+        }
+
         if (c == '\b') {
             if (pos > 0) {
                 int old_len = len;
@@ -629,6 +644,98 @@ static void readline(char* buf, unsigned int max,
 // commands
 // =====================================================================
 
+/* ------------------------------------------------------------------ */
+/* tar                                                                  */
+/* ------------------------------------------------------------------ */
+/*
+ * Usage:
+ *   tar -tf <file>           list contents
+ *   tar -xf <file>           extract to /
+ *   tar -xf <file> -C <dir>  extract to <dir>
+ *   tar -xvf <file>          extract verbosely
+ */
+static void cmd_tar(const char* args) {
+    while (*args == ' ') args++;
+    if (!args[0]) {
+        printf("usage: tar [-tv|-xv]f <file.tar> [-C <dir>]\n");
+        return;
+    }
+
+    int do_extract = 0;
+    int do_list    = 0;
+    int verbose    = 0;
+    const char* src     = 0;
+    const char* dst_dir = "/tmp";  /* safe default — use -C to override */
+
+    /* Parse flags and arguments. */
+    char a0[32];
+    const char* p = args;
+    unsigned int ai = 0;
+    while (*p && *p != ' ' && ai < sizeof(a0) - 1) a0[ai++] = *p++;
+    a0[ai] = '\0';
+
+    /* Flags can be "-xvf", "-tf", "xvf", "tf", etc. */
+    const char* flags = a0;
+    if (flags[0] == '-') flags++;
+
+    for (const char* f = flags; *f; f++) {
+        if (*f == 'x') do_extract = 1;
+        else if (*f == 't') do_list = 1;
+        else if (*f == 'v') verbose  = 1;
+        else if (*f == 'f') {
+            /* Next token is the filename. */
+            while (*p == ' ') p++;
+            src = p;
+            /* Advance p past the filename. */
+            while (*p && *p != ' ') p++;
+        }
+    }
+
+    /* If -f was not in the flags string, the next bare arg is the file. */
+    if (!src) {
+        while (*p == ' ') p++;
+        src = p;
+        while (*p && *p != ' ') p++;
+    }
+
+    /* Look for -C <dir>. */
+    while (*p == ' ') p++;
+    if (p[0] == '-' && p[1] == 'C') {
+        p += 2;
+        while (*p == ' ') p++;
+        if (*p) dst_dir = p;
+    }
+
+    if (!src || src[0] == '\0') {
+        printf("tar: no archive specified\n");
+        return;
+    }
+
+    /* Copy src to a null-terminated local buffer (it may run to next arg). */
+    char srcbuf[256];
+    unsigned int si = 0;
+    while (src[si] && src[si] != ' ' && si < sizeof(srcbuf) - 1) {
+        srcbuf[si] = src[si]; si++;
+    }
+    srcbuf[si] = '\0';
+
+    if (do_list) {
+        int n = tar_list(srcbuf);
+        if (n < 0) return;
+        con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+        printf("\n%d entries\n", n);
+        con_set_color(CON_WHITE, CON_BLACK);
+    } else if (do_extract) {
+        int n = tar_extract(srcbuf, dst_dir, verbose);
+        if (n < 0) return;
+        con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+        printf("\nextracted %d entries to %s\n", n, dst_dir);
+        con_set_color(CON_WHITE, CON_BLACK);
+    } else {
+        printf("tar: specify -t (list) or -x (extract)\n");
+    }
+}
+
 static void cmd_help(void) {
     con_set_color(CON_LIGHT_GREEN, CON_BLACK);
     printf("Computer OS help\n");
@@ -658,6 +765,7 @@ static void cmd_help(void) {
     printf("  rmdir <path>         remove an empty directory\n");
     printf("  cd [path]            change directory; no arg goes to /\n");
     printf("  pwd                  print working directory\n");
+    printf("  tar [-tv|-xv]f <f>   list or extract a .tar archive\n");
     printf("\n");
 
     printf("Programs and tasks:\n");
@@ -713,7 +821,50 @@ static void cmd_clear(void) { con_clear(); }
 
 static void cmd_echo(const char* args) {
     while (*args == ' ') args++;
-    printf("%s\n", args);
+
+    const char* redir = 0; int append = 0;
+    const char* p = args;
+    while (*p) { if (*p == '>') { redir = p; append = (*(p+1) == '>'); break; } p++; }
+
+    char text[512]; unsigned int tlen = 0;
+    if (redir) {
+        const char* end = redir;
+        while (end > args && *(end-1) == ' ') end--;
+        for (const char* q = args; q < end && tlen < sizeof(text)-2; q++) text[tlen++] = *q;
+    } else {
+        for (const char* q = args; *q && tlen < sizeof(text)-2; q++) text[tlen++] = *q;
+    }
+    text[tlen++] = '\n'; text[tlen] = '\0';
+
+    /* Strip surrounding quotes */
+    if (tlen >= 3 && text[0] == '"' && text[tlen-2] == '"') {
+        for (unsigned int i = 0; i < tlen-2; i++) text[i] = text[i+1];
+        tlen -= 2; text[tlen-1] = '\n'; text[tlen] = '\0';
+    }
+
+    if (redir) {
+        const char* fname = redir + (append ? 2 : 1);
+        while (*fname == ' ') fname++;
+        if (*fname == '\0') { printf("echo: missing filename\n"); return; }
+        if (append) {
+            char* existing = (char*)kmalloc(8192);
+            if (!existing) { printf("echo: out of memory\n"); return; }
+            int en = vfs_read_file(fname, existing, 8191);
+            if (en < 0) en = 0;
+            char* combined = (char*)kmalloc(en + tlen + 1);
+            if (!combined) { kfree(existing); printf("echo: out of memory\n"); return; }
+            for (int i = 0; i < en; i++) combined[i] = existing[i];
+            for (unsigned int i = 0; i < tlen; i++) combined[en+i] = text[i];
+            vfs_write_file(fname, combined, (unsigned int)(en + tlen));
+            kfree(existing); kfree(combined);
+        } else {
+            vfs_write_file(fname, text, tlen);
+        }
+    } else {
+        const char* out = args;
+        if (*out == '"') { out++; while (*out && *out != '"') con_putchar(*out++); printf("\n"); }
+        else printf("%s\n", args);
+    }
 }
 
 static void cmd_about(void) {
@@ -1054,44 +1205,178 @@ static void cmd_mount(void) {
 static void cmd_ls(const char* args) {
     while (*args == ' ') args++;
 
-    vfs_dirent_t entries[64];
-    // vfs_list("") lists the cwd; otherwise it lists the given path.
+    int flag_l = 0, flag_h = 0, flag_a = 0;
+    while (*args == '-') {
+        args++;
+        while (*args && *args != ' ') {
+            if (*args == 'l') flag_l = 1;
+            if (*args == 'h') flag_h = 1;
+            if (*args == 'a') flag_a = 1;
+            args++;
+        }
+        while (*args == ' ') args++;
+    }
+
+    vfs_dirent_t* entries = (vfs_dirent_t*)kmalloc(64 * sizeof(vfs_dirent_t));
+    if (!entries) { printf("ls: out of memory\n"); return; }
+
     int n = vfs_list(args, entries, 64);
     if (n < 0) {
+        kfree(entries);
         printf("ls: %s: not a directory\n", (*args ? args : "."));
         return;
     }
-    if (n == 0) {
-        printf("(empty)\n");
-        return;
+    if (n == 0) { kfree(entries); printf("(empty)\n"); return; }
+
+    char size_buf[16];
+
+    if (flag_l) {
+        for (int i = 0; i < n; i++) {
+            int is_dir = (entries[i].attr & 0x10);
+            if (!flag_a && entries[i].name[0] == '.') continue;
+            if (flag_h) {
+                unsigned int sz = entries[i].size;
+                char* sp = size_buf;
+                unsigned int sv; char tmp[10]; int tl = 0;
+                if (sz >= 1024*1024) { sv = sz/(1024*1024); }
+                else if (sz >= 1024) { sv = sz/1024; }
+                else                 { sv = sz; }
+                if (sv == 0) tmp[tl++] = '0';
+                else { unsigned int t=sv; while(t){tmp[tl++]='0'+t%10;t/=10;} }
+                for(int ti=tl-1;ti>=0;ti--) *sp++=tmp[ti];
+                if      (sz>=1024*1024) *sp++='M';
+                else if (sz>=1024)      *sp++='K';
+                else                    *sp++='B';
+                *sp = '\0';
+            } else {
+                char* sp = size_buf; unsigned int sz = entries[i].size;
+                char tmp[12]; int tl = 0;
+                if (sz==0) tmp[tl++]='0';
+                else { unsigned int t=sz; while(t){tmp[tl++]='0'+t%10;t/=10;} }
+                for(int ti=tl-1;ti>=0;ti--) *sp++=tmp[ti];
+                *sp = '\0';
+            }
+            con_set_color(is_dir ? CON_LIGHT_CYAN : CON_LIGHT_GREY, CON_BLACK);
+            printf("%s  %-8s  %s\n", is_dir ? "d" : "-", size_buf, entries[i].name);
+        }
+        con_set_color(CON_LIGHT_GREY, CON_BLACK);
+    } else {
+        int cols_avail = con_cols();
+        if (cols_avail < 20) cols_avail = 20;
+        int max_name = 0;
+        for (int i = 0; i < n; i++) {
+            if (!flag_a && entries[i].name[0] == '.') continue;
+            int len = (int)strlen(entries[i].name);
+            if (len > max_name) max_name = len;
+        }
+        int col_w = max_name + 2;
+        int num_cols = cols_avail / col_w;
+        if (num_cols < 1) num_cols = 1;
+        int col = 0;
+        for (int i = 0; i < n; i++) {
+            if (!flag_a && entries[i].name[0] == '.') continue;
+            int is_dir = (entries[i].attr & 0x10);
+            con_set_color(is_dir ? CON_LIGHT_CYAN : CON_LIGHT_GREY, CON_BLACK);
+            int len = (int)strlen(entries[i].name);
+            printf("%s", entries[i].name);
+            if (col < num_cols - 1)
+                for (int s = len; s < col_w; s++) printf(" ");
+            col++;
+            if (col >= num_cols) { printf("\n"); col = 0; }
+        }
+        if (col > 0) printf("\n");
+        con_set_color(CON_LIGHT_GREY, CON_BLACK);
     }
-    for (int i = 0; i < n; i++) {
-        const char* tag = (entries[i].attr & 0x10) ? "<DIR>" : "     ";
-        printf("  %s  %u  %s\n", tag, entries[i].size, entries[i].name);
+    kfree(entries);
+}
+
+static int cat_readline(char* buf, int max) {
+    int pos = 0;
+    while (pos < max - 1) {
+        char c = keyboard_getchar();
+        if (c == '\r' || c == '\n') { buf[pos] = '\0'; printf("\n"); return pos; }
+        if (c == '\b' || c == 127) { if (pos > 0) { pos--; printf("\b \b"); } continue; }
+        buf[pos++] = c; con_putchar(c);
     }
+    buf[pos] = '\0'; return pos;
 }
 
 static void cmd_cat(const char* args) {
     while (*args == ' ') args++;
-    if (*args == '\0') { printf("usage: cat <file>\n"); return; }
 
-    enum { CAT_MAX = 8192 };
-    char* buf = (char*)kmalloc(CAT_MAX);
+    if (args[0] == '<' && args[1] == '<') {
+        const char* p = args + 2;
+        while (*p == ' ') p++;
+        char delim[32]; int di = 0;
+        while (*p && *p != ' ' && *p != '>' && di < 31) delim[di++] = *p++;
+        delim[di] = '\0';
+        while (*p == ' ') p++;
+        int append = 0; const char* outfile = 0;
+        if (*p == '>') { p++; if (*p == '>') { append = 1; p++; } while (*p == ' ') p++; if (*p) outfile = p; }
+        char* collected = (char*)kmalloc(16384);
+        if (!collected) { printf("cat: out of memory\n"); return; }
+        int clen = 0;
+        char line[256];
+        while (1) {
+            printf("> ");
+            int llen = cat_readline(line, sizeof(line));
+            if (strcmp(line, delim) == 0) break;
+            for (int i = 0; i < llen && clen < 16383; i++) collected[clen++] = line[i];
+            if (clen < 16383) collected[clen++] = '\n';
+        }
+        collected[clen] = '\0';
+        if (outfile) {
+            if (append) {
+                char* existing = (char*)kmalloc(16384);
+                int en = existing ? vfs_read_file(outfile, existing, 16383) : -1;
+                if (en < 0) en = 0;
+                char* combined = (char*)kmalloc(en + clen + 1);
+                if (combined) {
+                    for (int i = 0; i < en; i++) combined[i] = existing[i];
+                    for (int i = 0; i < clen; i++) combined[en+i] = collected[i];
+                    vfs_write_file(outfile, combined, (unsigned int)(en + clen));
+                    kfree(combined);
+                }
+                if (existing) kfree(existing);
+            } else { vfs_write_file(outfile, collected, (unsigned int)clen); }
+        } else { for (int i = 0; i < clen; i++) con_putchar(collected[i]); }
+        kfree(collected); return;
+    }
+
+    if (*args == '\0') { printf("usage: cat <file> [> outfile]\n"); return; }
+
+    char fname[256]; int fi = 0;
+    const char* p = args;
+    while (*p && *p != '>' && fi < 255) { fname[fi++] = *p++; }
+    while (fi > 0 && fname[fi-1] == ' ') fi--;
+    fname[fi] = '\0';
+    int append = 0; const char* outfile = 0;
+    if (*p == '>') { p++; if (*p == '>') { append = 1; p++; } while (*p == ' ') p++; if (*p) outfile = p; }
+
+    unsigned int cat_max = 1024 * 1024;
+    char* buf = (char*)kmalloc(cat_max);
     if (!buf) { printf("cat: out of memory\n"); return; }
+    int n = vfs_read_file(fname, buf, cat_max);
+    if (n < 0) { printf("cat: %s: not found\n", fname); kfree(buf); return; }
 
-    int n = vfs_read_file(args, buf, CAT_MAX);
-    if (n < 0) {
-        printf("cat: %s: not found\n", args);
-        kfree(buf);
-        return;
+    if (outfile) {
+        if (append) {
+            char* existing = (char*)kmalloc(cat_max);
+            int en = existing ? vfs_read_file(outfile, existing, cat_max-1) : -1;
+            if (en < 0) en = 0;
+            char* combined = (char*)kmalloc(en + n + 1);
+            if (combined) {
+                for (int i = 0; i < en; i++) combined[i] = existing[i];
+                for (int i = 0; i < n; i++) combined[en+i] = buf[i];
+                vfs_write_file(outfile, combined, (unsigned int)(en + n));
+                kfree(combined);
+            }
+            if (existing) kfree(existing);
+        } else { vfs_write_file(outfile, buf, (unsigned int)n); }
+    } else {
+        for (int i = 0; i < n; i++) { char c = buf[i]; if (c == '\r') continue; con_putchar(c); }
+        if (n > 0 && buf[n-1] != '\n') printf("\n");
     }
-
-    for (int i = 0; i < n; i++) {
-        char c = buf[i];
-        if (c == '\r') continue;
-        con_putchar(c);
-    }
-    if (n > 0 && buf[n - 1] != '\n') printf("\n");
     kfree(buf);
 }
 
@@ -1373,6 +1658,160 @@ static void cmd_preempt(const char* args) {
 }
 
 // =====================================================================
+// stats
+// =====================================================================
+
+extern unsigned int fat32_free_clusters(void);
+extern unsigned int fat32_total_clusters(void);
+extern unsigned int fat32_cluster_size(void);
+
+static void print_bar(unsigned int used, unsigned int total, int width) {
+    if (total == 0) { printf("[--------------------]"); return; }
+    int filled = (int)((unsigned long long)used * width / total);
+    printf("[");
+    for (int i = 0; i < width; i++)
+        printf(i < filled ? "#" : "-");
+    printf("]");
+}
+
+static void print_mb(unsigned long long bytes) {
+    unsigned long long mb = bytes / (1024 * 1024);
+    unsigned long long kb = (bytes % (1024 * 1024)) / 1024;
+    if (mb >= 1024) {
+        printf("%llu GB", mb / 1024);
+    } else if (mb > 0) {
+        printf("%llu MB", mb);
+    } else {
+        printf("%llu KB", kb);
+    }
+}
+
+static void cmd_stats(void) {
+    con_set_color(CON_LIGHT_CYAN, CON_BLACK);
+    printf("=== System Stats ===\n");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+
+    /* --- Date/Time --- */
+    {
+        rtc_time_t t;
+        rtc_read_local(&t);
+        static const char* months[] = {
+            "Jan","Feb","Mar","Apr","May","Jun",
+            "Jul","Aug","Sep","Oct","Nov","Dec"
+        };
+        const char* mon = (t.month >= 1 && t.month <= 12)
+            ? months[t.month - 1] : "???";
+        int off = rtc_tz_offset_minutes();
+        const char* zone = rtc_tz_name_for_offset(off);
+        printf("  Date/Time : %s %u, %u  %u%u:%u%u:%u%u %s\n",
+               mon, (unsigned int)t.day, t.year,
+               t.hour/10, t.hour%10,
+               t.minute/10, t.minute%10,
+               t.second/10, t.second%10,
+               zone ? zone : "UTC");
+    }
+
+    /* --- Uptime --- */
+    {
+        unsigned int ms = pit_millis();
+        unsigned int s  = ms / 1000;
+        printf("  Uptime    : %uh %um %us\n",
+               s / 3600, (s % 3600) / 60, s % 60);
+    }
+
+    /* --- RAM (use memmap total so we count all physical RAM) --- */
+    {
+        unsigned long long total = memmap_total_usable();
+        unsigned long long free  = pmm_free_pages() * 4096ULL;
+        unsigned long long used  = (free < total) ? (total - free) : 0;
+        printf("  RAM       : ");
+        print_bar((unsigned int)(used  / 4096),
+                  (unsigned int)(total / 4096), 20);
+        printf("  ");
+        print_mb(used);
+        printf(" / ");
+        print_mb(total);
+        printf("\n");
+    }
+
+    /* --- Kernel Heap --- */
+    {
+        unsigned long long used  = kheap_used();
+        unsigned long long total = kheap_size();
+        printf("  Heap      : ");
+        print_bar((unsigned int)used, (unsigned int)total, 20);
+        printf("  ");
+        print_mb(used);
+        printf(" / ");
+        print_mb(total);
+        printf("  (%u blocks)\n", kheap_blocks());
+    }
+
+    /* --- Disk (FAT32) --- */
+    {
+        unsigned int free_c  = fat32_free_clusters();
+        unsigned int total_c = fat32_total_clusters();
+        unsigned int csz     = fat32_cluster_size();
+        unsigned long long free_b  = (unsigned long long)free_c  * csz;
+        unsigned long long total_b = (unsigned long long)total_c * csz;
+        unsigned long long used_b  = total_b - free_b;
+        printf("  Disk      : ");
+        print_bar((unsigned int)(used_b  / (csz ? csz : 1)),
+                  (unsigned int)(total_b / (csz ? csz : 1)), 20);
+        printf("  ");
+        print_mb(used_b);
+        printf(" / ");
+        print_mb(total_b);
+        printf("\n");
+    }
+
+    /* --- Tasks --- */
+    {
+        int total = 0, running = 0, ready_c = 0, blocked = 0;
+        task_count_states(&total, &running, &ready_c, &blocked);
+        printf("  Tasks     : %d total  (%d running, %d ready, %d blocked)\n",
+               total, running, ready_c, blocked);
+    }
+
+    /* --- CPU (CPUID) --- */
+    {
+        unsigned int ebx = 0, ecx = 0, edx = 0, eax_max = 0;
+        __asm__ volatile (
+            "cpuid"
+            : "=a"(eax_max), "=b"(ebx), "=c"(ecx), "=d"(edx)
+            : "a"(0)
+        );
+        char vendor[13];
+        ((unsigned int*)vendor)[0] = ebx;
+        ((unsigned int*)vendor)[1] = edx;
+        ((unsigned int*)vendor)[2] = ecx;
+        vendor[12] = '\0';
+
+        char brand[49];
+        unsigned int* bp = (unsigned int*)brand;
+        for (int leaf = 0; leaf < 3; leaf++) {
+            unsigned int a, b, c, d;
+            __asm__ volatile (
+                "cpuid"
+                : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                : "a"(0x80000002 + (unsigned int)leaf)
+            );
+            bp[leaf*4+0] = a; bp[leaf*4+1] = b;
+            bp[leaf*4+2] = c; bp[leaf*4+3] = d;
+        }
+        brand[48] = '\0';
+        const char* bs = brand;
+        while (*bs == ' ') bs++;
+
+        printf("  CPU       : %s  |  %s\n", vendor, bs);
+    }
+
+    con_set_color(CON_LIGHT_CYAN, CON_BLACK);
+    printf("====================\n");
+    con_set_color(CON_LIGHT_GREY, CON_BLACK);
+}
+
+// =====================================================================
 // dispatcher
 // =====================================================================
 
@@ -1486,6 +1925,7 @@ static void execute(char* line) {
     else if (strcmp(line, "cd")       == 0) cmd_cd(args);
     else if (strcmp(line, "pwd")      == 0) cmd_pwd();
     else if (strcmp(line, "mount")    == 0) cmd_mount();
+    else if (strcmp(line, "tar")      == 0) cmd_tar(args);
     else if (strcmp(line, "history")  == 0) cmd_history();
     else if (strcmp(line, "date")     == 0) cmd_date();
     else if (strcmp(line, "time")     == 0) cmd_date();
@@ -1496,6 +1936,7 @@ static void execute(char* line) {
     else if (strcmp(line, "gfx")      == 0) cmd_gfx();
     else if (strcmp(line, "gfxmouse") == 0) cmd_gfxmouse();
     else if (strcmp(line, "paint")    == 0) cmd_paint();
+    else if (strcmp(line, "stats")    == 0) cmd_stats();
     else if (strcmp(line, "reboot")   == 0) reboot();
     else if (strcmp(line, "shutdown") == 0) shutdown();
     else {
@@ -1517,8 +1958,18 @@ void shell_run(void) {
         int i = 0;
         while (line[i] && i < LINE_MAX - 1) { saved[i] = line[i]; i++; }
         saved[i] = '\0';
-
-        execute(line);
         history_push(saved);
+
+        /* Split on \n and execute each sub-line */
+        char sub[LINE_MAX]; int si = 0;
+        for (int j = 0; j <= i; j++) {
+            char ch = line[j];
+            if (ch == '\n' || ch == '\0') {
+                sub[si] = '\0';
+                char* s = sub; while (*s == ' ') s++;
+                if (*s) execute(s);
+                si = 0;
+            } else { if (si < LINE_MAX - 1) sub[si++] = ch; }
+        }
     }
 }

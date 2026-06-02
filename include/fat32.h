@@ -23,7 +23,7 @@
 // One row of `ls`. Same layout as fat12_dirent_t so the VFS can share
 // vfs_dirent_t across both drivers without any casting.
 typedef struct {
-    char          name[13];        // "FOO     TXT" -> "FOO.TXT", null-terminated
+    char          name[256];       // LFN-capable name, null-terminated
     unsigned int  size;            // file size in bytes (0 for directories)
     unsigned int  first_cluster;   // starting cluster in the FAT chain
     unsigned char attr;            // FAT attribute byte (0x10 = directory, etc.)

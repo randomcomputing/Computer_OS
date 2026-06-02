@@ -25,10 +25,9 @@
 #define LOADER_CODE_PAGES 16
 #define LOADER_CODE_BYTES (LOADER_CODE_PAGES * 4096)
 
-// User stack: one page, sitting just below LOADER_CODE_VIRT + 1 MB.
-// The initial esp is the top of this page (LOADER_STACK_TOP); the
-// first push will write to (top - 4) which is inside the page.
-#define LOADER_STACK_TOP  (LOADER_CODE_VIRT + 0x100000)
+// User stack: placed high in user address space for musl compatibility.
+// musl needs ~400KB of stack for init so we give it plenty of room.
+#define LOADER_STACK_TOP  0x7fff0000ULL
 #define LOADER_STACK_PAGE (LOADER_STACK_TOP - 0x1000)
 
 // Per-process user heap (sbrk).

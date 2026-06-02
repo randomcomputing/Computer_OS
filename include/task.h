@@ -53,6 +53,7 @@ int      task_clone_user(struct registers* frame, uint64_t pd_phys,
 
 void     yield(void);
 void     task_exit(void);
+void     task_exit_trampoline(void);
 void     task_exit_code(int code);
 int      task_wait_child(int* status);
 void     tasking_enable_preemption(void);
@@ -61,5 +62,7 @@ void     scheduler_tick(void);
 task_t*  task_current(void);
 task_t*  task_find_by_id(int id);
 void     task_list_print(void);
+void     task_count_states(int* out_total, int* out_running,
+                           int* out_ready, int* out_blocked);
 
 #endif

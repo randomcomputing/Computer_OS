@@ -106,6 +106,12 @@ static void keyboard_irq(struct registers* regs) {
 
     if (sc >= 128) return;
 
+    /* Shift+Enter -> special KEY_SHIFT_ENTER code */
+    if (sc == 0x1C && shift_down) {
+        push_char((char)0x89);  /* KEY_SHIFT_ENTER */
+        return;
+    }
+
     char c = shift_down ? scancode_to_ascii_shift[sc] : scancode_to_ascii[sc];
     if (c == 0) return;
 

@@ -16,9 +16,13 @@
 //   - Listing and cwd are PATH-based (no cluster numbers leak through the
 //     interface), so non-FAT filesystems such as ramfs work cleanly.
 
-#include "fat12.h"   // for fat12_dirent_t, reused as the VFS dirent type
-
-typedef fat12_dirent_t vfs_dirent_t;
+// One directory entry returned by vfs_list().
+typedef struct {
+    char          name[256];      // LFN-capable name, null-terminated
+    unsigned int  size;           // file size in bytes (0 for directories)
+    unsigned int  first_cluster;  // starting cluster (filesystem-internal)
+    unsigned char attr;           // FAT-style attribute byte (0x10 = directory)
+} vfs_dirent_t;
 
 // Operations a filesystem provides. All paths are absolute *within the
 // mount*. A NULL pointer means "unsupported" and the VFS returns -1.
@@ -65,7 +69,6 @@ int  vfs_getcwd(char* out, unsigned int max);
 int  vfs_resolve(const char* path, char* out, unsigned int outsz);
 
 // ---- filesystem bindings -----------------------------------------------
-const vfs_ops_t* fat12_vfs_ops(void);
 const vfs_ops_t* fat32_vfs_ops(void);
 
 #endif

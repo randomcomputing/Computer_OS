@@ -13,6 +13,7 @@
 #define KEY_DELETE    0x86
 #define KEY_PGUP      0x87
 #define KEY_PGDN      0x88
+#define KEY_SHIFT_ENTER 0x89  /* Shift+Enter: newline in input */
 
 // Install the IRQ1 handler. Call after idt_init() and pic_remap().
 void keyboard_init(void);

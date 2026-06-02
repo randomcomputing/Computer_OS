@@ -276,6 +276,13 @@ static uint64_t elf_load(const unsigned char* file,
                (unsigned int)ph->p_filesz);
     }
 
+    /* Debug: check init_array contents */
+    {
+        uint64_t* ia = (uint64_t*)0x405ff0;
+        printf("[loader] init_array[0]=0x%llx init_array[1]=0x%llx\n",
+               ia[0], ia[1]);
+    }
+
     vmm_switch(old_cr3);
 
     return (uint64_t)eh->e_entry;
@@ -365,6 +372,23 @@ int loader_run(const char* path) {
         entry = flat_load(buf, n, r, pd_phys);
     }
 
+    /* Save ELF phdr info before freeing buf */
+    uint64_t elf_phdr_vaddr = 0;
+    uint16_t elf_phnum = 0;
+    if (elf64_valid(buf, n)) {
+        const Elf64_Ehdr* _eh = (const Elf64_Ehdr*)buf;
+        elf_phnum = _eh->e_phnum;
+        for (int _pi = 0; _pi < _eh->e_phnum; _pi++) {
+            const Elf64_Phdr* _ph = (const Elf64_Phdr*)((const unsigned char*)buf +
+                _eh->e_phoff + (uint64_t)_pi * _eh->e_phentsize);
+            if (_ph->p_type == 1 /* PT_LOAD */) {
+                uint64_t load_base = _ph->p_vaddr - _ph->p_offset;
+                elf_phdr_vaddr = load_base + _eh->e_phoff;
+                break;
+            }
+        }
+    }
+
     kfree(buf);
 
     if (!entry) {
@@ -374,17 +398,94 @@ int loader_run(const char* path) {
         return -1;
     }
 
-    if (!alloc_user_page(LOADER_STACK_PAGE,
-                         VMM_PRESENT | VMM_WRITE | VMM_USER,
-                         r,
-                         pd_phys)) {
-        release_resources(r);
-        kfree(r);
-        vmm_free_user_pd(pd_phys);
-        return -1;
+    /* Allocate 8 stack pages (32KB) — enough for musl startup.
+       Pages run from LOADER_STACK_PAGE down to LOADER_STACK_PAGE - 7*0x1000.
+       We also map the page AT LOADER_STACK_TOP so [rsp] is accessible. */
+    for (int _si = -1; _si < 8; _si++) {
+        if (!alloc_user_page(LOADER_STACK_PAGE - _si * 0x1000,
+                             VMM_PRESENT | VMM_WRITE | VMM_USER,
+                             r, pd_phys)) {
+            release_resources(r);
+            kfree(r);
+            vmm_free_user_pd(pd_phys);
+            return -1;
+        }
     }
 
-    int id = task_spawn_user(entry, LOADER_STACK_TOP, pd_phys, path);
+    /*
+     * Set up the initial stack for musl/Linux ABI.
+     * musl's _start reads: [rsp] = argc, argv[], NULL, envp[], NULL, auxv[], AT_NULL
+     * We push this onto the user stack before spawning.
+     */
+    uint64_t old_cr3_s = vmm_current();
+    vmm_switch(pd_phys);
+
+    /*
+     * Build Linux ABI initial stack in user memory.
+     * Layout from rsp upward:
+     *   argc, argv[0], NULL, envp[0], NULL, auxv pairs..., AT_NULL
+     * Data area above aux vector: AT_RANDOM bytes, argv0 string.
+     *
+     * We start from LOADER_STACK_TOP and work downward.
+     * Use a large gap so __init_libc's sub rsp, 0x158 doesn't
+     * stomp on our TLS-related stack frames.
+     */
+
+    /* Start well below stack top to leave room for musl's init frames */
+    uint8_t* stk_top = (uint8_t*)LOADER_STACK_TOP;
+
+    /* Program name at top */
+    const char* _pname = path ? path : "hello2";
+    int _pname_len = 0;
+    while (_pname[_pname_len]) _pname_len++;
+    _pname_len++;
+    stk_top -= _pname_len;
+    for (int _pi2 = 0; _pi2 < _pname_len; _pi2++) stk_top[_pi2] = ((const uint8_t*)_pname)[_pi2];
+    uint8_t* _argv0_str = stk_top;
+
+    /* AT_RANDOM 16 bytes, 16-byte aligned */
+    stk_top = (uint8_t*)((uint64_t)stk_top & ~15ULL);
+    stk_top -= 16;
+    for (int _ri2 = 0; _ri2 < 16; _ri2++)
+        stk_top[_ri2] = (uint8_t)(0x42 ^ _ri2 ^ ((uint64_t)entry >> 8));
+    uint8_t* _rand_ptr = stk_top;
+
+    /* Align to 8 bytes */
+    stk_top = (uint8_t*)((uint64_t)stk_top & ~7ULL);
+
+    uint64_t* sp = (uint64_t*)stk_top;
+
+    /* Aux vector: build top-down so lowest addr = first entry musl reads */
+    /* Push in REVERSE of desired read order (last pair = AT_NULL) */
+    sp -= 2; sp[0] = 0;  sp[1] = 0;              /* AT_NULL (last) */
+    sp -= 2; sp[0] = 6;  sp[1] = 4096;            /* AT_PAGESZ */
+    sp -= 2; sp[0] = 25; sp[1] = (uint64_t)_rand_ptr; /* AT_RANDOM */
+    sp -= 2; sp[0] = 23; sp[1] = 0;               /* AT_SECURE */
+    sp -= 2; sp[0] = 14; sp[1] = 0;               /* AT_EGID */
+    sp -= 2; sp[0] = 13; sp[1] = 0;               /* AT_GID */
+    sp -= 2; sp[0] = 12; sp[1] = 0;               /* AT_EUID */
+    sp -= 2; sp[0] = 11; sp[1] = 0;               /* AT_UID */
+    sp -= 2; sp[0] = 9;  sp[1] = (uint64_t)entry; /* AT_ENTRY */
+    sp -= 2; sp[0] = 4;  sp[1] = sizeof(Elf64_Phdr); /* AT_PHENT */
+    sp -= 2; sp[0] = 5;  sp[1] = elf_phnum;       /* AT_PHNUM */
+    sp -= 2; sp[0] = 3;  sp[1] = elf_phdr_vaddr;  /* AT_PHDR */
+
+    /* NULL envp terminator */
+    *(--sp) = 0;
+    /* NULL argv terminator */
+    *(--sp) = 0;
+    /* argv[0] pointer */
+    *(--sp) = (uint64_t)_argv0_str;
+    /* argc = 1 */
+    *(--sp) = 1;
+
+    /* Align to 16 bytes for ABI compliance */
+    if ((uint64_t)sp & 8) sp--;
+
+    uint64_t initial_rsp = (uint64_t)sp;
+    vmm_switch(old_cr3_s);
+
+    int id = task_spawn_user(entry, initial_rsp, pd_phys, path);
 
     if (id < 0) {
         printf("loader: task_spawn_user failed\n");
@@ -621,6 +722,23 @@ int loader_exec(const char* path, struct registers* frame) {
         entry = elf_load(buf, n, nr, new_pd);
     } else {
         entry = flat_load(buf, n, nr, new_pd);
+    }
+
+    /* Save ELF phdr info before freeing buf */
+    uint64_t elf_phdr_vaddr = 0;
+    uint16_t elf_phnum = 0;
+    if (elf64_valid(buf, n)) {
+        const Elf64_Ehdr* _eh = (const Elf64_Ehdr*)buf;
+        elf_phnum = _eh->e_phnum;
+        for (int _pi = 0; _pi < _eh->e_phnum; _pi++) {
+            const Elf64_Phdr* _ph = (const Elf64_Phdr*)((const unsigned char*)buf +
+                _eh->e_phoff + (uint64_t)_pi * _eh->e_phentsize);
+            if (_ph->p_type == 1 /* PT_LOAD */) {
+                uint64_t load_base = _ph->p_vaddr - _ph->p_offset;
+                elf_phdr_vaddr = load_base + _eh->e_phoff;
+                break;
+            }
+        }
     }
 
     kfree(buf);

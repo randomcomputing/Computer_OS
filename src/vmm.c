@@ -2,6 +2,7 @@
 #include "pmm.h"
 #include "printf.h"
 #include "isr.h"
+#include "task.h"
 
 /*
  * 64-bit VMM using 4-level paging.
@@ -220,10 +221,34 @@ int vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags)
 
 int vmm_page_fault(struct registers* regs) {
     uint64_t fault_addr = read_cr2();
-    (void)regs;
 
-    /* TODO: add copy_from_user recovery label support here. */
+    /* Check if we're inside a copy_from/to_user — recover gracefully */
+    task_t* t = task_current();
+    if (t && t->in_user_access) {
+        t->uaccess_faulted = 1;
+        t->in_user_access  = 0;
+        /* Jump the saved RIP past the faulting instruction to fault_label */
+        regs->rip = t->fault_recovery_rip;
+        return 1;
+    }
+
+    /* User space fault outside of uaccess — mark task for death.
+       We can't call task_exit_code() from inside an ISR because
+       task_switch does a ret which corrupts the ISR stack.
+       Instead redirect the saved RIP to a kernel trampoline that
+       will call task_exit_code() safely after iretq. */
+    if (fault_addr < 0x8000000000000000ULL && t && t->is_user) {
+        printf("[vmm] segfault in task %d at 0x%llx (err=0x%llx rip=0x%llx rax=0x%llx rbx=0x%llx rsp=0x%llx)\n", t->id, fault_addr, regs->err_code, regs->rip, regs->rax, regs->rbx, regs->rsp);
+        extern void task_exit_trampoline(void);
+        regs->rip = (uint64_t)task_exit_trampoline;
+        /* Switch to kernel stack so the iretq returns to kernel code */
+        regs->rsp = t->kstack_top - 16;
+        regs->cs  = 0x08;  /* kernel code selector */
+        regs->ss  = 0x10;  /* kernel data selector */
+        return 1;
+    }
+
     printf("[vmm] page fault at 0x%llx (rip=0x%llx err=0x%llx)\n",
            fault_addr, regs->rip, regs->err_code);
-    return 0;   /* not recoverable yet */
+    return 0;
 }

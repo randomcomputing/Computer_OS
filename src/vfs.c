@@ -1,9 +1,8 @@
 #include "vfs.h"
-#include "fat12.h"
 #include "string.h"
 
 // ---- mount table -------------------------------------------------------
-#define VFS_MAX_MOUNTS 8
+#define VFS_MAX_MOUNTS 12
 static vfs_mount_t mounts[VFS_MAX_MOUNTS];
 
 // The VFS-owned current working directory, always a normalized absolute
@@ -235,24 +234,6 @@ int vfs_getcwd(char* out, unsigned int max) {
     out[i] = '\0';
     return (int)i;
 }
-
-// ---- FAT12 shim --------------------------------------------------------
-extern int fat12_vfs_list(const char* path, vfs_dirent_t* out, int max);
-extern int fat12_vfs_is_dir(const char* path);
-
-static const vfs_ops_t fat12_ops = {
-    .list        = fat12_vfs_list,
-    .is_dir      = fat12_vfs_is_dir,
-    .read_file   = fat12_read_file,
-    .write_file  = fat12_write_file,
-    .delete_file = fat12_delete_file,
-    .mkdir       = fat12_mkdir,
-    .rmdir       = fat12_rmdir,
-    .cp          = fat12_cp,
-    .mv          = fat12_mv,
-};
-
-const vfs_ops_t* fat12_vfs_ops(void) { return &fat12_ops; }
 
 // ---- FAT32 shim --------------------------------------------------------
 extern int fat32_read_file(const char* path, void* buf, unsigned int max);

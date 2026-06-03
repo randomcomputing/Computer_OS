@@ -118,9 +118,9 @@ linux_syscall_entry:
     ; Check for exit
     mov  r11, [rel g_syscall_num]
     cmp  r11, 60
-    je   .do_exit_halt
+    je   linux_do_exit_halt
     cmp  r11, 231
-    je   .do_exit_halt
+    je   linux_do_exit_halt
 
     ; Pop arg regs
     pop r9
@@ -130,20 +130,16 @@ linux_syscall_entry:
     pop rsi
     pop rdi
     add rsp, 8           ; skip rax
-    pop rcx              ; user rip
-    pop r11              ; user rflags
-    pop rbx              ; user rbx  ← restore user rbx explicitly!
-    pop r12              ; user rsp
+    pop rcx              ; user rip  → sysretq uses rcx as rip
+    pop r11              ; user rflags → sysretq uses r11 as rflags
+    pop rbx              ; user rbx
+    pop rsp              ; user rsp  → restore user stack directly!
 
-    ; Build iretq frame
-    push qword 0x1b
-    push r12             ; user rsp
-    push r11             ; user rflags
-    push qword 0x23
-    push rcx             ; user rip
-    iretq
+    ; sysretq: returns to rcx (rip), restoring r11→rflags
+    ; All other registers (rbx, etc.) are preserved as-is
+    o64 sysret
 
-.do_exit_halt:
+linux_do_exit_halt:
     sti
     hlt
-    jmp  .do_exit_halt
+    jmp  linux_do_exit_halt

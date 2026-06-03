@@ -497,12 +497,11 @@ static int64_t sys_linux_munmap(uint64_t addr, uint64_t length) {
 
 /* sys_brk (12) */
 static int64_t sys_linux_brk(uint64_t new_brk) {
-    printf("[brk] new_brk=0x%llx\n", new_brk);
     task_t* t = task_current();
     if (!t || !t->is_user || !t->user_data) return EINVAL;
 
     /* Use loader's existing heap management */
-    extern int loader_brk(uint64_t new_brk);
+    extern int64_t loader_brk(uint64_t new_brk);
     return loader_brk(new_brk);
 }
 
@@ -807,6 +806,23 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 5:   ret = sys_linux_fstat  ((int)a1, (linux_stat_t*)a2); break;
         case 6:   ret = sys_linux_stat   ((const char*)a1, (linux_stat_t*)a2); break; /* lstat */
         case 8:   ret = sys_linux_lseek  ((int)a1, (int64_t)a2, (int)a3); break;
+        case 7: {
+            /* poll — musl uses this to get random bytes if AT_RANDOM is bad.
+             * Write pseudo-random bytes to the pollfd array (rdi=ptr, rsi=nfds) */
+            uint8_t* _buf = (uint8_t*)a1;
+            uint64_t _len = a2 * 8;  /* nfds * sizeof(struct pollfd) */
+            if (_buf && _len) {
+                extern uint64_t g_hhdm_offset;
+                /* Just write some bytes — musl only needs entropy, not true random */
+                static uint64_t _seed = 0xdeadbeefcafe1234ULL;
+                for (uint64_t _i = 0; _i < _len; _i++) {
+                    _seed = _seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                    _buf[_i] = (uint8_t)(_seed >> 33);
+                }
+            }
+            ret = (int64_t)a2;  /* return nfds = success */
+            break;
+        }
         case 9:   ret = sys_linux_mmap   (a1, a2, (int)a3, (int)a4, (int)frame->r8, (int64_t)frame->r9); break;
         case 11:  ret = sys_linux_munmap (a1, a2); break;
         case 12:  ret = sys_linux_brk    (a1); break;
@@ -842,6 +858,20 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 231: ret = sys_linux_exit   ((int)a1); break; /* exit_group */
         case 257: ret = sys_linux_openat ((int)a1,(const char*)a2,(int)a3,(int)a4); break;
         case 262: ret = sys_linux_newfstatat((int)a1,(const char*)a2,(linux_stat_t*)a3,(int)a4); break;
+        case 318: {
+            /* getrandom — write random bytes to buffer */
+            uint8_t* _gbuf = (uint8_t*)a1;
+            uint64_t _glen = a2;
+            if (_gbuf && _glen) {
+                static uint64_t _gseed = 0x123456789abcdef0ULL;
+                for (uint64_t _gi = 0; _gi < _glen; _gi++) {
+                    _gseed = _gseed * 6364136223846793005ULL + 1442695040888963407ULL;
+                    _gbuf[_gi] = (uint8_t)(_gseed >> 33);
+                }
+            }
+            ret = (int64_t)a2;
+            break;
+        }
         default:
             printf("[linux_syscall] unimplemented %llu (a1=0x%llx)\n", num, a1);
             ret = ENOSYS;
@@ -856,20 +886,15 @@ void linux_syscall_handler(linux_frame_t* frame) {
 /* ------------------------------------------------------------------ */
 /* loader_brk — Linux brk() semantics (set absolute break)             */
 /* ------------------------------------------------------------------ */
-int loader_brk(uint64_t new_brk) {
+int64_t loader_brk(uint64_t new_brk) {
     /* brk(0) = return current break; brk(n) = set break to n */
-    /* We implement this via loader_sbrk which takes a delta */
-    if (new_brk == 0) {
-        /* Return current brk by calling sbrk(0) */
-        int cur = loader_sbrk(0);
-        return cur < 0 ? 0x02000000 : cur;
-    }
-    int cur = loader_sbrk(0);
-    if (cur < 0) return (int)new_brk;
-    int delta = (int)new_brk - cur;
-    if (delta <= 0) return (int)new_brk;
-    loader_sbrk(delta);
-    return (int)new_brk;
+    extern uint64_t loader_sbrk64(int64_t delta);
+    uint64_t cur = loader_sbrk64(0);
+    if (new_brk == 0) return (int64_t)cur;
+    if (new_brk <= cur) return (int64_t)new_brk;
+    int64_t delta = (int64_t)(new_brk - cur);
+    loader_sbrk64(delta);
+    return (int64_t)new_brk;
 }
 
 /* ------------------------------------------------------------------ */

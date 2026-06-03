@@ -268,8 +268,12 @@ debug: $(DISK_IMG)
 	    -netdev user,id=net0 \
 	    -device e1000,netdev=net0 \
 	    -m 8G \
+	    -cpu max \
+	    -accel tcg \
 	    -serial stdio \
 	    -no-reboot \
+	    -d int,cpu_reset,guest_errors \
+	    -D /tmp/qemu_debug.log \
 	    -display cocoa,zoom-to-fit=on
 
 clean:

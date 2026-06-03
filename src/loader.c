@@ -276,13 +276,6 @@ static uint64_t elf_load(const unsigned char* file,
                (unsigned int)ph->p_filesz);
     }
 
-    /* Debug: check init_array contents */
-    {
-        uint64_t* ia = (uint64_t*)0x405ff0;
-        printf("[loader] init_array[0]=0x%llx init_array[1]=0x%llx\n",
-               ia[0], ia[1]);
-    }
-
     vmm_switch(old_cr3);
 
     return (uint64_t)eh->e_entry;
@@ -509,6 +502,24 @@ int loader_run(const char* path) {
 /* =====================================================================
  * SYS_SBRK backend
  * ===================================================================== */
+
+uint64_t loader_sbrk64(int64_t delta) {
+    task_t* t = task_current();
+    if (!t || !t->is_user || !t->user_data) return 0;
+    user_resources_t* r = (user_resources_t*)t->user_data;
+    uint64_t old_brk = r->heap_brk;
+    if (delta <= 0) return old_brk;
+    uint64_t new_brk = old_brk + (uint64_t)delta;
+    if (new_brk > r->heap_max) return old_brk; /* fail = return old */
+    uint64_t first_page = (old_brk + 0xFFFULL) & ~0xFFFULL;
+    uint64_t last_page  = (new_brk + 0xFFFULL) & ~0xFFFULL;
+    for (uint64_t v = first_page; v < last_page; v += 0x1000) {
+        if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, t->pd_phys))
+            break;
+    }
+    r->heap_brk = new_brk;
+    return old_brk;
+}
 
 int loader_sbrk(int delta) {
     task_t* t = task_current();

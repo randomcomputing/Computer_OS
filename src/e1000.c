@@ -56,7 +56,7 @@
 #define TXD_CMD_RS           0x08
 #define TXD_STAT_DD          0x01
 
-#define NUM_RX_DESC          32
+#define NUM_RX_DESC          256   /* 256 * 16B descriptors = exactly one 4KB page */
 #define NUM_TX_DESC          32
 #define RX_BUF_SIZE          2048
 #define TX_BUF_SIZE          2048
@@ -214,6 +214,7 @@ unsigned int e1000_receive_poll(void* out, unsigned int max) {
     if (len > max) len = max;
     memcpy(out, (void*)rx_buf_virt[rx_cur], len);
     d->status = 0;
+    /* Give this descriptor back to hardware BEFORE advancing */
     e1000_write(E1000_REG_RDT, rx_cur);
     rx_cur = (rx_cur + 1) % NUM_RX_DESC;
     return len;

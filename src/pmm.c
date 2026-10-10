@@ -31,6 +31,13 @@ static void mark_free_page(uint64_t i) {
 
 void pmm_init(void) {
     int n = memmap_count();
+    printf("[pmm] memmap: %d entries\n", n);
+    for (int i = 0; i < n; i++) {
+        const memmap_entry_t* e = memmap_get(i);
+        printf("[pmm]   [%d] base=0x%llx len=0x%llx type=%d\n",
+               i, (unsigned long long)e->base,
+               (unsigned long long)e->length, (int)e->type);
+    }
 
     /* Pass 1: find highest usable address across ALL regions, but cap at
        64 GB so the bitmap stays manageable. QEMU can have sparse entries
@@ -109,6 +116,12 @@ void pmm_init(void) {
     /* Reserve the bitmap itself and page 0. */
     mark_used(bitmap_phys, bitmap_bytes);
     mark_used(0, PAGE_SIZE);
+
+    printf("[pmm] total=%llu pages (%llu MB), free=%llu pages (%llu MB)\n",
+           (unsigned long long)g_total_pages,
+           (unsigned long long)(g_total_pages * 4096 / (1024*1024)),
+           (unsigned long long)g_free_pages,
+           (unsigned long long)(g_free_pages  * 4096 / (1024*1024)));
 }
 
 uint64_t pmm_alloc(void) {

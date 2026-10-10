@@ -795,6 +795,18 @@ static int dir_delete_slot(unsigned int chunk, int idx) {
 
     buf[idx * 32] = 0xE5;
 
+    /* Also mark the LFN entries that precede this short entry as deleted,
+     * otherwise they are left orphaned in the directory. (LFN entries in
+     * a previous cluster are not handled; the allocator keeps an entry's
+     * LFN + short slots contiguous within one cluster.) */
+    for (int j = idx - 1; j >= 0; j--) {
+        unsigned char first = buf[j * 32];
+        unsigned char attr  = buf[j * 32 + 11];
+        if (first == 0xE5 || first == 0x00) break;
+        if (attr != ATTR_LFN) break;
+        buf[j * 32] = 0xE5;
+    }
+
     int r = dir_write_chunk(chunk, buf);
 
     kfree(buf);
@@ -1271,6 +1283,7 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     char basename[64];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
+        printf("[fat32] read: resolve_parent FAILED for '%s'\n", path);
         return -1;
     }
 
@@ -1280,10 +1293,12 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     dirent_t e;
 
     if (dir_find_lfn(parent, raw83, basename, &e, 0, 0) < 0) {
+        /* Not found — routine (callers probe for optional files) */
         return -1;
     }
 
     if (e.attr & ATTR_DIRECTORY) {
+        printf("[fat32] read: '%s' is a directory\n", basename);
         return -1;
     }
 
@@ -1320,6 +1335,68 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     return (int)read_so_far;
 }
 
+/* Read `len` bytes from `path` starting at byte `offset`.
+ * Walks the cluster chain, skipping clusters before `offset`,
+ * then copies exactly `len` bytes. Uses one cluster-sized buffer.
+ * Returns bytes actually read, or -1 on error. */
+int fat32_read_file_at(const char* path, void* buf, unsigned int offset,
+                       unsigned int len) {
+    if (len == 0) return 0;
+
+    unsigned int parent;
+    char basename[64];
+    if (fat32_resolve_parent(path, &parent, basename) < 0) return -1;
+
+    char raw83[11];
+    build_83(basename, raw83);
+    dirent_t e;
+    if (dir_find_lfn(parent, raw83, basename, &e, 0, 0) < 0) return -1;
+    if (e.attr & ATTR_DIRECTORY) return -1;
+
+    unsigned int file_size = e.size;
+    if (offset >= file_size) return 0;
+    if (offset + len > file_size) len = file_size - offset;
+
+    unsigned char* cbuf = (unsigned char*)kmalloc(bytes_per_cluster);
+    if (!cbuf) return -1;
+
+    unsigned int cluster   = entry_cluster(&e);
+    unsigned int file_pos  = 0;       /* byte offset of start of current cluster */
+    unsigned int written   = 0;
+
+    while (written < len && cluster >= 2 && !is_end_of_chain(cluster)) {
+        unsigned int cluster_end = file_pos + bytes_per_cluster;
+
+        /* Skip clusters entirely before `offset` */
+        if (cluster_end <= offset) {
+            file_pos = cluster_end;
+            cluster  = fat32_get_entry(cluster);
+            continue;
+        }
+
+        /* This cluster overlaps [offset, offset+len) — read it */
+        if (fat_read(cluster_to_lba(cluster), bpb.sectors_per_cluster, cbuf) < 0)
+            break;
+
+        /* Byte range within this cluster that we want */
+        unsigned int c_start = (offset > file_pos) ? (offset - file_pos) : 0;
+        unsigned int c_end   = bytes_per_cluster;
+        if (file_pos + c_end > offset + len)
+            c_end = (offset + len) - file_pos;
+
+        unsigned int copy_len = c_end - c_start;
+        for (unsigned int i = 0; i < copy_len; i++)
+            ((unsigned char*)buf)[written + i] = cbuf[c_start + i];
+
+        written  += copy_len;
+        file_pos  = cluster_end;
+        cluster   = fat32_get_entry(cluster);
+    }
+
+    kfree(cbuf);
+    return (int)written;
+}
+
 // ============================================================
 // File write
 // ============================================================
@@ -1335,8 +1412,11 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
     char raw83[11];
     build_83(basename, raw83);
     int use_lfn = needs_lfn(basename);
-    if (use_lfn) build_83_tail(basename, 1, raw83);
 
+    /* Existence check with the SAME matcher the read path uses: plain-8.3
+     * name or case-insensitive LFN name. Never match by a generated ~N
+     * alias — two different long names can share an alias, and matching
+     * on it silently overwrites an unrelated file. */
     dirent_t existing;
     unsigned int ex_chunk;
     int ex_idx;
@@ -1414,8 +1494,24 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
     ne.cluster_hi = (first >> 16) & 0xFFFF;
 
     if (exists) {
+        /* Overwrite in place. Keep the entry's existing on-disk short name:
+         * the LFN entries' checksum is computed over it, so stamping a new
+         * alias here would orphan them. */
+        memcpy(ne.name, existing.name, 11);
         if (dir_put_entry(parent, ex_chunk, ex_idx, &ne) < 0) return -1;
     } else if (use_lfn) {
+        /* Find a unique ~N short alias — different long names can collide
+         * on the same alias (e.g. APKINDEX.aaaa.tar.gz / APKINDEX.bbbb.tar.gz
+         * both want APKIND~1.GZ), so probe until one is free. */
+        int t;
+        for (t = 1; t <= 999; t++) {
+            build_83_tail(basename, t, raw83);
+            dirent_t dummy;
+            if (dir_find(parent, raw83, &dummy, 0, 0) < 0) break; /* free */
+        }
+        if (t > 999) return -1;
+        memcpy(ne.name, raw83, 11);
+
         int namelen = (int)strlen(basename);
         int n_lfn   = lfn_entry_count(namelen);
         int total   = n_lfn + 1;

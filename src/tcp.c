@@ -35,13 +35,20 @@ typedef struct {
 
 struct tcp_conn {
     int            used;
-    unsigned int   dst_ip;       // host order
-    unsigned short dst_port;     // host order
-    unsigned short src_port;     // host order
-    unsigned int   snd_nxt;      // next sequence number we'll send (host order)
-    unsigned int   rcv_nxt;      // next sequence number we expect (host order)
+    unsigned int   dst_ip;
+    unsigned short dst_port;
+    unsigned short src_port;
+    unsigned int   snd_nxt;
+    unsigned int   rcv_nxt;
     unsigned char  gw_mac[6];
-    int            peer_fin;     // peer has sent FIN
+    int            peer_fin;
+    int            recv_started;  /* set after first tcp_recv */
+    /* Spill buffer: holds the tail of a segment when the caller's recv
+     * buffer was smaller than the segment payload. Drained first on the
+     * next tcp_recv call so no bytes are ever dropped. */
+    unsigned char  rx_buf[524288];  /* 512KB */
+    unsigned int   rx_len;          /* bytes stored */
+    unsigned int   rx_pos;          /* bytes consumed */
 };
 
 static struct tcp_conn g_conn;   // single connection slot for now
@@ -112,7 +119,9 @@ static int tcp_send_segment(struct tcp_conn* c, unsigned char flags,
     tcp->ack      = htonl(c->rcv_nxt);
     tcp->data_off = (5 << 4);        // 5 words = 20 bytes, no options
     tcp->flags    = flags;
-    tcp->window   = htons(64240);
+    /* Small window: sender may only have 2 segments in flight. Our RX ring
+     * is tiny and we poll slowly, so a big window causes drops + corruption. */
+    tcp->window   = htons(2 * 1460);
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
@@ -157,6 +166,9 @@ static int tcp_poll_segment(struct tcp_conn* c, unsigned char* flags,
 }
 
 tcp_conn_t* tcp_connect(unsigned int dst_ip, unsigned short dst_port) {
+    printf("[tcp] connect to %u.%u.%u.%u:%u\n",
+           (dst_ip>>24)&0xFF, (dst_ip>>16)&0xFF,
+           (dst_ip>>8)&0xFF,  dst_ip&0xFF, dst_port);
     struct tcp_conn* c = &g_conn;
     memset(c, 0, sizeof(*c));
     c->used     = 1;
@@ -176,7 +188,7 @@ tcp_conn_t* tcp_connect(unsigned int dst_ip, unsigned short dst_port) {
     // --- await SYN-ACK ---
     unsigned char flags; unsigned int rseq, rack, plen; unsigned char* pl;
     int got = 0;
-    for (int t = 0; t < 300; t++) {     // ~3s
+    for (int t = 0; t < 1000; t++) {     // ~10s
         int r = tcp_poll_segment(c, &flags, &rseq, &rack, &pl, &plen);
         if (r >= 0) {
             if (flags & TCP_RST) { printf("tcp: connection refused\n"); return 0; }
@@ -192,6 +204,7 @@ tcp_conn_t* tcp_connect(unsigned int dst_ip, unsigned short dst_port) {
 
     // --- send ACK to complete the handshake ---
     if (!tcp_send_segment(c, TCP_ACK, 0, 0)) { printf("tcp: ACK send failed\n"); return 0; }
+    printf("[tcp] connected!\n");
     return c;
 }
 
@@ -205,28 +218,30 @@ int tcp_send(tcp_conn_t* c, const void* data, unsigned int len) {
         if (!tcp_send_segment(c, TCP_PSH | TCP_ACK, p, chunk)) return -1;
         c->snd_nxt += chunk;
         p += chunk; remaining -= chunk;
-
-        // Wait for an ACK that covers what we've sent (happy path).
-        unsigned char flags; unsigned int rseq, rack, plen; unsigned char* pl;
-        for (int t = 0; t < 200; t++) {
-            int r = tcp_poll_segment(c, &flags, &rseq, &rack, &pl, &plen);
-            if (r >= 0) {
-                // Any data that arrives with the ACK: advance rcv_nxt + ack it.
-                if (plen > 0 && rseq == c->rcv_nxt) {
-                    c->rcv_nxt += plen;
-                    tcp_send_segment(c, TCP_ACK, 0, 0);
-                }
-                if (flags & TCP_ACK) break;
-            }
-            pit_sleep(5);
-        }
+        /* Small delay to let the NIC transmit before we send the next chunk */
+        pit_sleep(2);
     }
     return (int)len;
 }
 
 int tcp_recv(tcp_conn_t* c, void* out, unsigned int max, unsigned int timeout_ms) {
     if (!c || !c->used) return -1;
+
+    /* Drain spilled data first (segment tail from a previous short read) */
+    if (c->rx_pos < c->rx_len) {
+        unsigned int avail = c->rx_len - c->rx_pos;
+        unsigned int n = avail < max ? avail : max;
+        for (unsigned int i = 0; i < n; i++)
+            ((unsigned char*)out)[i] = c->rx_buf[c->rx_pos + i];
+        c->rx_pos += n;
+        if (c->rx_pos >= c->rx_len) { c->rx_len = 0; c->rx_pos = 0; }
+        return (int)n;
+    }
+
     if (c->peer_fin) return -1;
+
+    /* Settle delay on first recv */
+    if (!c->recv_started) { c->recv_started = 1; pit_sleep(20); }
 
     unsigned int waited = 0;
     while (waited < timeout_ms) {
@@ -239,14 +254,37 @@ int tcp_recv(tcp_conn_t* c, void* out, unsigned int max, unsigned int timeout_ms
             if (plen > 0 && rseq == c->rcv_nxt) {
                 unsigned int n = plen > max ? max : plen;
                 for (unsigned int i = 0; i < n; i++) ((unsigned char*)out)[i] = pl[i];
+                /* If the caller's buffer was smaller than the segment, stash
+                 * the remainder in rx_buf so no bytes are ever lost. It is
+                 * drained at the top of the next tcp_recv call. */
+                if (n < plen) {
+                    unsigned int rem = plen - n;
+                    if (rem <= sizeof(c->rx_buf)) {
+                        for (unsigned int i = 0; i < rem; i++)
+                            c->rx_buf[i] = pl[n + i];
+                        c->rx_len = rem;
+                        c->rx_pos = 0;
+                    }
+                }
                 c->rcv_nxt += plen;
+                /* If FIN rode along with the data, account for it now so the
+                 * ACK covers it; report EOF on the next call. */
+                if (flags & TCP_FIN) { c->rcv_nxt += 1; c->peer_fin = 1; }
                 tcp_send_segment(c, TCP_ACK, 0, 0);
                 return (int)n;
             }
+            if (plen > 0 && rseq != c->rcv_nxt) {
+                /* Dropped or out-of-order segment. NEVER skip the gap — that
+                 * silently corrupts the byte stream. Send a duplicate ACK
+                 * (acknowledging only what we actually have) so the peer
+                 * retransmits the missing data. */
+                tcp_send_segment(c, TCP_ACK, 0, 0);
+            }
 
             // Peer closing: FIN consumes one seq; ACK it and report EOF.
-            if (flags & TCP_FIN) {
-                c->rcv_nxt = rseq + plen + 1;
+            // (Data-carrying FIN segments are handled in the in-order branch.)
+            if ((flags & TCP_FIN) && plen == 0 && rseq == c->rcv_nxt) {
+                c->rcv_nxt = rseq + 1;
                 tcp_send_segment(c, TCP_ACK, 0, 0);
                 c->peer_fin = 1;
                 return -1;
@@ -256,6 +294,10 @@ int tcp_recv(tcp_conn_t* c, void* out, unsigned int max, unsigned int timeout_ms
         waited += 5;
     }
     return 0;   // timeout, no data
+}
+
+int tcp_alive(tcp_conn_t* c) {
+    return c && c->used && !c->peer_fin;
 }
 
 void tcp_close(tcp_conn_t* c) {

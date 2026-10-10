@@ -73,3 +73,5 @@ bochsrc.bak
 
 # Dependency files
 *.d
+
+apk.static

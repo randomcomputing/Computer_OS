@@ -9,6 +9,9 @@
 const console_backend_t* fbcon_init(void);
 
 // True once fbcon_init has succeeded.
+
+
+
 int fbcon_ready(void);
 
 #endif

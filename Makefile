@@ -205,7 +205,8 @@ $(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
               userprogs/c/testc.c userprogs/c/echo.c \
               userprogs/c/lib/stdio.c userprogs/c/lib/string.c \
               userprogs/c/lib/crt0.s userprogs/c/user.ld \
-              userprogs/c/Makefile
+              userprogs/c/Makefile \
+              apk.static
 	@echo "Building FAT32 data disk..."
 	dd if=/dev/zero of=$(FAT32_IMG) bs=1M count=64 2>/dev/null
 	mkfs.fat -F 32 -n COMPUTEROS $(FAT32_IMG)
@@ -237,6 +238,45 @@ $(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
 	mcopy -i $(FAT32_IMG) /tmp/_tarball.tar.gz        ::tarball.tar.gz
 	mcopy -i $(FAT32_IMG) /tmp/_fileio2               ::fileio2
 	mcopy -i $(FAT32_IMG) /tmp/_hello_musl            ::hello
+	@# --- apk filesystem structure ---
+	mmd -i $(FAT32_IMG) ::etc
+	mmd -i $(FAT32_IMG) ::etc/apk
+	mmd -i $(FAT32_IMG) ::etc/apk/keys
+	mmd -i $(FAT32_IMG) ::etc/apk/protected_paths.d
+	mmd -i $(FAT32_IMG) ::lib
+	mmd -i $(FAT32_IMG) ::lib/apk
+	mmd -i $(FAT32_IMG) ::lib/apk/db
+	mmd -i $(FAT32_IMG) ::var
+	mmd -i $(FAT32_IMG) ::var/cache
+	mmd -i $(FAT32_IMG) ::var/cache/apk
+	mmd -i $(FAT32_IMG) ::usr
+	mmd -i $(FAT32_IMG) ::usr/lib
+	@printf "x86_64\n"  > /tmp/_apk_arch
+	@echo "http://151.101.2.132/alpine/v3.19/main" > /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.19/community" >> /tmp/_apk_repos
+	@printf ""           > /tmp/_apk_world
+	@printf ""           > /tmp/_apk_installed
+	mcopy -i $(FAT32_IMG) /tmp/_apk_arch        ::etc/apk/arch
+	mcopy -i $(FAT32_IMG) /tmp/_apk_repos       ::etc/apk/repositories
+	mcopy -i $(FAT32_IMG) /tmp/_apk_world       ::etc/apk/world
+	mcopy -i $(FAT32_IMG) /tmp/_apk_installed   ::lib/apk/db/installed
+	@# Alpine signing key for v3.19
+	@if [ -f /tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub ]; then \
+	  mcopy -i $(FAT32_IMG) "/tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub" \
+	    "::etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"; \
+	fi
+	@# /etc/resolv.conf — point to QEMU SLIRP DNS (10.0.2.3)
+	@echo "nameserver 10.0.2.3" > /tmp/_resolv.conf
+	@echo "127.0.0.1 localhost" > /tmp/_hosts
+	@echo "151.101.2.132 dl-cdn.alpinelinux.org" >> /tmp/_hosts
+	mcopy -i $(FAT32_IMG) /tmp/_resolv.conf     ::etc/resolv.conf
+	mcopy -i $(FAT32_IMG) /tmp/_hosts           ::etc/hosts
+	@echo "hosts: files" > /tmp/_nsswitch.conf
+	@echo "networks: files" >> /tmp/_nsswitch.conf
+	mcopy -i $(FAT32_IMG) /tmp/_nsswitch.conf   ::etc/nsswitch.conf
+	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts
+	@# --- apk.static binary ---
+	mcopy -i $(FAT32_IMG) apk.static           ::apk.static
 	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
 	@rm -f /tmp/_helloworld2.txt /tmp/_file2_testing.txt /tmp/_test.tar /tmp/_tarball.tar.gz
 	@rm -f /tmp/_fileio2.c /tmp/_fileio2 /tmp/_hello_musl.c /tmp/_hello_musl
@@ -261,7 +301,8 @@ run: $(DISK_IMG)
 	    -display cocoa,zoom-to-fit=on
 
 debug: $(DISK_IMG)
-	@echo "Booting in QEMU (UEFI, debug)..."
+	@rm -f /tmp/serial.log && touch /tmp/serial.log
+	@tail -f /tmp/serial.log & \
 	$(QEMU) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	    -drive file=$(DISK_IMG),format=raw \
@@ -270,12 +311,49 @@ debug: $(DISK_IMG)
 	    -m 8G \
 	    -cpu max \
 	    -accel tcg \
-	    -serial stdio \
+	    -serial file:/tmp/serial.log \
 	    -no-reboot \
-	    -d int,cpu_reset,guest_errors \
+	    -d cpu_reset,guest_errors \
 	    -D /tmp/qemu_debug.log \
-	    -display cocoa,zoom-to-fit=on
+	    -display cocoa,zoom-to-fit=on; \
+	kill %% 2>/dev/null; true
+
+# Set up apk filesystem on existing fat32disk.img without full rebuild
+apk-fs:
+	@echo "Setting up apk filesystem structure on $(FAT32_IMG)..."
+	-mmd -i $(FAT32_IMG) ::etc
+	-mmd -i $(FAT32_IMG) ::etc/apk
+	-mmd -i $(FAT32_IMG) ::etc/apk/keys
+	-mmd -i $(FAT32_IMG) ::etc/apk/protected_paths.d
+	-mmd -i $(FAT32_IMG) ::lib
+	-mmd -i $(FAT32_IMG) ::lib/apk
+	-mmd -i $(FAT32_IMG) ::lib/apk/db
+	-mmd -i $(FAT32_IMG) ::var
+	-mmd -i $(FAT32_IMG) ::var/cache
+	-mmd -i $(FAT32_IMG) ::var/cache/apk
+	-mmd -i $(FAT32_IMG) ::usr
+	-mmd -i $(FAT32_IMG) ::usr/lib
+	@printf "x86_64\n" > /tmp/_apk_arch
+	@echo "http://151.101.2.132/alpine/v3.19/main" > /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.19/community" >> /tmp/_apk_repos
+	@printf "" > /tmp/_apk_world
+	@printf "" > /tmp/_apk_installed
+	-mcopy -oi $(FAT32_IMG) /tmp/_apk_arch      ::etc/apk/arch
+	-mcopy -oi $(FAT32_IMG) /tmp/_apk_repos     ::etc/apk/repositories
+	-mcopy -oi $(FAT32_IMG) /tmp/_apk_world     ::etc/apk/world
+	-mcopy -oi $(FAT32_IMG) /tmp/_apk_installed ::lib/apk/db/installed
+	@echo "nameserver 10.0.2.3" > /tmp/_resolv.conf
+	@echo "127.0.0.1 localhost" > /tmp/_hosts
+	@echo "151.101.2.132 dl-cdn.alpinelinux.org" >> /tmp/_hosts
+	-mcopy -oi $(FAT32_IMG) /tmp/_resolv.conf   ::etc/resolv.conf
+	-mcopy -oi $(FAT32_IMG) /tmp/_hosts         ::etc/hosts
+	@echo "hosts: files" > /tmp/_nsswitch.conf
+	@echo "networks: files" >> /tmp/_nsswitch.conf
+	-mcopy -oi $(FAT32_IMG) /tmp/_nsswitch.conf ::etc/nsswitch.conf
+	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts /tmp/_nsswitch.conf
+	mcopy -oi $(FAT32_IMG) apk.static          ::apk.static
+	@echo "Done. Run 'make' to rebuild disk.img with the new FAT32 image."
 
 clean:
 	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT32_IMG)
-	$(MAKE) -C userprogs/c clean
+	-$(MAKE) -C userprogs/c clean 2>/dev/null || true

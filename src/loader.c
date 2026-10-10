@@ -121,7 +121,8 @@ static uint64_t alloc_user_page(uint64_t virt,
     uint64_t frame = pmm_alloc();
 
     if (!frame) {
-        printf("loader: OOM\n");
+        printf("loader: OOM (pmm_alloc failed, %llu pages free)\n",
+               (unsigned long long)pmm_free_pages());
         return 0;
     }
 
@@ -149,135 +150,162 @@ static uint64_t alloc_user_page(uint64_t virt,
  * ELF64 loader
  * ===================================================================== */
 
+/*
+ * elf_load_streaming: load an ELF64 executable by path, reading only
+ * a small header buffer then each segment individually from VFS.
+ * Avoids buffering the whole file in kernel heap.
+ */
+static uint64_t elf_load_streaming(const char* path,
+                                    user_resources_t* r,
+                                    uint64_t pd_phys,
+                                    uint64_t* out_phdr_vaddr,
+                                    uint16_t* out_phnum) {
+    /* Read just enough for ELF header + program headers */
+    unsigned int hdr_buf_sz = 4096;
+    unsigned char* hbuf = (unsigned char*)kmalloc(hdr_buf_sz);
+    if (!hbuf) { printf("loader: OOM (hdr)\n"); return 0; }
+
+    int n = vfs_read_file(path, hbuf, hdr_buf_sz);
+    if (n < (int)sizeof(Elf64_Ehdr)) {
+        printf("loader: %s: too small\n", path);
+        kfree(hbuf); return 0;
+    }
+
+    Elf64_Ehdr eh_copy;
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)hbuf;
+    eh_copy = *eh;
+
+    if (eh_copy.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh_copy.e_ident[EI_DATA]  != ELFDATA2LSB ||
+        eh_copy.e_type            != ET_EXEC      ||
+        eh_copy.e_machine         != EM_X86_64    ||
+        eh_copy.e_phnum == 0 || eh_copy.e_phoff == 0 || eh_copy.e_entry == 0) {
+        printf("loader: %s: invalid ELF header\n", path);
+        kfree(hbuf); return 0;
+    }
+
+    /* Expand header buffer if phdrs extend past 4KB */
+    uint64_t phdrs_end = (uint64_t)eh_copy.e_phoff +
+                         (uint64_t)eh_copy.e_phnum * (uint64_t)eh_copy.e_phentsize;
+    if (phdrs_end > hdr_buf_sz) {
+        kfree(hbuf);
+        hdr_buf_sz = (unsigned int)((phdrs_end + 4095) & ~4095ULL);
+        hbuf = (unsigned char*)kmalloc(hdr_buf_sz);
+        if (!hbuf) { printf("loader: OOM (phdrs)\n"); return 0; }
+        n = vfs_read_file(path, hbuf, hdr_buf_sz);
+        if (n < (int)phdrs_end) {
+            printf("loader: %s: can't read phdrs\n", path);
+            kfree(hbuf); return 0;
+        }
+    }
+
+    /* Save program headers before freeing hbuf */
+#define MAX_PHDRS 32
+    Elf64_Phdr saved_phdrs[MAX_PHDRS];
+    int nph = (eh_copy.e_phnum < MAX_PHDRS) ? eh_copy.e_phnum : MAX_PHDRS;
+    uint64_t elf_phdr_vaddr = 0;
+
+    for (int i = 0; i < nph; i++) {
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)
+            (hbuf + eh_copy.e_phoff + (uint64_t)i * eh_copy.e_phentsize);
+        saved_phdrs[i] = *ph;
+        if (ph->p_type == 1 && elf_phdr_vaddr == 0) {
+            uint64_t load_base = ph->p_vaddr - ph->p_offset;
+            elf_phdr_vaddr = load_base + eh_copy.e_phoff;
+        }
+    }
+    kfree(hbuf);
+
+    if (out_phdr_vaddr) *out_phdr_vaddr = elf_phdr_vaddr;
+    if (out_phnum)      *out_phnum      = (uint16_t)nph;
+
+    /* Map all PT_LOAD pages */
+    for (int i = 0; i < nph; i++) {
+        const Elf64_Phdr* ph = &saved_phdrs[i];
+        if (ph->p_type != 1 || ph->p_memsz == 0) continue;
+        if (ph->p_filesz > ph->p_memsz) {
+            printf("loader: bad segment %d\n", i); return 0;
+        }
+        uint64_t seg_start = ph->p_vaddr & ~0xFFFULL;
+        uint64_t seg_end   = (ph->p_vaddr + ph->p_memsz + 0xFFFULL) & ~0xFFFULL;
+        for (uint64_t v = seg_start; v < seg_end; v += 0x1000)
+            if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, pd_phys))
+                return 0;
+    }
+
+    /* Load each segment using vfs_read_at — reads directly from the
+     * FAT32 cluster chain at the right offset, using only a 1-cluster
+     * (~4KB) kernel buffer inside the driver.  No large allocations. */
+    uint64_t old_cr3 = vmm_current();
+    vmm_switch(pd_phys);
+
+    for (int i = 0; i < nph; i++) {
+        const Elf64_Phdr* ph = &saved_phdrs[i];
+        if (ph->p_type != 1 || ph->p_filesz == 0) continue;
+
+        int nr = vfs_read_at(path,
+                             (void*)(uint64_t)ph->p_vaddr,
+                             (unsigned int)ph->p_offset,
+                             (unsigned int)ph->p_filesz);
+        if (nr < (int)ph->p_filesz) {
+            vmm_switch(old_cr3);
+            printf("loader: segment %d short read (%d/%llu)\n",
+                   i, nr, (unsigned long long)ph->p_filesz);
+            return 0;
+        }
+
+        /* Zero the BSS tail (memsz > filesz) */
+        if (ph->p_memsz > ph->p_filesz) {
+            uint64_t bss_start = ph->p_vaddr + ph->p_filesz;
+            uint64_t bss_len   = ph->p_memsz - ph->p_filesz;
+            memset((void*)bss_start, 0, (unsigned int)bss_len);
+        }
+    }
+
+    vmm_switch(old_cr3);
+    return eh_copy.e_entry;
+}
+
+/* elf_load: load from an already-buffered ELF file (small binaries) */
 static uint64_t elf_load(const unsigned char* file,
                          int filesz,
                          user_resources_t* r,
                          uint64_t pd_phys) {
-    if (filesz < (int)sizeof(Elf64_Ehdr)) {
-        printf("loader: ELF too small\n");
-        return 0;
-    }
-
+    if (filesz < (int)sizeof(Elf64_Ehdr)) { printf("loader: ELF too small\n"); return 0; }
     const Elf64_Ehdr* eh = (const Elf64_Ehdr*)file;
-
-    if (eh->e_ident[EI_CLASS] != ELFCLASS64) {
-        printf("loader: not ELF64\n");
-        return 0;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh->e_type != ET_EXEC || eh->e_machine != EM_X86_64 ||
+        eh->e_phnum == 0 || eh->e_phoff == 0 || eh->e_entry == 0) {
+        printf("loader: invalid ELF\n"); return 0;
     }
-
-    if (eh->e_ident[EI_DATA] != ELFDATA2LSB) {
-        printf("loader: not LE ELF\n");
-        return 0;
+    if ((uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > (uint64_t)filesz) {
+        printf("loader: program headers out of bounds\n"); return 0;
     }
-
-    if (eh->e_type != ET_EXEC) {
-        printf("loader: not executable\n");
-        return 0;
-    }
-
-    if (eh->e_machine != EM_X86_64) {
-        printf("loader: not x86_64 ELF\n");
-        return 0;
-    }
-
-    if (eh->e_phnum == 0 || eh->e_phoff == 0) {
-        printf("loader: no phdrs\n");
-        return 0;
-    }
-
-    if (eh->e_entry == 0) {
-        printf("loader: null entry\n");
-        return 0;
-    }
-
-    if ((uint64_t)eh->e_phoff +
-        (uint64_t)eh->e_phnum * (uint64_t)eh->e_phentsize >
-        (uint64_t)filesz) {
-        printf("loader: program headers out of bounds\n");
-        return 0;
-    }
-
-    /*
-     * Pass 1:
-     * Allocate and map every PT_LOAD page.
-     *
-     * IMPORTANT:
-     * Map all ELF pages writable while loading.
-     *
-     * Normal .text sections are R-X, but the loader still needs to
-     * memcpy() bytes into them. If they are mapped non-writable before
-     * copying, the kernel page-faults while loading the ELF.
-     */
     for (int i = 0; i < (int)eh->e_phnum; i++) {
-        uint64_t phdr_off =
-            (uint64_t)eh->e_phoff + (uint64_t)i * (uint64_t)eh->e_phentsize;
-
-        if (phdr_off + sizeof(Elf64_Phdr) > (uint64_t)filesz) {
-            printf("loader: phdr %d out of bounds\n", i);
-            return 0;
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)
+            (file + eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+        if (ph->p_filesz > ph->p_memsz ||
+            (uint64_t)ph->p_offset + ph->p_filesz > (uint64_t)filesz) {
+            printf("loader: bad segment %d\n", i); return 0;
         }
-
-        const Elf64_Phdr* ph = (const Elf64_Phdr*)(file + phdr_off);
-
-        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) {
-            continue;
-        }
-
-        if (ph->p_filesz > ph->p_memsz) {
-            printf("loader: bad ELF segment size\n");
-            return 0;
-        }
-
-        if ((uint64_t)ph->p_offset + (uint64_t)ph->p_filesz >
-            (uint64_t)filesz) {
-            printf("loader: ELF segment outside file\n");
-            return 0;
-        }
-
-        /*
-         * Keep writable for now.
-         * Later you can tighten permissions after loading:
-         *   RX for text, RW for data/bss, etc.
-         */
-        uint64_t page_flags = VMM_PRESENT | VMM_WRITE | VMM_USER;
-
         uint64_t seg_start = (uint64_t)ph->p_vaddr & ~0xFFFULL;
-        uint64_t seg_end =
-            ((uint64_t)ph->p_vaddr + (uint64_t)ph->p_memsz + 0xFFFULL)
-            & ~0xFFFULL;
-
-        for (uint64_t v = seg_start; v < seg_end; v += 0x1000) {
-            if (!alloc_user_page(v, page_flags, r, pd_phys)) {
-                return 0;
-            }
-        }
+        uint64_t seg_end   = ((uint64_t)ph->p_vaddr + ph->p_memsz + 0xFFFULL) & ~0xFFFULL;
+        for (uint64_t v = seg_start; v < seg_end; v += 0x1000)
+            if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, pd_phys)) return 0;
     }
-
-    /*
-     * Pass 2:
-     * Switch to the new user page table, copy the ELF segment bytes,
-     * then switch back to the old page table.
-     */
     uint64_t old_cr3 = vmm_current();
     vmm_switch(pd_phys);
-
     for (int i = 0; i < (int)eh->e_phnum; i++) {
-        uint64_t phdr_off =
-            (uint64_t)eh->e_phoff + (uint64_t)i * (uint64_t)eh->e_phentsize;
-
-        const Elf64_Phdr* ph = (const Elf64_Phdr*)(file + phdr_off);
-
-        if (ph->p_type != PT_LOAD || ph->p_filesz == 0) {
-            continue;
-        }
-
-        memcpy((void*)(uint64_t)ph->p_vaddr,
-               file + ph->p_offset,
-               (unsigned int)ph->p_filesz);
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)
+            (file + eh->e_phoff + (uint64_t)i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD || ph->p_filesz == 0) continue;
+        memcpy((void*)(uint64_t)ph->p_vaddr, file + ph->p_offset, (unsigned int)ph->p_filesz);
+        if (ph->p_memsz > ph->p_filesz)
+            memset((void*)(uint64_t)(ph->p_vaddr + ph->p_filesz), 0,
+                   (unsigned int)(ph->p_memsz - ph->p_filesz));
     }
-
     vmm_switch(old_cr3);
-
     return (uint64_t)eh->e_entry;
 }
 
@@ -318,75 +346,59 @@ static uint64_t flat_load(const unsigned char* buf,
  * Public API
  * ===================================================================== */
 
+int loader_run_args(const char* path, const char* extra_args);
+
 int loader_run(const char* path) {
-    unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
+    return loader_run_args(path, "");
+}
 
-    if (!buf) {
-        printf("loader: OOM\n");
-        return -1;
-    }
-
-    int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
-
-    if (n <= 0) {
-        printf("loader: %s: not found\n", path);
-        kfree(buf);
-        return -1;
-    }
-
+int loader_run_args(const char* path, const char* extra_args) {
     uint64_t pd_phys = vmm_new_user_pd();
-
-    if (!pd_phys) {
-        printf("loader: failed to create PD\n");
-        kfree(buf);
-        return -1;
-    }
+    if (!pd_phys) { printf("loader: failed to create PD\n"); return -1; }
 
     user_resources_t* r = (user_resources_t*)kmalloc(sizeof(*r));
-
-    if (!r) {
-        vmm_free_user_pd(pd_phys);
-        kfree(buf);
-        return -1;
-    }
-
+    if (!r) { vmm_free_user_pd(pd_phys); return -1; }
     memset(r, 0, sizeof(*r));
-
     r->pd_phys   = pd_phys;
     r->heap_base = LOADER_HEAP_BASE;
     r->heap_brk  = LOADER_HEAP_BASE;
     r->heap_max  = LOADER_HEAP_BASE + LOADER_HEAP_MAX;
 
-    uint64_t entry;
-
-    if (elf64_valid(buf, n)) {
-        entry = elf_load(buf, n, r, pd_phys);
-    } else {
-        entry = flat_load(buf, n, r, pd_phys);
+    /* Probe: read just the first 8 bytes to detect ELF vs flat */
+    unsigned char magic[8];
+    int nm = vfs_read_file(path, magic, sizeof(magic));
+    if (nm <= 0) {
+        printf("loader: %s: not found\n", path);
+        kfree(r); vmm_free_user_pd(pd_phys); return -1;
     }
 
-    /* Save ELF phdr info before freeing buf */
+    uint64_t entry = 0;
     uint64_t elf_phdr_vaddr = 0;
     uint16_t elf_phnum = 0;
-    if (elf64_valid(buf, n)) {
-        const Elf64_Ehdr* _eh = (const Elf64_Ehdr*)buf;
-        elf_phnum = _eh->e_phnum;
-        for (int _pi = 0; _pi < _eh->e_phnum; _pi++) {
-            const Elf64_Phdr* _ph = (const Elf64_Phdr*)((const unsigned char*)buf +
-                _eh->e_phoff + (uint64_t)_pi * _eh->e_phentsize);
-            if (_ph->p_type == 1 /* PT_LOAD */) {
-                uint64_t load_base = _ph->p_vaddr - _ph->p_offset;
-                elf_phdr_vaddr = load_base + _eh->e_phoff;
-                break;
-            }
+
+    int is_elf = (nm >= 4 && magic[0] == 0x7f && magic[1] == 'E' &&
+                              magic[2] == 'L'  && magic[3] == 'F');
+
+    if (is_elf) {
+        /* Streaming ELF load — never buffers the whole file */
+        entry = elf_load_streaming(path, r, pd_phys, &elf_phdr_vaddr, &elf_phnum);
+    } else {
+        /* Flat binary — small, buffer the whole thing */
+        unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
+        if (!buf) {
+            printf("loader: OOM\n");
+            kfree(r); vmm_free_user_pd(pd_phys); return -1;
         }
+        int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
+        if (n <= 0) {
+            printf("loader: %s: not found\n", path);
+            kfree(buf); kfree(r); vmm_free_user_pd(pd_phys); return -1;
+        }
+        entry = flat_load(buf, n, r, pd_phys);
+        kfree(buf);
     }
 
-    kfree(buf);
-
     if (!entry) {
-        release_resources(r);
-        kfree(r);
         vmm_free_user_pd(pd_phys);
         return -1;
     }
@@ -436,21 +448,55 @@ int loader_run(const char* path) {
     for (int _pi2 = 0; _pi2 < _pname_len; _pi2++) stk_top[_pi2] = ((const uint8_t*)_pname)[_pi2];
     uint8_t* _argv0_str = stk_top;
 
-    /* AT_RANDOM 16 bytes, 16-byte aligned */
+    /* AT_RANDOM 16 bytes, 16-byte aligned.
+     * Use all-zero bytes so glibc's pointer guard = 0 and
+     * PTR_MANGLE/DEMANGLE is just ror/rol(17), always consistent. */
     stk_top = (uint8_t*)((uint64_t)stk_top & ~15ULL);
     stk_top -= 16;
     for (int _ri2 = 0; _ri2 < 16; _ri2++)
-        stk_top[_ri2] = (uint8_t)(0x42 ^ _ri2 ^ ((uint64_t)entry >> 8));
+        stk_top[_ri2] = 0;
     uint8_t* _rand_ptr = stk_top;
+
+    /* Extra args: write arg strings into the data area (above aux vector),
+     * right after _rand_ptr. We write them top-down via stk_top BEFORE
+     * building the aux/argv stack with sp. */
+    #define MAX_EXTRA_ARGS 16
+    uint8_t* arg_strs[MAX_EXTRA_ARGS];
+    int nargs = 0;
+    if (extra_args && extra_args[0]) {
+        const char* p = extra_args;
+        while (*p && nargs < MAX_EXTRA_ARGS) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            const char* start = p;
+            while (*p && *p != ' ') p++;
+            int alen = (int)(p - start) + 1;
+            stk_top -= alen;
+            for (int ai = 0; ai < alen - 1; ai++) stk_top[ai] = ((const uint8_t*)start)[ai];
+            stk_top[alen-1] = 0;
+            arg_strs[nargs++] = stk_top;
+        }
+    }
 
     /* Align to 8 bytes */
     stk_top = (uint8_t*)((uint64_t)stk_top & ~7ULL);
 
     uint64_t* sp = (uint64_t*)stk_top;
 
-    /* Aux vector: build top-down so lowest addr = first entry musl reads */
-    /* Push in REVERSE of desired read order (last pair = AT_NULL) */
-    sp -= 2; sp[0] = 0;  sp[1] = 0;              /* AT_NULL (last) */
+    /* The ABI requires rsp % 16 == 0 at process entry with argc exactly
+     * at [rsp]. We are about to push a fixed number of words:
+     *   12 auxv pairs (24) + envp NULL (1) + argv NULL (1)
+     *   + nargs argv slots + argv0 (1) + argc (1)  =  28 + nargs.
+     * If that would leave rsp misaligned, insert one padding word HERE,
+     * above the aux vector — never below argc, which must stay at [rsp]. */
+    {
+        int total_words = 28 + nargs;
+        if (((uint64_t)sp - (uint64_t)total_words * 8) & 15)
+            *(--sp) = 0;
+    }
+
+    /* Aux vector */
+    sp -= 2; sp[0] = 0;  sp[1] = 0;              /* AT_NULL */
     sp -= 2; sp[0] = 6;  sp[1] = 4096;            /* AT_PAGESZ */
     sp -= 2; sp[0] = 25; sp[1] = (uint64_t)_rand_ptr; /* AT_RANDOM */
     sp -= 2; sp[0] = 23; sp[1] = 0;               /* AT_SECURE */
@@ -467,13 +513,16 @@ int loader_run(const char* path) {
     *(--sp) = 0;
     /* NULL argv terminator */
     *(--sp) = 0;
-    /* argv[0] pointer */
-    *(--sp) = (uint64_t)_argv0_str;
-    /* argc = 1 */
-    *(--sp) = 1;
 
-    /* Align to 16 bytes for ABI compliance */
-    if ((uint64_t)sp & 8) sp--;
+    /* argv[1..N] in reverse order */
+    for (int ai = nargs - 1; ai >= 0; ai--)
+        *(--sp) = (uint64_t)arg_strs[ai];
+
+    /* argv[0] */
+    *(--sp) = (uint64_t)_argv0_str;
+    /* argc — must be exactly at [rsp] at entry; alignment was
+     * handled by the padding word above the aux vector. */
+    *(--sp) = (uint64_t)(1 + nargs);
 
     uint64_t initial_rsp = (uint64_t)sp;
     vmm_switch(old_cr3_s);
@@ -514,11 +563,40 @@ uint64_t loader_sbrk64(int64_t delta) {
     uint64_t first_page = (old_brk + 0xFFFULL) & ~0xFFFULL;
     uint64_t last_page  = (new_brk + 0xFFFULL) & ~0xFFFULL;
     for (uint64_t v = first_page; v < last_page; v += 0x1000) {
-        if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, t->pd_phys))
-            break;
+        /* Skip pages already mapped (e.g. left over from a previous
+         * partially-failed grow, or below a shrunken break). */
+        if (vmm_resolve_in(t->pd_phys, v)) continue;
+        if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, t->pd_phys)) {
+            /* Out of pages mid-grow. Do NOT advance the break — a break
+             * that covers unmapped pages makes malloc hand out memory
+             * that faults on first touch. The pages mapped so far stay
+             * mapped and tracked; they'll back a smaller future grow. */
+            return old_brk;
+        }
     }
     r->heap_brk = new_brk;
     return old_brk;
+}
+
+/* Move the break down without unmapping (pages are reused on regrowth
+ * and released at task exit). */
+void loader_set_brk(uint64_t brk) {
+    task_t* t = task_current();
+    if (!t || !t->is_user || !t->user_data) return;
+    user_resources_t* r = (user_resources_t*)t->user_data;
+    if (brk >= r->heap_base && brk <= r->heap_brk)
+        r->heap_brk = brk;
+}
+
+/* Map one zeroed anonymous user page at virt in the current task's
+ * address space, tracked so it is freed at task exit. Used by mmap. */
+int loader_map_anon_page(uint64_t virt) {
+    task_t* t = task_current();
+    if (!t || !t->is_user || !t->user_data) return 0;
+    user_resources_t* r = (user_resources_t*)t->user_data;
+    if (vmm_resolve_in(t->pd_phys, virt)) return 1; /* already mapped */
+    return alloc_user_page(virt, VMM_PRESENT|VMM_WRITE|VMM_USER,
+                           r, t->pd_phys) ? 1 : 0;
 }
 
 int loader_sbrk(int delta) {
@@ -690,69 +768,40 @@ int loader_exec(const char* path, struct registers* frame) {
         return -1;
     }
 
-    unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
-
-    if (!buf) {
-        printf("exec: OOM\n");
-        return -1;
-    }
-
-    int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
-
-    if (n <= 0) {
-        printf("exec: %s: not found\n", path);
-        kfree(buf);
-        return -1;
-    }
-
     uint64_t new_pd = vmm_new_user_pd();
-
-    if (!new_pd) {
-        kfree(buf);
-        return -1;
-    }
+    if (!new_pd) return -1;
 
     user_resources_t* nr = (user_resources_t*)kmalloc(sizeof(*nr));
-
-    if (!nr) {
-        vmm_free_user_pd(new_pd);
-        kfree(buf);
-        return -1;
-    }
-
+    if (!nr) { vmm_free_user_pd(new_pd); return -1; }
     memset(nr, 0, sizeof(*nr));
-
     nr->pd_phys   = new_pd;
     nr->heap_base = LOADER_HEAP_BASE;
     nr->heap_brk  = LOADER_HEAP_BASE;
     nr->heap_max  = LOADER_HEAP_BASE + LOADER_HEAP_MAX;
 
-    uint64_t entry;
-
-    if (elf64_valid(buf, n)) {
-        entry = elf_load(buf, n, nr, new_pd);
-    } else {
-        entry = flat_load(buf, n, nr, new_pd);
+    /* Probe magic bytes */
+    unsigned char magic[8];
+    int nm = vfs_read_file(path, magic, sizeof(magic));
+    if (nm <= 0) {
+        printf("exec: %s: not found\n", path);
+        kfree(nr); vmm_free_user_pd(new_pd); return -1;
     }
 
-    /* Save ELF phdr info before freeing buf */
+    uint64_t entry = 0;
     uint64_t elf_phdr_vaddr = 0;
     uint16_t elf_phnum = 0;
-    if (elf64_valid(buf, n)) {
-        const Elf64_Ehdr* _eh = (const Elf64_Ehdr*)buf;
-        elf_phnum = _eh->e_phnum;
-        for (int _pi = 0; _pi < _eh->e_phnum; _pi++) {
-            const Elf64_Phdr* _ph = (const Elf64_Phdr*)((const unsigned char*)buf +
-                _eh->e_phoff + (uint64_t)_pi * _eh->e_phentsize);
-            if (_ph->p_type == 1 /* PT_LOAD */) {
-                uint64_t load_base = _ph->p_vaddr - _ph->p_offset;
-                elf_phdr_vaddr = load_base + _eh->e_phoff;
-                break;
-            }
-        }
-    }
 
-    kfree(buf);
+    int is_elf = (nm >= 4 && magic[0] == 0x7f && magic[1] == 'E' &&
+                              magic[2] == 'L'  && magic[3] == 'F');
+    if (is_elf) {
+        entry = elf_load_streaming(path, nr, new_pd, &elf_phdr_vaddr, &elf_phnum);
+    } else {
+        unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
+        if (!buf) { kfree(nr); vmm_free_user_pd(new_pd); return -1; }
+        int n = vfs_read_file(path, buf, LOADER_CODE_BYTES);
+        if (n > 0) entry = flat_load(buf, n, nr, new_pd);
+        kfree(buf);
+    }
 
     if (!entry) {
         release_resources(nr);

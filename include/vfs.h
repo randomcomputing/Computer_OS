@@ -30,6 +30,7 @@ typedef struct vfs_ops {
     int (*list)(const char* path, vfs_dirent_t* out, int max);
     int (*is_dir)(const char* path);
     int (*read_file)(const char* path, void* buf, unsigned int max);
+    int (*read_file_at)(const char* path, void* buf, unsigned int offset, unsigned int len);
     int (*write_file)(const char* path, const void* data, unsigned int size);
     int (*delete_file)(const char* path);
     int (*mkdir)(const char* path);
@@ -53,6 +54,7 @@ const vfs_mount_t* vfs_mount_at(int i);
 // ---- path-based operations (route by normalized absolute path) --------
 int  vfs_list(const char* path, vfs_dirent_t* out, int max);   // "" = cwd
 int  vfs_read_file(const char* path, void* buf, unsigned int max);
+int  vfs_read_at  (const char* path, void* buf, unsigned int offset, unsigned int len);
 int  vfs_write_file(const char* path, const void* data, unsigned int size);
 int  vfs_delete_file(const char* path);
 int  vfs_mkdir(const char* path);

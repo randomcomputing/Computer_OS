@@ -48,7 +48,7 @@ syscall_stub:
     iretq
 
 ; -----------------------------------------------------------------------
-; syscall fast path (Linux x86-64)
+; syscall fast path (Linux x86-64)w
 ;
 ; Frame layout (rsp = r9 slot after pushes):
 ;   [rsp+ 0] = r9   (arg6)

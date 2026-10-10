@@ -174,6 +174,9 @@ void kmain(void) {
 
     kheap_init(0xFFFFFFFF40000000ULL, 64, 131072);
 
+    /* Serial: init first so all printf output goes to COM1 for debug */
+    serial_init();
+
     /* Console: try the Limine framebuffer, fall back to VGA text. */
     con_init();
     if (fb_request.response && fb_request.response->framebuffer_count > 0) {

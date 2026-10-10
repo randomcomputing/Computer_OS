@@ -18,6 +18,7 @@ void     vmm_init(uint64_t hhdm_offset);
 int      vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
 void     vmm_unmap(uint64_t virt);
 uint64_t vmm_resolve(uint64_t virt);
+uint64_t vmm_resolve_in(uint64_t pml4_phys, uint64_t virt);
 
 uint64_t vmm_new_user_pd(void);
 void     vmm_free_user_pd(uint64_t pml4_phys);

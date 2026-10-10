@@ -1585,10 +1585,18 @@ static void cmd_user(void) {
 
 static void cmd_run(const char* args) {
     while (*args == ' ') args++;
-    if (*args == '\0') { printf("usage: run <file>\n"); return; }
+    if (*args == '\0') { printf("usage: run <file> [args...]\n"); return; }
 
-    int id = loader_run(args);
-    if (id < 0) return;   // loader_run already printed the reason
+    /* Split path from args: everything up to first space is the path */
+    char path[256];
+    int pi = 0;
+    while (args[pi] && args[pi] != ' ' && pi < 255) { path[pi] = args[pi]; pi++; }
+    path[pi] = '\0';
+    const char* extra = args[pi] ? args + pi + 1 : "";
+    while (*extra == ' ') extra++;
+
+    int id = loader_run_args(path, extra);
+    if (id < 0) return;
 
     printf("[run] %s started as task %d\n", args, id);
 
@@ -1940,9 +1948,34 @@ static void execute(char* line) {
     else if (strcmp(line, "reboot")   == 0) reboot();
     else if (strcmp(line, "shutdown") == 0) shutdown();
     else {
-        con_set_color(CON_LIGHT_RED, CON_BLACK);
-        printf("unknown command: %s\n", line);
-        con_set_color(CON_LIGHT_GREY, CON_BLACK);
+        /* Auto-run: if the command looks like a filename (has '.' or '/'),
+           treat it as a path and pass it directly to the loader.
+           e.g. "apk.static --version" → run /apk.static with args "--version" */
+        int looks_like_file = 0;
+        for (int _i = 0; line[_i]; _i++) {
+            if (line[_i] == '.' || line[_i] == '/') { looks_like_file = 1; break; }
+        }
+        if (looks_like_file) {
+            /* Build "/path args" string for cmd_run */
+            char _fullcmd[512];
+            int _j = 0;
+            if (line[0] != '/' && line[0] != '.') {
+                _fullcmd[_j++] = '/';
+            }
+            /* copy path (line is already null-terminated at space by split_args) */
+            for (int _k = 0; line[_k] && _j < 510; _k++) _fullcmd[_j++] = line[_k];
+            /* append args if any */
+            if (args && args[0]) {
+                _fullcmd[_j++] = ' ';
+                for (int _k = 0; args[_k] && _j < 510; _k++) _fullcmd[_j++] = args[_k];
+            }
+            _fullcmd[_j] = '\0';
+            cmd_run(_fullcmd);
+        } else {
+            con_set_color(CON_LIGHT_RED, CON_BLACK);
+            printf("unknown command: %s\n", line);
+            con_set_color(CON_LIGHT_GREY, CON_BLACK);
+        }
     }
 }
 

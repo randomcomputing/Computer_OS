@@ -308,6 +308,7 @@ static int procfs_write_file(const char* path, const void* data, unsigned int si
     (void)path; (void)data; (void)size;
     return -1;
 }
+
 static int procfs_delete_file(const char* path) { (void)path; return -1; }
 static int procfs_mkdir(const char* path)       { (void)path; return -1; }
 static int procfs_rmdir(const char* path)       { (void)path; return -1; }

@@ -1,5 +1,9 @@
 #include "vfs.h"
 #include "string.h"
+#include "kheap.h"
+
+/* Forward declaration for fat32_read_file_at used in fat32_ops below */
+int fat32_read_file_at(const char* path, void* buf, unsigned int offset, unsigned int len);
 
 // ---- mount table -------------------------------------------------------
 #define VFS_MAX_MOUNTS 12
@@ -156,6 +160,34 @@ int vfs_read_file(const char* path, void* buf, unsigned int max) {
     return m->ops->read_file(sub, buf, max);
 }
 
+/* Read `len` bytes from `path` starting at byte `offset`.
+ * Uses the mount's read_file_at op if available (O(1) cluster skip).
+ * Falls back to the chunked window approach for other mounts. */
+int vfs_read_at(const char* path, void* buf, unsigned int offset,
+                unsigned int len) {
+    if (len == 0) return 0;
+    char sub[256];
+    const vfs_mount_t* m = resolve_route(path, sub, sizeof(sub));
+    if (!m) return -1;
+    if (m->ops->read_file_at)
+        return m->ops->read_file_at(sub, buf, offset, len);
+    /* Fallback: shouldn't be needed for FAT32, but handle ramfs etc. */
+    if (!m->ops->read_file) return -1;
+    unsigned int total = offset + len;
+    unsigned char* tmp = (unsigned char*)kmalloc(total);
+    if (!tmp) return -1;
+    int nr = m->ops->read_file(sub, tmp, total);
+    int got = 0;
+    if (nr > (int)offset) {
+        got = nr - (int)offset;
+        if ((unsigned int)got > len) got = (int)len;
+        for (int i = 0; i < got; i++)
+            ((unsigned char*)buf)[i] = tmp[offset + i];
+    }
+    kfree(tmp);
+    return got;
+}
+
 int vfs_write_file(const char* path, const void* data, unsigned int size) {
     char sub[256];
     const vfs_mount_t* m = resolve_route(path, sub, sizeof(sub));
@@ -247,15 +279,16 @@ extern int fat32_vfs_list(const char* path, vfs_dirent_t* out, int max);
 extern int fat32_vfs_is_dir(const char* path);
 
 static const vfs_ops_t fat32_ops = {
-    .list        = fat32_vfs_list,
-    .is_dir      = fat32_vfs_is_dir,
-    .read_file   = fat32_read_file,
-    .write_file  = fat32_write_file,
-    .delete_file = fat32_delete_file,
-    .mkdir       = fat32_mkdir,
-    .rmdir       = fat32_rmdir,
-    .cp          = fat32_cp,
-    .mv          = fat32_mv,
+    .list         = fat32_vfs_list,
+    .is_dir       = fat32_vfs_is_dir,
+    .read_file    = fat32_read_file,
+    .read_file_at = fat32_read_file_at,
+    .write_file   = fat32_write_file,
+    .delete_file  = fat32_delete_file,
+    .mkdir        = fat32_mkdir,
+    .rmdir        = fat32_rmdir,
+    .cp           = fat32_cp,
+    .mv           = fat32_mv,
 };
 
 const vfs_ops_t* fat32_vfs_ops(void) { return &fat32_ops; }

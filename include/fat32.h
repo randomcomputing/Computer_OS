@@ -78,6 +78,7 @@ int fat32_getcwd(char* out, unsigned int max);
 
 // Read a file by path. Returns bytes read, or -1.
 int fat32_read_file(const char* path, void* buf, unsigned int max);
+int fat32_read_file_at(const char* path, void* buf, unsigned int offset, unsigned int len);
 
 // Create or overwrite a file. Returns size on success, -1 on error.
 int fat32_write_file(const char* path, const void* data, unsigned int size);

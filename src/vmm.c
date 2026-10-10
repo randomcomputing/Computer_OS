@@ -219,6 +219,14 @@ int vmm_map_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags)
     return 1;
 }
 
+/* Query a mapping in a specific address space without creating tables.
+ * Returns the physical address, or 0 if not mapped. */
+uint64_t vmm_resolve_in(uint64_t pml4_phys, uint64_t virt) {
+    uint64_t* pte = walk_to_pte(pml4_phys, virt, 0);
+    if (!pte || !(*pte & VMM_PRESENT)) return 0;
+    return (*pte & ~0xFFFULL) | (virt & 0xFFF);
+}
+
 int vmm_page_fault(struct registers* regs) {
     uint64_t fault_addr = read_cr2();
 

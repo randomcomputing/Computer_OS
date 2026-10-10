@@ -41,7 +41,7 @@
 // Maximum is 16 MB — enough for any reasonable user program, small
 // enough that a runaway malloc loop can't eat all of physical memory.
 #define LOADER_HEAP_BASE  0x02000000u
-#define LOADER_HEAP_MAX   0x01000000u   // 16 MB cap on heap growth
+#define LOADER_HEAP_MAX   0x10000000u   // 256 MB cap on heap growth
 
 // Read `path` from FAT12 and run it as a ring-3 program.
 // Returns the new task id on success, or -1 on any failure
@@ -49,6 +49,7 @@
 // be alive at once (e.g. a parent that forked a child); the caller
 // waits on the returned task id to know when it has finished.
 int loader_run(const char* path);
+int loader_run_args(const char* path, const char* extra_args);
 
 // SYS_SBRK backend: extend the calling task's user heap by `delta` bytes.
 // Returns the OLD break on success, or -1 on any failure (no heap, would

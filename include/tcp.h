@@ -27,7 +27,37 @@ int tcp_send(tcp_conn_t* c, const void* data, unsigned int len);
 // the connection (FIN received and drained).
 int tcp_recv(tcp_conn_t* c, void* out, unsigned int max, unsigned int timeout_ms);
 
+// Returns 1 if the connection handle is still usable (open, no FIN/RST seen).
+int tcp_alive(tcp_conn_t* c);
+
 // Close the connection (send FIN, drain). Safe to call once per handle.
 void tcp_close(tcp_conn_t* c);
 
 #endif
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// this code is why half of the OS crashes from a segfauly

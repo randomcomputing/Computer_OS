@@ -15,11 +15,14 @@
 #define ELFDATA2LSB 1
 
 #define ET_EXEC     2
+#define ET_DYN      3   /* position-independent executable or shared object */
 
 #define EM_386      3
 #define EM_X86_64   62
 
 #define PT_LOAD     1
+#define PT_INTERP   3   /* path of the dynamic loader */
+#define PT_PHDR     6   /* location of the program headers in memory */
 
 #define PF_X        0x1
 #define PF_W        0x2

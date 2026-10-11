@@ -39,6 +39,9 @@ typedef struct task {
     uint64_t  fault_recovery_rip;
     int       uaccess_faulted;
 
+    uint64_t  fs_base;      /* per-task FS base (user TLS pointer), MSR 0xC0000100 */
+    void*     fdt;          /* Linux fd table (linux_syscall.c), NULL until first use */
+
     struct task* next;
 } task_t;
 
@@ -56,6 +59,9 @@ void     task_exit(void);
 void     task_exit_trampoline(void);
 void     task_exit_code(int code);
 int      task_wait_child(int* status);
+/* waitpid: pid>0 = that child, -1/0 = any; nohang = WNOHANG.
+   Returns child pid, 0 (nohang, none exited yet), or -1 (no such child). */
+int      task_wait_child_ex(int pid, int nohang, int* status);
 void     tasking_enable_preemption(void);
 void     scheduler_tick(void);
 

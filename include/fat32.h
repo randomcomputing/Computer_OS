@@ -52,7 +52,7 @@ int fat32_resolve_dir(const char* path, unsigned int* out);
 // Split a path into (parent dir cluster, basename).
 // "/foo/bar.txt" -> parent = cluster of "/foo", basename = "bar.txt".
 // "bar.txt"      -> parent = cwd,               basename = "bar.txt".
-// basename_out must be at least 64 bytes.
+// basename_out must be at least FAT32_NAME_MAX + 1 (256) bytes.
 // Returns 0 on success, -1 if the parent directory doesn't exist.
 int fat32_resolve_parent(const char* path,
                          unsigned int* parent_out,

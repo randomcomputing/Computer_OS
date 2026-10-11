@@ -48,7 +48,7 @@ syscall_stub:
     iretq
 
 ; -----------------------------------------------------------------------
-; syscall fast path (Linux x86-64)w
+; syscall fast path (Linux x86-64)
 ;
 ; Frame layout (rsp = r9 slot after pushes):
 ;   [rsp+ 0] = r9   (arg6)
@@ -116,11 +116,9 @@ linux_syscall_entry:
     mov  rax, [rsp + 48]
 
     ; Check for exit
-    mov  r11, [rel g_syscall_num]
-    cmp  r11, 60
-    je   linux_do_exit_halt
-    cmp  r11, 231
-    je   linux_do_exit_halt
+    ; (exit/exit_group never return here: task_exit_code switches away.
+    ;  The old check read g_syscall_num, a global that other tasks
+    ;  overwrite while this one is blocked, e.g. a parent in wait4.)
 
     ; Pop arg regs
     pop r9

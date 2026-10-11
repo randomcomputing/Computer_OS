@@ -67,6 +67,12 @@ static void release_resources(user_resources_t* r) {
 static void on_user_exit(task_t* t) {
     if (!t) return;
 
+    /* Close every fd the process still had open: flushes buffered file
+       writes and drops pipe references, so a parent reading the other
+       end of a pipe sees EOF. */
+    extern void linux_fdt_release(task_t* t);
+    linux_fdt_release(t);
+
     user_resources_t* r = (user_resources_t*)t->user_data;
 
     if (r) {
@@ -151,15 +157,31 @@ static uint64_t alloc_user_page(uint64_t virt,
  * ===================================================================== */
 
 /*
- * elf_load_streaming: load an ELF64 executable by path, reading only
- * a small header buffer then each segment individually from VFS.
- * Avoids buffering the whole file in kernel heap.
+ * Where position-independent images go. Static ET_EXEC programs keep their
+ * link address (0x400000 / 0x01000000). Must stay clear of the heap
+ * (0x02000000..0x12000000), anonymous mmap (from 0x40000000 upward) and
+ * the stack (just below 0x7fff0000).
  */
-static uint64_t elf_load_streaming(const char* path,
-                                    user_resources_t* r,
-                                    uint64_t pd_phys,
-                                    uint64_t* out_phdr_vaddr,
-                                    uint16_t* out_phnum) {
+#define LOADER_PIE_BASE     0x0000555555554000ULL   /* main program (ET_DYN) */
+#define LOADER_INTERP_BASE  0x00007f0000000000ULL   /* dynamic loader        */
+
+typedef struct {
+    uint64_t entry;          /* entry point, load bias applied            */
+    uint64_t phdr;           /* program headers in memory, bias applied   */
+    uint16_t phnum;
+    uint64_t bias;           /* 0 for ET_EXEC                              */
+    char     interp[128];    /* PT_INTERP path, "" if statically linked    */
+} elf_info_t;
+
+/*
+ * elf_map: load an ELF64 image (ET_EXEC, or ET_DYN at dyn_base) by path,
+ * reading only a small header buffer then each segment individually.
+ * Avoids buffering the whole file in kernel heap. Returns 1 on success.
+ */
+static int elf_map(const char* path, uint64_t dyn_base,
+                   user_resources_t* r, uint64_t pd_phys, elf_info_t* out) {
+    memset(out, 0, sizeof(*out));
+
     /* Read just enough for ELF header + program headers */
     unsigned int hdr_buf_sz = 4096;
     unsigned char* hbuf = (unsigned char*)kmalloc(hdr_buf_sz);
@@ -171,15 +193,13 @@ static uint64_t elf_load_streaming(const char* path,
         kfree(hbuf); return 0;
     }
 
-    Elf64_Ehdr eh_copy;
-    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)hbuf;
-    eh_copy = *eh;
+    Elf64_Ehdr eh_copy = *(const Elf64_Ehdr*)hbuf;
 
     if (eh_copy.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh_copy.e_ident[EI_DATA]  != ELFDATA2LSB ||
-        eh_copy.e_type            != ET_EXEC      ||
+        (eh_copy.e_type != ET_EXEC && eh_copy.e_type != ET_DYN) ||
         eh_copy.e_machine         != EM_X86_64    ||
-        eh_copy.e_phnum == 0 || eh_copy.e_phoff == 0 || eh_copy.e_entry == 0) {
+        eh_copy.e_phnum == 0 || eh_copy.e_phoff == 0) {
         printf("loader: %s: invalid ELF header\n", path);
         kfree(hbuf); return 0;
     }
@@ -203,34 +223,59 @@ static uint64_t elf_load_streaming(const char* path,
 #define MAX_PHDRS 32
     Elf64_Phdr saved_phdrs[MAX_PHDRS];
     int nph = (eh_copy.e_phnum < MAX_PHDRS) ? eh_copy.e_phnum : MAX_PHDRS;
-    uint64_t elf_phdr_vaddr = 0;
-
-    for (int i = 0; i < nph; i++) {
-        const Elf64_Phdr* ph = (const Elf64_Phdr*)
+    for (int i = 0; i < nph; i++)
+        saved_phdrs[i] = *(const Elf64_Phdr*)
             (hbuf + eh_copy.e_phoff + (uint64_t)i * eh_copy.e_phentsize);
-        saved_phdrs[i] = *ph;
-        if (ph->p_type == 1 && elf_phdr_vaddr == 0) {
-            uint64_t load_base = ph->p_vaddr - ph->p_offset;
-            elf_phdr_vaddr = load_base + eh_copy.e_phoff;
-        }
-    }
     kfree(hbuf);
 
-    if (out_phdr_vaddr) *out_phdr_vaddr = elf_phdr_vaddr;
-    if (out_phnum)      *out_phnum      = (uint16_t)nph;
+    /* Load bias: ET_DYN images are linked at ~0 and placed at dyn_base. */
+    uint64_t min_vaddr = ~0ULL;
+    for (int i = 0; i < nph; i++)
+        if (saved_phdrs[i].p_type == PT_LOAD && saved_phdrs[i].p_vaddr < min_vaddr)
+            min_vaddr = saved_phdrs[i].p_vaddr;
+    if (min_vaddr == ~0ULL) { printf("loader: %s: no PT_LOAD\n", path); return 0; }
+    uint64_t bias = (eh_copy.e_type == ET_DYN) ? dyn_base - (min_vaddr & ~0xFFFULL) : 0;
 
-    /* Map all PT_LOAD pages */
+    uint64_t phdr_vaddr = 0;
     for (int i = 0; i < nph; i++) {
         const Elf64_Phdr* ph = &saved_phdrs[i];
-        if (ph->p_type != 1 || ph->p_memsz == 0) continue;
+        if (ph->p_type == PT_PHDR) phdr_vaddr = ph->p_vaddr;
+        if (ph->p_type == PT_LOAD && !phdr_vaddr &&
+            ph->p_offset <= eh_copy.e_phoff &&
+            eh_copy.e_phoff < ph->p_offset + ph->p_filesz)
+            phdr_vaddr = ph->p_vaddr + (eh_copy.e_phoff - ph->p_offset);
+        if (ph->p_type == PT_INTERP) {
+            unsigned int len = (unsigned int)ph->p_filesz;
+            if (len == 0 || len >= sizeof(out->interp)) {
+                printf("loader: %s: bad PT_INTERP\n", path); return 0;
+            }
+            if (vfs_read_at(path, out->interp, (unsigned int)ph->p_offset, len) < (int)len) {
+                printf("loader: %s: can't read PT_INTERP\n", path); return 0;
+            }
+            out->interp[len] = '\0';
+        }
+    }
+
+    out->entry = eh_copy.e_entry + bias;
+    out->phdr  = phdr_vaddr ? phdr_vaddr + bias : 0;
+    out->phnum = (uint16_t)nph;
+    out->bias  = bias;
+
+    /* Map all PT_LOAD pages. Adjacent segments often share a page (end of
+     * text / start of data): map each page only once. */
+    for (int i = 0; i < nph; i++) {
+        const Elf64_Phdr* ph = &saved_phdrs[i];
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
         if (ph->p_filesz > ph->p_memsz) {
             printf("loader: bad segment %d\n", i); return 0;
         }
-        uint64_t seg_start = ph->p_vaddr & ~0xFFFULL;
-        uint64_t seg_end   = (ph->p_vaddr + ph->p_memsz + 0xFFFULL) & ~0xFFFULL;
-        for (uint64_t v = seg_start; v < seg_end; v += 0x1000)
+        uint64_t seg_start = (ph->p_vaddr + bias) & ~0xFFFULL;
+        uint64_t seg_end   = (ph->p_vaddr + bias + ph->p_memsz + 0xFFFULL) & ~0xFFFULL;
+        for (uint64_t v = seg_start; v < seg_end; v += 0x1000) {
+            if (vmm_resolve_in(pd_phys, v)) continue;
             if (!alloc_user_page(v, VMM_PRESENT|VMM_WRITE|VMM_USER, r, pd_phys))
                 return 0;
+        }
     }
 
     /* Load each segment using vfs_read_at — reads directly from the
@@ -241,10 +286,10 @@ static uint64_t elf_load_streaming(const char* path,
 
     for (int i = 0; i < nph; i++) {
         const Elf64_Phdr* ph = &saved_phdrs[i];
-        if (ph->p_type != 1 || ph->p_filesz == 0) continue;
+        if (ph->p_type != PT_LOAD || ph->p_filesz == 0) continue;
 
         int nr = vfs_read_at(path,
-                             (void*)(uint64_t)ph->p_vaddr,
+                             (void*)(ph->p_vaddr + bias),
                              (unsigned int)ph->p_offset,
                              (unsigned int)ph->p_filesz);
         if (nr < (int)ph->p_filesz) {
@@ -256,14 +301,55 @@ static uint64_t elf_load_streaming(const char* path,
 
         /* Zero the BSS tail (memsz > filesz) */
         if (ph->p_memsz > ph->p_filesz) {
-            uint64_t bss_start = ph->p_vaddr + ph->p_filesz;
+            uint64_t bss_start = ph->p_vaddr + bias + ph->p_filesz;
             uint64_t bss_len   = ph->p_memsz - ph->p_filesz;
             memset((void*)bss_start, 0, (unsigned int)bss_len);
         }
     }
 
     vmm_switch(old_cr3);
-    return eh_copy.e_entry;
+    return 1;
+}
+
+/* Implemented in linux_syscall.c: resolve fake-symlink files in place. */
+extern void linux_follow_symlinks(char* path, unsigned int pathsz);
+
+/*
+ * elf_load_program: load a program and, if it is dynamically linked,
+ * its PT_INTERP loader (e.g. /lib/ld-musl-x86_64.so.1) too.
+ *   returns   the address to start executing (interpreter entry for
+ *             dynamic programs, program entry for static ones), 0 on error
+ *   at_*      values for the auxiliary vector: AT_PHDR/AT_PHNUM/AT_ENTRY
+ *             always describe the MAIN program; AT_BASE is the
+ *             interpreter's load address (0 if static).
+ */
+static uint64_t elf_load_program(const char* path,
+                                 user_resources_t* r, uint64_t pd_phys,
+                                 uint64_t* at_phdr, uint16_t* at_phnum,
+                                 uint64_t* at_entry, uint64_t* at_base) {
+    elf_info_t mainp;
+    if (!elf_map(path, LOADER_PIE_BASE, r, pd_phys, &mainp)) return 0;
+
+    *at_phdr  = mainp.phdr;
+    *at_phnum = mainp.phnum;
+    *at_entry = mainp.entry;
+    *at_base  = 0;
+
+    if (!mainp.interp[0]) return mainp.entry;     /* statically linked */
+
+    char ipath[256];
+    unsigned int i = 0;
+    for (; mainp.interp[i] && i < sizeof(ipath) - 1; i++) ipath[i] = mainp.interp[i];
+    ipath[i] = '\0';
+    linux_follow_symlinks(ipath, sizeof(ipath));
+
+    elf_info_t interp;
+    if (!elf_map(ipath, LOADER_INTERP_BASE, r, pd_phys, &interp)) {
+        printf("loader: %s: interpreter %s not loadable\n", path, mainp.interp);
+        return 0;
+    }
+    *at_base = interp.bias;
+    return interp.entry;
 }
 
 /* elf_load: load from an already-buffered ELF file (small binaries) */
@@ -346,6 +432,89 @@ static uint64_t flat_load(const unsigned char* buf,
  * Public API
  * ===================================================================== */
 
+/* =====================================================================
+ * Linux initial process stack
+ * =====================================================================
+ * Builds   argc | argv[] NULL | envp[] NULL | auxv pairs AT_NULL | strings
+ * in the CURRENTLY ACTIVE address space, ending at LOADER_STACK_TOP.
+ * The stack pages must already be mapped (see map_user_stack).
+ * Returns the initial rsp, or 0 if the arguments don't fit. */
+#define LOADER_STACK_PAGES   8              /* + 1 page at LOADER_STACK_TOP */
+#define LOADER_MAX_ARGS      256
+#define LOADER_MAX_ARGBYTES  (16 * 1024)
+
+static int map_user_stack(user_resources_t* r, uint64_t pd_phys) {
+    for (int i = -1; i < LOADER_STACK_PAGES; i++) {
+        if (!alloc_user_page(LOADER_STACK_PAGE - (uint64_t)(i * 0x1000),
+                             VMM_PRESENT | VMM_WRITE | VMM_USER, r, pd_phys))
+            return 0;
+    }
+    return 1;
+}
+
+static uint64_t build_linux_stack(const char* const* argv, int argc,
+                                  const char* const* envp, int envc,
+                                  uint64_t entry, uint64_t phdr_vaddr,
+                                  uint16_t phnum, uint64_t at_base) {
+    if (argc < 0 || argc > LOADER_MAX_ARGS) return 0;
+    if (envc < 0 || envc > LOADER_MAX_ARGS) return 0;
+
+    unsigned int total = 0;
+    for (int i = 0; i < argc; i++) total += (unsigned int)strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) total += (unsigned int)strlen(envp[i]) + 1;
+    if (total > LOADER_MAX_ARGBYTES) return 0;
+
+    uint8_t* top = (uint8_t*)LOADER_STACK_TOP;
+
+    /* Strings, copied top-down. Remember where each one lands. */
+    uint64_t argp[LOADER_MAX_ARGS];
+    uint64_t envpp[LOADER_MAX_ARGS];
+    for (int i = envc - 1; i >= 0; i--) {
+        unsigned int n = (unsigned int)strlen(envp[i]) + 1;
+        top -= n; memcpy(top, envp[i], n); envpp[i] = (uint64_t)top;
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        unsigned int n = (unsigned int)strlen(argv[i]) + 1;
+        top -= n; memcpy(top, argv[i], n); argp[i] = (uint64_t)top;
+    }
+
+    /* AT_RANDOM: 16 bytes. Zero keeps pointer-guard values predictable. */
+    top = (uint8_t*)((uint64_t)top & ~15ULL);
+    top -= 16;
+    memset(top, 0, 16);
+    uint64_t rand_ptr = (uint64_t)top;
+
+    uint64_t* sp = (uint64_t*)((uint64_t)top & ~15ULL);
+
+    /* Words pushed below: 13 auxv pairs (26) + envp NULL + envc
+       + argv NULL + argc slots + argc word. rsp must be 16-aligned at
+       entry with argc at [rsp], so pad above the aux vector if needed. */
+    uint64_t words = 26 + 1 + (uint64_t)envc + 1 + (uint64_t)argc + 1;
+    if (((uint64_t)sp - words * 8) & 15) *(--sp) = 0;
+
+    sp -= 2; sp[0] = 0;  sp[1] = 0;                  /* AT_NULL   */
+    sp -= 2; sp[0] = 6;  sp[1] = 4096;               /* AT_PAGESZ */
+    sp -= 2; sp[0] = 25; sp[1] = rand_ptr;           /* AT_RANDOM */
+    sp -= 2; sp[0] = 23; sp[1] = 0;                  /* AT_SECURE */
+    sp -= 2; sp[0] = 14; sp[1] = 0;                  /* AT_EGID   */
+    sp -= 2; sp[0] = 13; sp[1] = 0;                  /* AT_GID    */
+    sp -= 2; sp[0] = 12; sp[1] = 0;                  /* AT_EUID   */
+    sp -= 2; sp[0] = 11; sp[1] = 0;                  /* AT_UID    */
+    sp -= 2; sp[0] = 7;  sp[1] = at_base;            /* AT_BASE: dynamic loader */
+    sp -= 2; sp[0] = 9;  sp[1] = entry;              /* AT_ENTRY: main program  */
+    sp -= 2; sp[0] = 4;  sp[1] = sizeof(Elf64_Phdr); /* AT_PHENT  */
+    sp -= 2; sp[0] = 5;  sp[1] = phnum;              /* AT_PHNUM  */
+    sp -= 2; sp[0] = 3;  sp[1] = phdr_vaddr;         /* AT_PHDR   */
+
+    *(--sp) = 0;                                     /* envp NULL */
+    for (int i = envc - 1; i >= 0; i--) *(--sp) = envpp[i];
+    *(--sp) = 0;                                     /* argv NULL */
+    for (int i = argc - 1; i >= 0; i--) *(--sp) = argp[i];
+    *(--sp) = (uint64_t)argc;
+
+    return (uint64_t)sp;
+}
+
 int loader_run_args(const char* path, const char* extra_args);
 
 int loader_run(const char* path) {
@@ -353,6 +522,19 @@ int loader_run(const char* path) {
 }
 
 int loader_run_args(const char* path, const char* extra_args) {
+    /* `path` may be a symlink (busybox installs /bin/sh -> /bin/busybox).
+       Load the real file, but keep the name the user typed as argv[0]:
+       busybox picks the applet to run from argv[0]. */
+    const char* argv0 = path;
+    char real_path[256];
+    {
+        unsigned int i = 0;
+        for (; path[i] && i < sizeof(real_path) - 1; i++) real_path[i] = path[i];
+        real_path[i] = '\0';
+        linux_follow_symlinks(real_path, sizeof(real_path));
+        path = real_path;
+    }
+
     uint64_t pd_phys = vmm_new_user_pd();
     if (!pd_phys) { printf("loader: failed to create PD\n"); return -1; }
 
@@ -375,13 +557,15 @@ int loader_run_args(const char* path, const char* extra_args) {
     uint64_t entry = 0;
     uint64_t elf_phdr_vaddr = 0;
     uint16_t elf_phnum = 0;
+    uint64_t at_entry = 0, at_base = 0;
 
     int is_elf = (nm >= 4 && magic[0] == 0x7f && magic[1] == 'E' &&
                               magic[2] == 'L'  && magic[3] == 'F');
 
     if (is_elf) {
-        /* Streaming ELF load — never buffers the whole file */
-        entry = elf_load_streaming(path, r, pd_phys, &elf_phdr_vaddr, &elf_phnum);
+        /* Streaming ELF load (plus dynamic loader if PT_INTERP) */
+        entry = elf_load_program(path, r, pd_phys, &elf_phdr_vaddr, &elf_phnum,
+                                 &at_entry, &at_base);
     } else {
         /* Flat binary — small, buffer the whole thing */
         unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
@@ -403,131 +587,47 @@ int loader_run_args(const char* path, const char* extra_args) {
         return -1;
     }
 
-    /* Allocate 8 stack pages (32KB) — enough for musl startup.
-       Pages run from LOADER_STACK_PAGE down to LOADER_STACK_PAGE - 7*0x1000.
-       We also map the page AT LOADER_STACK_TOP so [rsp] is accessible. */
-    for (int _si = -1; _si < 8; _si++) {
-        if (!alloc_user_page(LOADER_STACK_PAGE - _si * 0x1000,
-                             VMM_PRESENT | VMM_WRITE | VMM_USER,
-                             r, pd_phys)) {
-            release_resources(r);
-            kfree(r);
-            vmm_free_user_pd(pd_phys);
-            return -1;
-        }
+    if (!map_user_stack(r, pd_phys)) {
+        release_resources(r);
+        kfree(r);
+        vmm_free_user_pd(pd_phys);
+        return -1;
     }
 
-    /*
-     * Set up the initial stack for musl/Linux ABI.
-     * musl's _start reads: [rsp] = argc, argv[], NULL, envp[], NULL, auxv[], AT_NULL
-     * We push this onto the user stack before spawning.
-     */
-    uint64_t old_cr3_s = vmm_current();
-    vmm_switch(pd_phys);
-
-    /*
-     * Build Linux ABI initial stack in user memory.
-     * Layout from rsp upward:
-     *   argc, argv[0], NULL, envp[0], NULL, auxv pairs..., AT_NULL
-     * Data area above aux vector: AT_RANDOM bytes, argv0 string.
-     *
-     * We start from LOADER_STACK_TOP and work downward.
-     * Use a large gap so __init_libc's sub rsp, 0x158 doesn't
-     * stomp on our TLS-related stack frames.
-     */
-
-    /* Start well below stack top to leave room for musl's init frames */
-    uint8_t* stk_top = (uint8_t*)LOADER_STACK_TOP;
-
-    /* Program name at top */
-    const char* _pname = path ? path : "hello2";
-    int _pname_len = 0;
-    while (_pname[_pname_len]) _pname_len++;
-    _pname_len++;
-    stk_top -= _pname_len;
-    for (int _pi2 = 0; _pi2 < _pname_len; _pi2++) stk_top[_pi2] = ((const uint8_t*)_pname)[_pi2];
-    uint8_t* _argv0_str = stk_top;
-
-    /* AT_RANDOM 16 bytes, 16-byte aligned.
-     * Use all-zero bytes so glibc's pointer guard = 0 and
-     * PTR_MANGLE/DEMANGLE is just ror/rol(17), always consistent. */
-    stk_top = (uint8_t*)((uint64_t)stk_top & ~15ULL);
-    stk_top -= 16;
-    for (int _ri2 = 0; _ri2 < 16; _ri2++)
-        stk_top[_ri2] = 0;
-    uint8_t* _rand_ptr = stk_top;
-
-    /* Extra args: write arg strings into the data area (above aux vector),
-     * right after _rand_ptr. We write them top-down via stk_top BEFORE
-     * building the aux/argv stack with sp. */
+    /* argv = { path, extra_args split on spaces... } */
     #define MAX_EXTRA_ARGS 16
-    uint8_t* arg_strs[MAX_EXTRA_ARGS];
-    int nargs = 0;
-    if (extra_args && extra_args[0]) {
+    char argbuf[512];
+    const char* argv[MAX_EXTRA_ARGS + 1];
+    int argc = 0;
+    argv[argc++] = argv0;
+    if (extra_args) {
+        unsigned int o = 0;
         const char* p = extra_args;
-        while (*p && nargs < MAX_EXTRA_ARGS) {
+        while (*p && argc < MAX_EXTRA_ARGS + 1) {
             while (*p == ' ') p++;
             if (!*p) break;
-            const char* start = p;
-            while (*p && *p != ' ') p++;
-            int alen = (int)(p - start) + 1;
-            stk_top -= alen;
-            for (int ai = 0; ai < alen - 1; ai++) stk_top[ai] = ((const uint8_t*)start)[ai];
-            stk_top[alen-1] = 0;
-            arg_strs[nargs++] = stk_top;
+            argv[argc++] = &argbuf[o];
+            while (*p && *p != ' ' && o < sizeof(argbuf) - 1) argbuf[o++] = *p++;
+            argbuf[o++] = '\0';
+            if (o >= sizeof(argbuf) - 1) break;
         }
     }
 
-    /* Align to 8 bytes */
-    stk_top = (uint8_t*)((uint64_t)stk_top & ~7ULL);
-
-    uint64_t* sp = (uint64_t*)stk_top;
-
-    /* The ABI requires rsp % 16 == 0 at process entry with argc exactly
-     * at [rsp]. We are about to push a fixed number of words:
-     *   12 auxv pairs (24) + envp NULL (1) + argv NULL (1)
-     *   + nargs argv slots + argv0 (1) + argc (1)  =  28 + nargs.
-     * If that would leave rsp misaligned, insert one padding word HERE,
-     * above the aux vector — never below argc, which must stay at [rsp]. */
-    {
-        int total_words = 28 + nargs;
-        if (((uint64_t)sp - (uint64_t)total_words * 8) & 15)
-            *(--sp) = 0;
+    uint64_t old_cr3_s = vmm_current();
+    vmm_switch(pd_phys);
+    uint64_t initial_rsp = build_linux_stack(argv, argc, 0, 0,
+                                             at_entry ? at_entry : entry,
+                                             elf_phdr_vaddr, elf_phnum, at_base);
+    vmm_switch(old_cr3_s);
+    if (!initial_rsp) {
+        release_resources(r);
+        kfree(r);
+        vmm_free_user_pd(pd_phys);
+        return -1;
     }
 
-    /* Aux vector */
-    sp -= 2; sp[0] = 0;  sp[1] = 0;              /* AT_NULL */
-    sp -= 2; sp[0] = 6;  sp[1] = 4096;            /* AT_PAGESZ */
-    sp -= 2; sp[0] = 25; sp[1] = (uint64_t)_rand_ptr; /* AT_RANDOM */
-    sp -= 2; sp[0] = 23; sp[1] = 0;               /* AT_SECURE */
-    sp -= 2; sp[0] = 14; sp[1] = 0;               /* AT_EGID */
-    sp -= 2; sp[0] = 13; sp[1] = 0;               /* AT_GID */
-    sp -= 2; sp[0] = 12; sp[1] = 0;               /* AT_EUID */
-    sp -= 2; sp[0] = 11; sp[1] = 0;               /* AT_UID */
-    sp -= 2; sp[0] = 9;  sp[1] = (uint64_t)entry; /* AT_ENTRY */
-    sp -= 2; sp[0] = 4;  sp[1] = sizeof(Elf64_Phdr); /* AT_PHENT */
-    sp -= 2; sp[0] = 5;  sp[1] = elf_phnum;       /* AT_PHNUM */
-    sp -= 2; sp[0] = 3;  sp[1] = elf_phdr_vaddr;  /* AT_PHDR */
 
-    /* NULL envp terminator */
-    *(--sp) = 0;
-    /* NULL argv terminator */
-    *(--sp) = 0;
-
-    /* argv[1..N] in reverse order */
-    for (int ai = nargs - 1; ai >= 0; ai--)
-        *(--sp) = (uint64_t)arg_strs[ai];
-
-    /* argv[0] */
-    *(--sp) = (uint64_t)_argv0_str;
-    /* argc — must be exactly at [rsp] at entry; alignment was
-     * handled by the padding word above the aux vector. */
-    *(--sp) = (uint64_t)(1 + nargs);
-
-    uint64_t initial_rsp = (uint64_t)sp;
-    vmm_switch(old_cr3_s);
-
-    int id = task_spawn_user(entry, initial_rsp, pd_phys, path);
+    int id = task_spawn_user(entry, initial_rsp, pd_phys, argv0);
 
     if (id < 0) {
         printf("loader: task_spawn_user failed\n");
@@ -760,7 +860,16 @@ int loader_fork(struct registers* frame) {
  * exec()
  * ===================================================================== */
 
-int loader_exec(const char* path, struct registers* frame) {
+/* Shared exec implementation.
+ *   linux_abi = 1: Linux execve — builds argc/argv/envp/auxv, maps a full
+ *                  stack, and refuses non-ELF files (returns -2 = ENOEXEC)
+ *                  so the caller can handle "#!" scripts.
+ *   linux_abi = 0: legacy int 0x80 exec — old behaviour (flat binaries
+ *                  allowed, bare one-page stack). */
+static int do_exec(const char* path,
+                   const char* const* argv, int argc,
+                   const char* const* envp, int envc,
+                   int linux_abi, struct registers* frame) {
     task_t* t = task_current();
 
     if (!t || !t->is_user || !t->user_data) {
@@ -790,11 +899,16 @@ int loader_exec(const char* path, struct registers* frame) {
     uint64_t entry = 0;
     uint64_t elf_phdr_vaddr = 0;
     uint16_t elf_phnum = 0;
+    uint64_t at_entry = 0, at_base = 0;
 
     int is_elf = (nm >= 4 && magic[0] == 0x7f && magic[1] == 'E' &&
                               magic[2] == 'L'  && magic[3] == 'F');
     if (is_elf) {
-        entry = elf_load_streaming(path, nr, new_pd, &elf_phdr_vaddr, &elf_phnum);
+        entry = elf_load_program(path, nr, new_pd, &elf_phdr_vaddr, &elf_phnum,
+                                 &at_entry, &at_base);
+    } else if (linux_abi) {
+        /* Not an ELF: never run arbitrary bytes as code. */
+        kfree(nr); vmm_free_user_pd(new_pd); return -2;
     } else {
         unsigned char* buf = (unsigned char*)kmalloc(LOADER_CODE_BYTES);
         if (!buf) { kfree(nr); vmm_free_user_pd(new_pd); return -1; }
@@ -810,14 +924,34 @@ int loader_exec(const char* path, struct registers* frame) {
         return -1;
     }
 
-    if (!alloc_user_page(LOADER_STACK_PAGE,
-                         VMM_PRESENT | VMM_WRITE | VMM_USER,
-                         nr,
-                         new_pd)) {
+    int stack_ok = linux_abi
+        ? map_user_stack(nr, new_pd)
+        : alloc_user_page(LOADER_STACK_PAGE, VMM_PRESENT | VMM_WRITE | VMM_USER,
+                          nr, new_pd);
+    if (!stack_ok) {
         release_resources(nr);
         kfree(nr);
         vmm_free_user_pd(new_pd);
         return -1;
+    }
+
+    /* Build the Linux stack BEFORE committing, so a failure leaves the
+       caller's image intact. argv/envp must be kernel copies: the old
+       address space is about to go away. */
+    uint64_t initial_rsp = LOADER_STACK_TOP;
+    if (linux_abi) {
+        uint64_t prev_cr3 = vmm_current();
+        vmm_switch(new_pd);
+        initial_rsp = build_linux_stack(argv, argc, envp, envc,
+                                        at_entry ? at_entry : entry,
+                                        elf_phdr_vaddr, elf_phnum, at_base);
+        vmm_switch(prev_cr3);
+        if (!initial_rsp) {
+            release_resources(nr);
+            kfree(nr);
+            vmm_free_user_pd(new_pd);
+            return -7;   /* E2BIG */
+        }
     }
 
     /*
@@ -847,7 +981,7 @@ int loader_exec(const char* path, struct registers* frame) {
     frame->rip    = entry;
     frame->cs     = 0x23;
     frame->rflags = 0x202;
-    frame->rsp    = LOADER_STACK_TOP;
+    frame->rsp    = initial_rsp;
     frame->ss     = 0x1B;
 
     frame->rax = 0;
@@ -857,6 +991,23 @@ int loader_exec(const char* path, struct registers* frame) {
     frame->rsi = 0;
     frame->rdi = 0;
     frame->rbp = 0;
+    frame->r8 = frame->r9 = frame->r10 = frame->r11 = 0;
+    frame->r12 = frame->r13 = frame->r14 = frame->r15 = 0;
+
+    /* Fresh image: no TLS until its libc sets one up via arch_prctl. */
+    t->fs_base = 0;
+    __asm__ volatile ("wrmsr" : : "c"(0xC0000100U), "a"(0), "d"(0));
 
     return 0;
+}
+
+int loader_exec(const char* path, struct registers* frame) {
+    return do_exec(path, 0, 0, 0, 0, 0, frame);
+}
+
+int loader_exec_argv(const char* path,
+                     const char* const* argv, int argc,
+                     const char* const* envp, int envc,
+                     struct registers* frame) {
+    return do_exec(path, argv, argc, envp, envc, 1, frame);
 }

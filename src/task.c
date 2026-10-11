@@ -12,7 +12,7 @@ extern void task_trampoline(void);
 extern void enter_user_mode(uint64_t user_rip, uint64_t user_rsp);
 extern void enter_user_resume(struct registers* frame);
 
-#define STACK_SIZE 8192
+#define STACK_SIZE 32768   /* per-task kernel stack; syscalls run on it */
 
 static inline void switch_pd(task_t* t) {
     /* Kernel tasks must always run on the real kernel PML4.
@@ -121,6 +121,21 @@ int task_spawn(task_entry_fn fn, const char* name) {
     return t->id;
 }
 
+/* ---- Per-task FS base (thread-local storage) ----------------------------
+   musl keeps its thread pointer in FS base. The MSR is global to the CPU,
+   so it must be saved/restored on every task switch or a task resumes with
+   another task's (or a zero) TLS pointer. */
+#define MSR_FS_BASE 0xC0000100U
+static inline uint64_t rd_fsbase(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_FS_BASE));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void wr_fsbase(uint64_t v) {
+    __asm__ volatile ("wrmsr" : : "c"(MSR_FS_BASE),
+                      "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
 static void user_entry_shim(void);
 
 int task_spawn_user(uint64_t user_rip, uint64_t user_rsp,
@@ -189,11 +204,18 @@ int task_clone_user(struct registers* frame, uint64_t pd_phys,
     t->state      = TASK_READY;
     t->is_user    = 1;
     name_copy(t->name, name ? name : "child", sizeof(t->name));
+    /* Child inherits the parent's TLS pointer (same address, copied memory). */
+    t->fs_base    = rd_fsbase();   /* we are running as the parent here */
 
     /* Copy the register frame onto the top of the child's kernel stack. */
     uint64_t sp = base + STACK_SIZE - FORK_FRAME_BYTES;
     memcpy((void*)sp, frame, FORK_FRAME_BYTES);
     t->resume_frame = sp;
+
+    /* fork(): the child gets a COPY of the parent's open file descriptors.
+       Must happen before the child can be scheduled. */
+    extern void linux_fdt_clone(task_t* parent, task_t* child);
+    linux_fdt_clone(current, t);
 
     t->rsp = task_init_stack(sp, fork_resume_shim);
 
@@ -245,6 +267,8 @@ void yield(void) {
 
     if (next->is_user) tss_set_kernel_stack(next->kstack_top);
     switch_pd(next);
+    prev->fs_base = rd_fsbase();
+    wr_fsbase(next->fs_base);
     task_switch(&prev->rsp, next->rsp);
     __asm__ volatile ("sti");
 }
@@ -252,6 +276,14 @@ void yield(void) {
 void task_exit(void) { task_exit_code(0); }
 
 void task_exit_code(int code) {
+    /* Close the process's files NOW, not when it is reaped: a parent
+       reading the other end of a pipe (e.g. the shell running $(cmd))
+       only sees EOF once every write end is closed, and it won't reap
+       the child until it has finished reading. Done before cli because
+       closing may flush buffered writes to disk. */
+    extern void linux_fdt_release(task_t* t);
+    if (current && current->is_user) linux_fdt_release(current);
+
     __asm__ volatile ("cli");
 
     current->exit_code  = code;
@@ -287,6 +319,7 @@ void task_exit_code(int code) {
     if (next->is_user) tss_set_kernel_stack(next->kstack_top);
     switch_pd(next);
 
+    wr_fsbase(next->fs_base);
     uint64_t dummy;
     task_switch(&dummy, next->rsp);
     for (;;) __asm__ volatile ("hlt");
@@ -314,49 +347,73 @@ void scheduler_tick(void) {
 
     if (next->is_user) tss_set_kernel_stack(next->kstack_top);
     switch_pd(next);
+    prev->fs_base = rd_fsbase();
+    wr_fsbase(next->fs_base);
     task_switch(&prev->rsp, next->rsp);
 }
 
 task_t* task_current(void) { return current; }
 
-static int has_any_child(void) {
+/* Does `t` match a waitpid() pid argument? (-1 / 0 = any child) */
+static int wait_match(task_t* t, int pid) {
+    return pid <= 0 || t->id == pid;
+}
+
+/* Any child (matching pid) that can still be waited for: alive, or exited
+ * but not yet reaped. Children already reaped by the parent don't count,
+ * even while they sit on the zombie list waiting to be freed. */
+static int has_any_child(int pid) {
     if (ready) {
         task_t* p = ready;
         do {
-            if (p->parent == current && p != current) return 1;
+            if (p->parent == current && p != current && wait_match(p, pid) &&
+                p->state != TASK_DEAD)
+                return 1;
             p = p->next;
         } while (p != ready);
     }
     for (task_t* z = zombie; z; z = z->next)
-        if (z->parent == current) return 1;
+        if (z->parent == current && !z->reaped_by_parent && wait_match(z, pid))
+            return 1;
     return 0;
 }
 
-static task_t* find_dead_child(void) {
+static task_t* find_dead_child(int pid) {
     for (task_t* z = zombie; z; z = z->next)
-        if (z->parent == current && z->has_exited && !z->reaped_by_parent)
+        if (z->parent == current && z->has_exited && !z->reaped_by_parent &&
+            wait_match(z, pid))
             return z;
     return 0;
 }
 
-int task_wait_child(int* status) {
+/* waitpid core.
+ *   pid    > 0: that child; -1 or 0: any child
+ *   nohang    : don't block (WNOHANG)
+ * Returns child pid, 0 if nohang and nothing has exited yet,
+ * or -1 if there is no such child (ECHILD). */
+int task_wait_child_ex(int pid, int nohang, int* status) {
     for (;;) {
         __asm__ volatile ("cli");
-        task_t* z = find_dead_child();
+        task_t* z = find_dead_child(pid);
         if (z) {
-            int pid = z->id;
+            int id = z->id;
             if (status) *status = z->exit_code;
             z->reaped_by_parent = 1;
             __asm__ volatile ("sti");
-            return pid;
+            return id;
         }
-        if (!has_any_child()) { __asm__ volatile ("sti"); return -1; }
+        if (!has_any_child(pid)) { __asm__ volatile ("sti"); return -1; }
+        if (nohang)              { __asm__ volatile ("sti"); return 0; }
         current->wait_any = 1;
         current->state    = TASK_BLOCKED;
         __asm__ volatile ("sti");
         yield();
         current->wait_any = 0;
     }
+}
+
+int task_wait_child(int* status) {
+    return task_wait_child_ex(-1, 0, status);
 }
 
 task_t* task_find_by_id(int id) {

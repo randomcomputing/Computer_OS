@@ -63,6 +63,9 @@ typedef struct __attribute__((packed)) {
 #define ATTR_VOLUME_ID  0x08
 #define ATTR_DIRECTORY  0x10
 #define ATTR_ARCHIVE    0x20
+/* Longest name a FAT32 long-filename entry can hold. Buffers used to be
+   64 bytes, which silently truncated apk's 69-char ".apk.<sha>" temp names. */
+#define FAT32_NAME_MAX  255
 #define ATTR_LFN        0x0F
 
 typedef struct __attribute__((packed)) {
@@ -738,6 +741,22 @@ static int dir_alloc_slots(unsigned int dir_cluster, int count,
             }
         }
 
+        /* No room for `count` contiguous slots in this cluster, so the new
+         * entry will land in a LATER cluster. Any 0x00 entries here mean
+         * "end of directory" to every reader, which would stop scanning
+         * before reaching it and make the new file invisible. Turn them
+         * into 0xE5 (free, keep scanning). */
+        {
+            int dirty = 0;
+            for (unsigned int i = 0; i < epc; i++) {
+                if ((unsigned char)entries[i].name[0] == 0x00) {
+                    entries[i].name[0] = (char)0xE5;
+                    dirty = 1;
+                }
+            }
+            if (dirty && dir_write_chunk(chunk, buf) < 0) { kfree(buf); return -1; }
+        }
+
         unsigned int real = real_cluster(chunk);
         unsigned int next = fat32_get_entry(real);
         if (is_end_of_chain(next)) break;
@@ -1015,13 +1034,13 @@ int fat32_resolve_dir(const char* path, unsigned int* out) {
 
     if (*path == '/') path++;
 
-    char comp[64];
+    char comp[FAT32_NAME_MAX + 1];
 
     while (*path) {
         int i = 0;
 
         while (*path && *path != '/') {
-            if (i < 63) comp[i++] = *path;
+            if (i < FAT32_NAME_MAX) comp[i++] = *path;
             path++;
         }
 
@@ -1054,7 +1073,7 @@ int fat32_resolve_parent(const char* path,
 
         int i = 0;
 
-        while (path[i] && i < 63) {
+        while (path[i] && i < FAT32_NAME_MAX) {
             basename_out[i] = path[i];
             i++;
         }
@@ -1076,7 +1095,7 @@ int fat32_resolve_parent(const char* path,
     int i = 0;
     const char* bn = path + slash + 1;
 
-    while (*bn && i < 63) {
+    while (*bn && i < FAT32_NAME_MAX) {
         basename_out[i++] = *bn++;
     }
 
@@ -1280,7 +1299,7 @@ int fat32_list_root(fat32_dirent_t* out, int max) {
 
 int fat32_read_file(const char* path, void* buf, unsigned int max) {
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
         printf("[fat32] read: resolve_parent FAILED for '%s'\n", path);
@@ -1344,7 +1363,7 @@ int fat32_read_file_at(const char* path, void* buf, unsigned int offset,
     if (len == 0) return 0;
 
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
     if (fat32_resolve_parent(path, &parent, basename) < 0) return -1;
 
     char raw83[11];
@@ -1401,9 +1420,63 @@ int fat32_read_file_at(const char* path, void* buf, unsigned int offset,
 // File write
 // ============================================================
 
+/* Insert a NEW directory entry for `name` into directory `parent`.
+ * `ne` supplies attr/size/cluster; its 11-byte short name is filled in here.
+ * Names that don't fit 8.3 get LFN entries plus a unique ~N short alias.
+ * Used for both files and directories. Returns 0 or -1. */
+static int dir_insert_named(unsigned int parent, const char* name, dirent_t* ne) {
+    char raw83[11];
+    build_83(name, raw83);
+
+    if (!needs_lfn(name)) {
+        memcpy(ne->name, raw83, 11);
+        unsigned int slot_chunk;
+        int slot_idx;
+        if (dir_alloc_slot(parent, &slot_chunk, &slot_idx) < 0) return -1;
+        return dir_put_entry(parent, slot_chunk, slot_idx, ne);
+    }
+
+    /* Find a unique ~N short alias — different long names can collide
+     * on the same alias (e.g. APKINDEX.aaaa.tar.gz / APKINDEX.bbbb.tar.gz
+     * both want APKIND~1.GZ), so probe until one is free. */
+    int t;
+    for (t = 1; t <= 999; t++) {
+        build_83_tail(name, t, raw83);
+        dirent_t dummy;
+        if (dir_find(parent, raw83, &dummy, 0, 0) < 0) break; /* free */
+    }
+    if (t > 999) return -1;
+    memcpy(ne->name, raw83, 11);
+
+    int namelen = (int)strlen(name);
+    int n_lfn   = lfn_entry_count(namelen);
+    int total   = n_lfn + 1;
+
+    unsigned int slot_chunk;
+    int slot_idx;
+    if (dir_alloc_slots(parent, total, &slot_chunk, &slot_idx) < 0)
+        return -1;
+
+    unsigned char* dbuf = dir_alloc_chunk();
+    if (!dbuf) return -1;
+    if (dir_read_chunk(slot_chunk, dbuf) < 0) { kfree(dbuf); return -1; }
+
+    unsigned char cksum = lfn_checksum(raw83);
+    unsigned int  epc   = dir_entries_per_cluster();
+    lfn_write_entries(dbuf, slot_idx, n_lfn, name, cksum, epc);
+
+    int short_idx = slot_idx + n_lfn;
+    if ((unsigned int)short_idx >= epc) { kfree(dbuf); return -1; }
+    ((dirent_t*)dbuf)[short_idx] = *ne;
+
+    int r = dir_write_chunk(slot_chunk, dbuf);
+    kfree(dbuf);
+    return r;
+}
+
 int fat32_write_file(const char* path, const void* data, unsigned int size) {
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
         return -1;
@@ -1499,47 +1572,8 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
          * alias here would orphan them. */
         memcpy(ne.name, existing.name, 11);
         if (dir_put_entry(parent, ex_chunk, ex_idx, &ne) < 0) return -1;
-    } else if (use_lfn) {
-        /* Find a unique ~N short alias — different long names can collide
-         * on the same alias (e.g. APKINDEX.aaaa.tar.gz / APKINDEX.bbbb.tar.gz
-         * both want APKIND~1.GZ), so probe until one is free. */
-        int t;
-        for (t = 1; t <= 999; t++) {
-            build_83_tail(basename, t, raw83);
-            dirent_t dummy;
-            if (dir_find(parent, raw83, &dummy, 0, 0) < 0) break; /* free */
-        }
-        if (t > 999) return -1;
-        memcpy(ne.name, raw83, 11);
-
-        int namelen = (int)strlen(basename);
-        int n_lfn   = lfn_entry_count(namelen);
-        int total   = n_lfn + 1;
-
-        unsigned int slot_chunk;
-        int slot_idx;
-        if (dir_alloc_slots(parent, total, &slot_chunk, &slot_idx) < 0)
-            return -1;
-
-        unsigned char* dbuf = dir_alloc_chunk();
-        if (!dbuf) return -1;
-        if (dir_read_chunk(slot_chunk, dbuf) < 0) { kfree(dbuf); return -1; }
-
-        unsigned char cksum = lfn_checksum(raw83);
-        unsigned int  epc   = dir_entries_per_cluster();
-        lfn_write_entries(dbuf, slot_idx, n_lfn, basename, cksum, epc);
-
-        int short_idx = slot_idx + n_lfn;
-        if ((unsigned int)short_idx < epc)
-            ((dirent_t*)dbuf)[short_idx] = ne;
-
-        if (dir_write_chunk(slot_chunk, dbuf) < 0) { kfree(dbuf); return -1; }
-        kfree(dbuf);
     } else {
-        unsigned int slot_chunk;
-        int slot_idx;
-        if (dir_alloc_slot(parent, &slot_chunk, &slot_idx) < 0) return -1;
-        if (dir_put_entry(parent, slot_chunk, slot_idx, &ne) < 0) return -1;
+        if (dir_insert_named(parent, basename, &ne) < 0) return -1;
     }
 
     if (fat32_flush_fat() < 0) return -1;
@@ -1553,7 +1587,7 @@ int fat32_write_file(const char* path, const void* data, unsigned int size) {
 
 int fat32_delete_file(const char* path) {
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
         return -1;
@@ -1596,7 +1630,7 @@ int fat32_delete_file(const char* path) {
 
 int fat32_mkdir(const char* path) {
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
         return -1;
@@ -1608,9 +1642,12 @@ int fat32_mkdir(const char* path) {
         return -1;
     }
 
+    /* Already exists? Match by long name or plain 8.3 name, like lookups do. */
     dirent_t dummy;
+    unsigned int ex_chunk;
+    int ex_idx;
 
-    if (dir_find(parent, raw83, &dummy, 0, 0) == 0) {
+    if (dir_find_lfn(parent, raw83, basename, &dummy, &ex_chunk, &ex_idx) == 0) {
         return -1;
     }
 
@@ -1656,21 +1693,14 @@ int fat32_mkdir(const char* path) {
     dirent_t ne;
 
     memset(&ne, 0, sizeof(ne));
-    memcpy(ne.name, raw83, 11);
 
     ne.attr = ATTR_DIRECTORY;
     ne.cluster_lo = c & 0xFFFF;
     ne.cluster_hi = (c >> 16) & 0xFFFF;
 
-    unsigned int slot_chunk;
-    int slot_idx;
-
-    if (dir_alloc_slot(parent, &slot_chunk, &slot_idx) < 0) {
-        fat32_set_entry(c, FAT32_FREE);
-        return -1;
-    }
-
-    if (dir_put_entry(parent, slot_chunk, slot_idx, &ne) < 0) {
+    /* Long names (e.g. "logrotate.d", "busybox-paths.d") get LFN entries
+     * instead of being chopped to 8.3. */
+    if (dir_insert_named(parent, basename, &ne) < 0) {
         fat32_set_entry(c, FAT32_FREE);
         return -1;
     }
@@ -1706,7 +1736,7 @@ static int rmdir_count_cb(dirent_t* e,
 
 int fat32_rmdir(const char* path) {
     unsigned int parent;
-    char basename[64];
+    char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
         return -1;
@@ -1758,7 +1788,7 @@ int fat32_rmdir(const char* path) {
 
 int fat32_cp(const char* src, const char* dst) {
     unsigned int s_parent;
-    char s_base[64];
+    char s_base[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(src, &s_parent, s_base) < 0) {
         return -1;
@@ -1826,7 +1856,7 @@ int fat32_cp(const char* src, const char* dst) {
 
 int fat32_mv(const char* src, const char* dst) {
     unsigned int s_parent;
-    char s_base[64];
+    char s_base[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(src, &s_parent, s_base) < 0) {
         return -1;
@@ -1875,7 +1905,7 @@ int fat32_mv(const char* src, const char* dst) {
     }
 
     unsigned int d_parent;
-    char d_base[64];
+    char d_base[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(dst_final, &d_parent, d_base) < 0) {
         return -1;

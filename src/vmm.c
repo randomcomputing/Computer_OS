@@ -245,7 +245,7 @@ int vmm_page_fault(struct registers* regs) {
        task_switch does a ret which corrupts the ISR stack.
        Instead redirect the saved RIP to a kernel trampoline that
        will call task_exit_code() safely after iretq. */
-    if (fault_addr < 0x8000000000000000ULL && t && t->is_user) {
+    if ((regs->err_code & 0x4) && t && t->is_user) {  /* U/S bit: fault came from ring 3 */
         printf("[vmm] segfault in task %d at 0x%llx (err=0x%llx rip=0x%llx rax=0x%llx rbx=0x%llx rsp=0x%llx)\n", t->id, fault_addr, regs->err_code, regs->rip, regs->rax, regs->rbx, regs->rsp);
         extern void task_exit_trampoline(void);
         regs->rip = (uint64_t)task_exit_trampoline;

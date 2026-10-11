@@ -65,9 +65,12 @@ int dns_resolve(const char* hostname, unsigned int* out_ip);
 #define FD_MAX       64
 #define FD_FLAG_USED 0x01
 #define FD_FLAG_DIR    0x02
+#define FD_FLAG_TTY    0x04   /* the console: keyboard in, screen out */
 #define FD_FLAG_PIPE_R 0x10
 #define FD_FLAG_PIPE_W 0x20
 #define FD_FLAG_SOCK   0x40
+#define FD_FLAG_CLOEXEC 0x80   /* close on execve (O_CLOEXEC / FD_CLOEXEC) */
+#define LX_O_CLOEXEC   0x80000 /* 02000000 */
 
 #define SOCK_MAX 8
 
@@ -80,10 +83,31 @@ typedef struct {
     unsigned int  wbuf_cap;    /* allocated capacity */
 } fd_entry_t;
 
-/* Stored in task->user_data extended area, or in a global for now */
-/* For simplicity, one global fd table (single-process model) */
-static fd_entry_t fd_table[FD_MAX];
+/* Each user process has its own fd table (task->fdt): created on first
+   use with stdin/stdout/stderr open, copied on fork, closed on exit.
+   boot_fd_table only serves code running outside a user task.
+   `fd_table` below expands to the CURRENT process's table, so every
+   existing `fd_table[fd]` use is per-process. */
+static fd_entry_t boot_fd_table[FD_MAX];
 static int        fd_table_init = 0;
+
+static fd_entry_t* fdt_new(void) {
+    fd_entry_t* t = (fd_entry_t*)kmalloc(sizeof(fd_entry_t) * FD_MAX);
+    if (!t) return 0;
+    memset(t, 0, sizeof(fd_entry_t) * FD_MAX);
+    t[0].flags = t[1].flags = t[2].flags = FD_FLAG_USED | FD_FLAG_TTY;
+    return t;
+}
+
+static fd_entry_t* cur_fdt(void) {
+    task_t* t = task_current();
+    if (t && t->is_user) {
+        if (!t->fdt) t->fdt = fdt_new();
+        if (t->fdt) return (fd_entry_t*)t->fdt;
+    }
+    return boot_fd_table;
+}
+#define fd_table (cur_fdt())
 
 /* Pipe pool — defined fully in the pipe section below; forward-declared
    here so sys_linux_close (which comes earlier) can reference it.     */
@@ -122,11 +146,11 @@ static uint64_t minimal_tls[16];  /* 128 bytes, zero-initialized */
 
 static void fdtable_init(void) {
     if (fd_table_init) return;
-    for (int i = 0; i < FD_MAX; i++) fd_table[i].flags = 0;
+    for (int i = 0; i < FD_MAX; i++) boot_fd_table[i].flags = 0;
     /* stdin=0, stdout=1, stderr=2 are always open */
-    fd_table[0].flags = FD_FLAG_USED;
-    fd_table[1].flags = FD_FLAG_USED;
-    fd_table[2].flags = FD_FLAG_USED;
+    boot_fd_table[0].flags = FD_FLAG_USED | FD_FLAG_TTY;
+    boot_fd_table[1].flags = FD_FLAG_USED | FD_FLAG_TTY;
+    boot_fd_table[2].flags = FD_FLAG_USED | FD_FLAG_TTY;
     fd_table_init = 1;
 
     /* Set up minimal TLS so %fs:0x0 is valid.
@@ -307,28 +331,101 @@ static int get_file_size(const char* abspath) {
 /* Syscall implementations                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Console terminal (the fds flagged FD_FLAG_TTY)                       */
+/* ------------------------------------------------------------------ */
+/* Kernel-side termios, as read/written by TCGETS/TCSETS (Linux's 36-byte
+ * kernel struct). Defaults: canonical line input (ICANON) + ISIG.
+ *
+ * ECHO is deliberately NOT reported even though the kernel echoes typed
+ * characters in canonical mode: busybox's line editor sees "ICANON without
+ * ECHO" and falls back to plain line input (prompt + fgets). Its full
+ * editor needs ANSI escape sequences, which this console doesn't draw yet.
+ * Once the console understands ESC[...] sequences, report ECHO here too. */
+#define LX_ICANON 0x0002
+#define LX_ECHO   0x0008
+#define LX_ENOTTY (-25)
+typedef struct {
+    uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[19];
+} lx_termios_t;
+static lx_termios_t tty_tio = {
+    0x0100,          /* ICRNL                  */
+    0x0005,          /* OPOST | ONLCR          */
+    0x00BF,          /* B38400 | CS8 | CREAD   */
+    0x0003,          /* ISIG | ICANON          */
+    0,
+    { 3, 0x1c, 0x7f, 0x15, 4, 0, 1, 0, 0x11, 0x13, 0x1a, 0, 0x12, 0x0f, 0x17, 0x16, 0, 0, 0 }
+};
+
+/* Canonical mode: a whole line is collected (with echo and backspace)
+ * before read() returns; leftover bytes are handed out on later reads. */
+static char         tty_line[512];
+static unsigned int tty_line_len = 0;
+static unsigned int tty_line_pos = 0;
+
+static char tty_getc_blocking(void) {
+    char c;
+    while (!keyboard_try_getchar(&c)) yield();
+    return c;
+}
+
+static int64_t tty_read(char* ubuf, uint64_t count) {
+    if (count == 0) return 0;
+    if (!user_range_ok(ubuf, count)) return EFAULT;
+
+    if (!(tty_tio.c_lflag & LX_ICANON)) {
+        /* Raw: block for one key, then return whatever else is queued. */
+        uint64_t n = 0;
+        char c = tty_getc_blocking();
+        for (;;) {
+            if ((unsigned char)c < 0x80) {            /* drop KEY_* codes */
+                if (tty_tio.c_lflag & LX_ECHO) con_putchar(c);
+                if (copy_to_user(ubuf + n, &c, 1) != 0) return n ? (int64_t)n : EFAULT;
+                n++;
+            }
+            if (n >= count || !keyboard_try_getchar(&c)) break;
+        }
+        if (n == 0) return tty_read(ubuf, count);    /* only special keys */
+        return (int64_t)n;
+    }
+
+    if (tty_line_pos >= tty_line_len) {
+        /* Collect a new line. */
+        tty_line_len = tty_line_pos = 0;
+        for (;;) {
+            char c = tty_getc_blocking();
+            if (c == '\r') c = '\n';                       /* ICRNL */
+            if (c == '\b' || c == 0x7f) {                  /* erase */
+                if (tty_line_len > 0) { tty_line_len--; con_putchar('\b'); }
+                continue;
+            }
+            if (c == 0x04) {                               /* Ctrl-D */
+                if (tty_line_len == 0) return 0;           /* EOF */
+                break;
+            }
+            if ((unsigned char)c >= 0x80) continue;        /* arrows etc. */
+            if (tty_line_len < sizeof(tty_line) - 1) {
+                tty_line[tty_line_len++] = c;
+                con_putchar(c);                            /* echo */
+            }
+            if (c == '\n') break;
+        }
+    }
+    uint64_t n = tty_line_len - tty_line_pos;
+    if (n > count) n = count;
+    if (copy_to_user(ubuf, tty_line + tty_line_pos, (unsigned int)n) != 0) return EFAULT;
+    tty_line_pos += (unsigned int)n;
+    return (int64_t)n;
+}
+
 /* sys_read (0) */
 static int64_t sys_linux_read(int fd, char* buf, uint64_t count) {
     if (!fd_valid(fd)) return EBADF;
     if (count == 0) return 0;
 
-    if (fd == 0) {
-        /* stdin: read from keyboard */
-        if (!user_range_ok(buf, count)) return EFAULT;
-        unsigned int i = 0;
-        while (i < (unsigned int)count) {
-            char c;
-            if (keyboard_try_getchar(&c)) {
-                if (copy_to_user(buf + i, &c, 1) != 0)
-                    return i > 0 ? (int64_t)i : EFAULT;
-                i++;
-                if (c == '\n') break;
-            } else {
-                yield();
-            }
-        }
-        return (int64_t)i;
-    }
+    if (fd_table[fd].flags & FD_FLAG_TTY) return tty_read(buf, count);
 
     /* Regular file */
     fd_entry_t* f = &fd_table[fd];
@@ -370,12 +467,121 @@ static int64_t sys_linux_read(int fd, char* buf, uint64_t count) {
     return (int64_t)to_read;
 }
 
+/* Console output with a small ANSI escape interpreter, so programs that
+ * colour their output (ls, grep --color, apk) or move the cursor render
+ * properly instead of printing "ESC[1;34m". Handles CSI ... m (SGR colours),
+ * K / J (erase), H / f (position), A B C D G (cursor moves); anything else
+ * is swallowed silently. */
+static int  ansi_state = 0;            /* 0 normal, 1 after ESC, 2 in CSI */
+static int  ansi_params[8];
+static int  ansi_nparams = 0;
+static int  ansi_fg = CON_LIGHT_GREY, ansi_bg = CON_BLACK, ansi_bold = 0;
+
+static void ansi_apply_color(void) {
+    int fg = ansi_fg;
+    if (ansi_bold && fg < 8) fg += 8;
+    con_set_color((enum con_color)fg, (enum con_color)ansi_bg);
+}
+
+static void ansi_erase_cells(int row, int from_col, int to_col) {
+    int cr, cc;
+    con_get_cursor(&cr, &cc);
+    for (int c = from_col; c < to_col; c++) {
+        con_set_cursor(row, c);
+        con_putchar_at_cursor(' ');
+    }
+    con_set_cursor(cr, cc);
+}
+
+static void ansi_csi(char final) {
+    static const int ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+    int p0 = ansi_nparams > 0 ? ansi_params[0] : 0;
+    int row, col;
+    con_get_cursor(&row, &col);
+    int rows = con_rows(), cols = con_cols();
+    int n = p0 > 0 ? p0 : 1;
+
+    switch (final) {
+    case 'm':
+        if (ansi_nparams == 0) { ansi_params[0] = 0; ansi_nparams = 1; }
+        for (int i = 0; i < ansi_nparams; i++) {
+            int v = ansi_params[i];
+            if (v == 0)                   { ansi_fg = CON_LIGHT_GREY; ansi_bg = CON_BLACK; ansi_bold = 0; }
+            else if (v == 1)              ansi_bold = 1;
+            else if (v == 22)             ansi_bold = 0;
+            else if (v >= 30 && v <= 37)  ansi_fg = ansi_to_vga[v - 30];
+            else if (v == 39)             ansi_fg = CON_LIGHT_GREY;
+            else if (v >= 40 && v <= 47)  ansi_bg = ansi_to_vga[v - 40];
+            else if (v == 49)             ansi_bg = CON_BLACK;
+            else if (v >= 90 && v <= 97)  ansi_fg = ansi_to_vga[v - 90] + 8;
+            else if (v >= 100 && v <= 107) ansi_bg = ansi_to_vga[v - 100] + 8;
+        }
+        ansi_apply_color();
+        break;
+    case 'K':                                     /* erase in line */
+        if (p0 == 0)      ansi_erase_cells(row, col, cols);
+        else if (p0 == 1) ansi_erase_cells(row, 0, col + 1);
+        else              ansi_erase_cells(row, 0, cols);
+        break;
+    case 'J':                                     /* erase in display */
+        if (p0 == 2 || p0 == 3) { con_clear(); con_set_cursor(0, 0); }
+        else if (p0 == 0) {
+            ansi_erase_cells(row, col, cols);
+            for (int r = row + 1; r < rows; r++) ansi_erase_cells(r, 0, cols);
+        }
+        break;
+    case 'H': case 'f': {
+        int r = (ansi_nparams > 0 && ansi_params[0] > 0) ? ansi_params[0] - 1 : 0;
+        int c = (ansi_nparams > 1 && ansi_params[1] > 0) ? ansi_params[1] - 1 : 0;
+        con_set_cursor(r, c);
+        break;
+    }
+    case 'A': con_set_cursor(row - n < 0 ? 0 : row - n, col); break;
+    case 'B': con_set_cursor(row + n >= rows ? rows - 1 : row + n, col); break;
+    case 'C': con_set_cursor(row, col + n >= cols ? cols - 1 : col + n); break;
+    case 'D': con_set_cursor(row, col - n < 0 ? 0 : col - n); break;
+    case 'G': con_set_cursor(row, n - 1 >= cols ? cols - 1 : n - 1); break;
+    default: break;                               /* unsupported: ignore */
+    }
+}
+
+static void tty_putc(char c) {
+    if (ansi_state == 0) {
+        if (c == 0x1b) { ansi_state = 1; return; }
+        con_putchar(c);
+        return;
+    }
+    if (ansi_state == 1) {
+        if (c == '[') { ansi_state = 2; ansi_nparams = 0; ansi_params[0] = 0; return; }
+        ansi_state = 0;                           /* ESC x: ignore both */
+        return;
+    }
+    /* CSI: digits ; digits ... final byte (0x40..0x7e) */
+    if (c >= '0' && c <= '9') {
+        if (ansi_nparams == 0) ansi_nparams = 1;
+        if (ansi_nparams <= 8)
+            ansi_params[ansi_nparams - 1] = ansi_params[ansi_nparams - 1] * 10 + (c - '0');
+        return;
+    }
+    if (c == ';') {
+        if (ansi_nparams == 0) ansi_nparams = 1;
+        if (ansi_nparams < 8) ansi_params[ansi_nparams++] = 0;
+        return;
+    }
+    if (c == '?' || c == '>' || c == '=') return; /* private-mode prefix */
+    if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7e) {
+        if (ansi_nparams > 8) ansi_nparams = 8;
+        ansi_csi(c);
+        ansi_state = 0;
+    }
+}
+
 /* sys_write (1) */
 static int64_t sys_linux_write(int fd, const char* buf, uint64_t count) {
     if (!fd_valid(fd)) return EBADF;
     if (count == 0) return 0;
 
-    if (fd == 1 || fd == 2) {
+    if (fd_table[fd].flags & FD_FLAG_TTY) {
         char chunk[128];
         uint64_t total = 0;
         while (total < count) {
@@ -383,7 +589,7 @@ static int64_t sys_linux_write(int fd, const char* buf, uint64_t count) {
             if (n > sizeof(chunk)) n = sizeof(chunk);
             if (copy_from_user(chunk, buf + total, n) != 0)
                 return total > 0 ? (int64_t)total : EFAULT;
-            for (unsigned int i = 0; i < n; i++) con_putchar(chunk[i]);
+            for (unsigned int i = 0; i < n; i++) tty_putc(chunk[i]);
             total += n;
         }
         return (int64_t)total;
@@ -515,7 +721,8 @@ open_path:;
         fd_table[fd].size = (unsigned int)sz;
     }
 
-    fd_table[fd].flags  = FD_FLAG_USED | (is_dir ? FD_FLAG_DIR : 0);
+    fd_table[fd].flags  = FD_FLAG_USED | (is_dir ? FD_FLAG_DIR : 0)
+                        | ((flags & LX_O_CLOEXEC) ? FD_FLAG_CLOEXEC : 0);
     fd_table[fd].offset = 0;
     fd_table[fd].wbuf     = 0;
     fd_table[fd].wbuf_cap = 0;
@@ -532,20 +739,19 @@ open_path:;
 }
 
 /* sys_close (3) */
-static int64_t sys_linux_close(int fd) {
-    if (fd < 3) return 0; /* never close stdin/out/err */
-    if (!fd_valid(fd)) return EBADF;
-    /* Decrement pipe refcount if applicable */
-    if (fd_table[fd].flags & FD_FLAG_PIPE_R) {
-        int pi = (int)fd_table[fd].offset;
+/* Release one open fd entry (any process's table). */
+static void fd_close_entry(fd_entry_t* e) {
+    if (!(e->flags & FD_FLAG_USED)) return;
+    if (e->flags & FD_FLAG_PIPE_R) {
+        int pi = (int)e->offset;
         if (pi >= 0 && pi < PIPE_MAX)
             if (--pipe_pool[pi].read_open < 0) pipe_pool[pi].read_open = 0;
-    } else if (fd_table[fd].flags & FD_FLAG_PIPE_W) {
-        int pi = (int)fd_table[fd].offset;
+    } else if (e->flags & FD_FLAG_PIPE_W) {
+        int pi = (int)e->offset;
         if (pi >= 0 && pi < PIPE_MAX)
             if (--pipe_pool[pi].write_open < 0) pipe_pool[pi].write_open = 0;
-    } else if (fd_table[fd].flags & FD_FLAG_SOCK) {
-        int si = (int)fd_table[fd].offset;
+    } else if (e->flags & FD_FLAG_SOCK) {
+        int si = (int)e->offset;
         if (si >= 0 && si < SOCK_MAX && sock_table[si].used) {
             /* tcp_close defined later — call via function pointer workaround.
                We'll just NULL the pointer; tcp_close is called in shutdown. */
@@ -553,12 +759,61 @@ static int64_t sys_linux_close(int fd) {
             sock_table[si].used = 0;
         }
     }
-    fd_table[fd].flags = 0;
+    e->flags = 0;
     /* Flush any buffered writes to disk */
-    fd_flush(&fd_table[fd]);
-    fd_table[fd].wbuf = 0;
-    fd_table[fd].wbuf_cap = 0;
+    fd_flush(e);
+    e->wbuf = 0;
+    e->wbuf_cap = 0;
+}
+
+static int64_t sys_linux_close(int fd) {
+    /* 0/1/2 are ordinary entries now: a shell closes and re-dups them to
+       build pipelines and redirections. */
+    if (!fd_valid(fd)) return EBADF;
+    fd_close_entry(&fd_table[fd]);
     return 0;
+}
+
+/* fork(): child gets a copy of the parent's table. Pipe ends gain a
+   reference; a pending write buffer is duplicated so the two processes
+   don't free the same buffer. Called from task_clone_user(). */
+void linux_fdt_clone(task_t* parent, task_t* child) {
+    child->fdt = 0;
+    if (!parent || !parent->fdt) return;   /* child starts with fresh 0/1/2 */
+    fd_entry_t* src = (fd_entry_t*)parent->fdt;
+    fd_entry_t* dst = (fd_entry_t*)kmalloc(sizeof(fd_entry_t) * FD_MAX);
+    if (!dst) return;
+    memcpy(dst, src, sizeof(fd_entry_t) * FD_MAX);
+    for (int i = 0; i < FD_MAX; i++) {
+        fd_entry_t* e = &dst[i];
+        if (!(e->flags & FD_FLAG_USED)) continue;
+        if (e->flags & FD_FLAG_PIPE_R) pipe_pool[e->offset].read_open++;
+        if (e->flags & FD_FLAG_PIPE_W) pipe_pool[e->offset].write_open++;
+        if (e->wbuf) {
+            char* nb = (char*)kmalloc(e->wbuf_cap ? e->wbuf_cap : 1);
+            if (nb) memcpy(nb, e->wbuf, e->wbuf_cap);
+            e->wbuf = nb;
+            if (!nb) e->wbuf_cap = 0;
+        }
+    }
+    child->fdt = dst;
+}
+
+/* Process exit: close everything it still had open, free the table. */
+void linux_fdt_release(task_t* t) {
+    if (!t || !t->fdt) return;
+    fd_entry_t* tab = (fd_entry_t*)t->fdt;
+    for (int i = 0; i < FD_MAX; i++) fd_close_entry(&tab[i]);
+    t->fdt = 0;
+    kfree(tab);
+}
+
+/* execve(): close every fd marked close-on-exec. */
+static void fdt_close_on_exec(void) {
+    fd_entry_t* tab = fd_table;
+    for (int i = 3; i < FD_MAX; i++)
+        if ((tab[i].flags & FD_FLAG_USED) && (tab[i].flags & FD_FLAG_CLOEXEC))
+            fd_close_entry(&tab[i]);
 }
 
 /* sys_stat (4) and sys_fstat (5) */
@@ -602,7 +857,7 @@ static int64_t sys_linux_stat(const char* upath, linux_stat_t* ustat) {
 
 static int64_t sys_linux_fstat(int fd, linux_stat_t* ustat) {
     if (!fd_valid(fd)) return EBADF;
-    if (fd == 0 || fd == 1 || fd == 2) {
+    if (fd_table[fd].flags & FD_FLAG_TTY) {
         linux_stat_t s; memset(&s, 0, sizeof(s));
         s.st_mode = 0020666; /* character device (tty) */
         s.st_rdev = 0x0501;  /* /dev/tty */
@@ -672,6 +927,13 @@ static int64_t sys_linux_brk(uint64_t new_brk) {
 /* sys_writev (20) */
 typedef struct { uint64_t iov_base; uint64_t iov_len; } iovec_t;
 
+/* One entry point per direction for every kind of fd (console, pipe,
+   socket, file). read/write/readv/writev/pread/pwrite all go through these,
+   so a redirected stdout (dup2 of a pipe onto fd 1) works no matter which
+   call the program happens to use. Defined after the pipe/socket code. */
+static int64_t fd_read_any(int fd, char* buf, uint64_t count);
+static int64_t fd_write_any(int fd, const char* buf, uint64_t count);
+
 static int64_t sys_linux_writev(int fd, const iovec_t* uiov, int iovcnt) {
     if (!fd_valid(fd)) return EBADF;
     int64_t total = 0;
@@ -679,11 +941,46 @@ static int64_t sys_linux_writev(int fd, const iovec_t* uiov, int iovcnt) {
         iovec_t iov;
         if (copy_from_user(&iov, uiov + i, sizeof(iov)) != 0) return EFAULT;
         if (iov.iov_len == 0) continue;
-        int64_t r = sys_linux_write(fd, (const char*)iov.iov_base, iov.iov_len);
-        if (r < 0) return r;
+        int64_t r = fd_write_any(fd, (const char*)iov.iov_base, iov.iov_len);
+        if (r < 0) return total > 0 ? total : r;
         total += r;
+        if ((uint64_t)r < iov.iov_len) break;     /* short write */
     }
     return total;
+}
+
+/* sys_readv (19) — musl's stdio reads through this. Stops at the first
+   short read, like Linux (a pipe/console read returns what's available). */
+static int64_t sys_linux_readv(int fd, const iovec_t* uiov, int iovcnt) {
+    if (!fd_valid(fd)) return EBADF;
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        iovec_t iov;
+        if (copy_from_user(&iov, uiov + i, sizeof(iov)) != 0) return EFAULT;
+        if (iov.iov_len == 0) continue;
+        int64_t r = fd_read_any(fd, (char*)iov.iov_base, iov.iov_len);
+        if (r < 0) return total > 0 ? total : r;
+        total += r;
+        if ((uint64_t)r < iov.iov_len) break;
+    }
+    return total;
+}
+
+/* sys_pread64 (17) / sys_pwrite64 (18): file I/O at an offset without
+   moving the file position. */
+static int64_t sys_linux_pread(int fd, char* buf, uint64_t count, int64_t off,
+                               int is_write) {
+    if (!fd_valid(fd)) return EBADF;
+    fd_entry_t* f = &fd_table[fd];
+    if (f->flags & (FD_FLAG_TTY | FD_FLAG_PIPE_R | FD_FLAG_PIPE_W | FD_FLAG_SOCK))
+        return -29; /* ESPIPE */
+    if (off < 0) return -22; /* EINVAL */
+    unsigned int saved = f->offset;
+    f->offset = (unsigned int)off;
+    int64_t r = is_write ? sys_linux_write(fd, buf, count)
+                         : sys_linux_read(fd, buf, count);
+    fd_table[fd].offset = saved;
+    return r;
 }
 
 /* sys_access (21) */
@@ -729,6 +1026,17 @@ static void lframe_to_regs(const linux_frame_t* lf, struct registers* r) {
     r->r8  = lf->r8;
     r->r9  = lf->r9;
     r->r10 = lf->r10;
+    /* Callee-saved user registers. linux_syscall_entry pushes
+       rbp, rbx, r12, r13, r14, r15 directly *below* the frame, and they
+       still hold the user's values at that point. A forked child must
+       get them back, or code like musl's fork() that keeps a pointer in
+       r12-r15 dereferences NULL in the child. */
+    const uint64_t* below = (const uint64_t*)lf;
+    r->rbp = below[-1];
+    r->r12 = below[-3];
+    r->r13 = below[-4];
+    r->r14 = below[-5];
+    r->r15 = below[-6];
     /* iretq-style CPU fields */
     r->rip    = lf->rcx;        /* rcx = saved user RIP on syscall entry */
     r->rsp    = lf->user_rsp;
@@ -763,28 +1071,151 @@ static int64_t sys_linux_fork(linux_frame_t* frame) {
     return (int64_t)child_pid;  /* -1 on failure */
 }
 
-/* sys_execve (59) */
-static int64_t sys_linux_execve(const char* upath, linux_frame_t* frame) {
-    char path[256];
-    if (copy_str_from_user(path, upath, sizeof(path)) < 0) return EFAULT;
+/* sys_execve (59)
+ *
+ * 1. Copy path, argv[] and envp[] out of user memory into one kernel arena
+ *    (the caller's address space is destroyed on success).
+ * 2. Resolve the path against the cwd and follow symlinks
+ *    (busybox installs /bin/sh etc. as symlinks to /bin/busybox).
+ * 3. If the file starts with "#!", run the interpreter instead:
+ *      argv = { interp, [optional arg], script-path, argv[1..] }
+ * 4. Load the ELF and build a real argc/argv/envp/auxv stack. */
+#define EXEC_ARENA     (32 * 1024)
+#define EXEC_MAX_ARGS  256
+#define EXEC_MAX_SHEBANG 4
 
-    struct registers regs;
-    lframe_to_regs(frame, &regs);
+typedef struct {
+    char*        buf;      /* string storage */
+    unsigned int used;
+    const char*  argv[EXEC_MAX_ARGS + 4];
+    int          argc;
+    const char*  envp[EXEC_MAX_ARGS];
+    int          envc;
+} exec_args_t;
 
-    int r = loader_exec(path, &regs);
-    if (r < 0) return ENOENT;
+static const char* exec_store(exec_args_t* a, const char* s, unsigned int n) {
+    if (a->used + n + 1 > EXEC_ARENA) return 0;
+    char* d = a->buf + a->used;
+    memcpy(d, s, n); d[n] = '\0';
+    a->used += n + 1;
+    return d;
+}
 
-    /* loader_exec rewrote regs.rip / rsp / rflags / rax.
-       Propagate those back into the linux_frame_t so sysretq
-       enters the new image correctly. */
-    regs_to_lframe(&regs, frame);
-    return regs.rax;  /* 0 on success — sysretq uses frame->rax */
+/* Copy a NULL-terminated user array of strings. */
+static int exec_copy_vec(exec_args_t* a, const char* const* uvec,
+                         const char** out, int max, int* count) {
+    *count = 0;
+    if (!uvec) return 0;
+    for (int i = 0; ; i++) {
+        uint64_t up;
+        if (copy_from_user(&up, &uvec[i], sizeof(up)) != 0) return EFAULT;
+        if (!up) break;
+        if (i >= max) return -7; /* E2BIG */
+        char tmp[4096];
+        if (copy_str_from_user(tmp, (const char*)up, sizeof(tmp)) < 0) return EFAULT;
+        const char* k = exec_store(a, tmp, (unsigned int)strlen(tmp));
+        if (!k) return -7;
+        out[i] = k;
+        *count = i + 1;
+    }
+    return 0;
+}
+
+/* cwd-relative -> absolute, then follow symlinks. */
+static int exec_resolve(const char* in, char* out, unsigned int outsz) {
+    if (vfs_resolve(in, out, outsz) < 0) return ENOENT;
+    follow_symlinks(out, outsz);
+    return 0;
+}
+
+static int64_t sys_linux_execve(const char* upath, const char* const* uargv,
+                                const char* const* uenvp, linux_frame_t* frame) {
+    exec_args_t* a = (exec_args_t*)kmalloc(sizeof(exec_args_t));
+    if (!a) return ENOMEM;
+    memset(a, 0, sizeof(*a));
+    a->buf = (char*)kmalloc(EXEC_ARENA);
+    if (!a->buf) { kfree(a); return ENOMEM; }
+
+    int64_t ret;
+    char upath_k[256];
+    char path[512];
+    if (copy_str_from_user(upath_k, upath, sizeof(upath_k)) < 0) { ret = EFAULT; goto out; }
+
+    ret = exec_copy_vec(a, uargv, a->argv, EXEC_MAX_ARGS, &a->argc);
+    if (ret) goto out;
+    ret = exec_copy_vec(a, uenvp, a->envp, EXEC_MAX_ARGS, &a->envc);
+    if (ret) goto out;
+    if (a->argc == 0) {                      /* argv may legally be empty */
+        a->argv[0] = exec_store(a, upath_k, (unsigned int)strlen(upath_k));
+        a->argc = 1;
+    }
+
+    if (exec_resolve(upath_k, path, sizeof(path)) < 0) { ret = ENOENT; goto out; }
+
+    for (int depth = 0; ; depth++) {
+        struct registers regs;
+        lframe_to_regs(frame, &regs);
+        int r = loader_exec_argv(path, a->argv, a->argc, a->envp, a->envc, &regs);
+        if (r == 0) {
+            fdt_close_on_exec();
+            /* loader rewrote rip/rsp/rflags/regs: hand them to sysret. */
+            regs_to_lframe(&regs, frame);
+            ret = 0;
+            goto out;
+        }
+        if (r == -7) { ret = -7; goto out; }        /* E2BIG */
+        if (r != -2) { ret = ENOENT; goto out; }    /* missing / bad ELF */
+
+        /* Not an ELF: is it a "#!" script? */
+        char hdr[128];
+        int n = vfs_read_file(path, hdr, sizeof(hdr) - 1);
+        if (n < 2 || hdr[0] != '#' || hdr[1] != '!' || depth >= EXEC_MAX_SHEBANG) {
+            ret = -8;   /* ENOEXEC */
+            goto out;
+        }
+        hdr[n] = '\0';
+        char* p = hdr + 2;
+        while (*p == ' ' || *p == '\t') p++;
+        char* interp = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        char* optarg = 0;
+        if (*p == ' ' || *p == '\t') {
+            *p++ = '\0';
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p && *p != '\n' && *p != '\r') {
+                optarg = p;                     /* Linux: rest of line = one arg */
+                while (*p && *p != '\n' && *p != '\r') p++;
+                while (p > optarg && (p[-1] == ' ' || p[-1] == '\t')) p--;
+            }
+        }
+        *p = '\0';
+        if (!*interp) { ret = -8; goto out; }
+
+        /* New argv: interp [optarg] script argv[1..] */
+        const char* nargv[EXEC_MAX_ARGS + 4];
+        int nc = 0;
+        nargv[nc++] = exec_store(a, interp, (unsigned int)strlen(interp));
+        if (optarg) nargv[nc++] = exec_store(a, optarg, (unsigned int)strlen(optarg));
+        nargv[nc++] = exec_store(a, path, (unsigned int)strlen(path));
+        for (int i = 1; i < a->argc && nc < EXEC_MAX_ARGS; i++) nargv[nc++] = a->argv[i];
+        for (int i = 0; i < nc; i++) if (!nargv[i]) { ret = -7; goto out; }
+        for (int i = 0; i < nc; i++) a->argv[i] = nargv[i];
+        a->argc = nc;
+
+        if (exec_resolve(interp, path, sizeof(path)) < 0) { ret = ENOENT; goto out; }
+    }
+
+out:
+    kfree(a->buf);
+    kfree(a);
+    return ret;
 }
 
 /* sys_exit (60) and sys_exit_group (231) */
 static int64_t sys_linux_exit(int code) {
     __asm__ volatile ("cli");
-    task_exit_code(code);
+    task_exit_code(code & 0xFF);   /* Linux keeps only the low 8 bits; negative
+                                      codes are reserved for "killed by signal" */
     /* task_exit_code switches away and never returns here.
        If it somehow does (shouldn't happen), halt this CPU. */
     __asm__ volatile ("cli; hlt");
@@ -793,13 +1224,16 @@ static int64_t sys_linux_exit(int code) {
 }
 
 /* sys_wait4 (61) */
+#define LX_WNOHANG 1
 static int64_t sys_linux_wait4(int pid, int* ustatus, int options) {
-    (void)pid; (void)options;
     int status = 0;
-    int child = task_wait_child(&status);
+    int child = task_wait_child_ex(pid, (options & LX_WNOHANG) != 0, &status);
     if (child < 0) return ECHILD;
+    if (child == 0) return 0;            /* WNOHANG: children still running */
     if (ustatus) {
-        int wstatus = (status & 0xFF) << 8;
+        /* Linux wait status: normal exit = code << 8; killed by a signal
+           = signal number in the low 7 bits (we record kills as -signo). */
+        int wstatus = (status < 0) ? ((-status) & 0x7F) : ((status & 0xFF) << 8);
         if (copy_to_user(ustatus, &wstatus, sizeof(int)) != 0) return EFAULT;
     }
     return child;
@@ -822,14 +1256,39 @@ static int64_t sys_linux_uname(linux_utsname_t* ubuf) {
 
 /* sys_fcntl (72) */
 static int64_t sys_linux_fcntl(int fd, int cmd, uint64_t arg) {
-    (void)arg;
     if (!fd_valid(fd)) return EBADF;
-    /* F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 */
-    if (cmd == 1) return 0;  /* FD_CLOEXEC flag = 0 */
-    if (cmd == 2) return 0;
-    if (cmd == 3) return 0;  /* O_RDONLY */
-    if (cmd == 4) return 0;
-    return EINVAL;
+    fd_entry_t* tab = fd_table;
+    switch (cmd) {
+    case 0:      /* F_DUPFD: lowest free fd >= arg */
+    case 1030: { /* F_DUPFD_CLOEXEC */
+        if (arg >= FD_MAX) return EINVAL;
+        int nfd = -1;
+        for (int i = (int)arg; i < FD_MAX; i++)
+            if (!(tab[i].flags & FD_FLAG_USED)) { nfd = i; break; }
+        if (nfd < 0) return EMFILE;
+        tab[nfd] = tab[fd];
+        tab[nfd].flags &= (unsigned char)~FD_FLAG_CLOEXEC;
+        if (cmd == 1030) tab[nfd].flags |= FD_FLAG_CLOEXEC;
+        if (tab[fd].flags & FD_FLAG_PIPE_R) pipe_pool[tab[fd].offset].read_open++;
+        if (tab[fd].flags & FD_FLAG_PIPE_W) pipe_pool[tab[fd].offset].write_open++;
+        return nfd;
+    }
+    case 1:      /* F_GETFD */
+        return (tab[fd].flags & FD_FLAG_CLOEXEC) ? 1 : 0;
+    case 2:      /* F_SETFD */
+        if (arg & 1) tab[fd].flags |= FD_FLAG_CLOEXEC;
+        else         tab[fd].flags &= (unsigned char)~FD_FLAG_CLOEXEC;
+        return 0;
+    case 3:      /* F_GETFL */
+        return 2;                     /* O_RDWR */
+    case 4:      /* F_SETFL (O_NONBLOCK etc.): accepted, ignored */
+        return 0;
+    case 5: case 6: case 7:   /* F_GETLK / F_SETLK / F_SETLKW: one user, no contention */
+    case 36: case 37: case 38: /* OFD locks */
+        return 0;
+    default:
+        return EINVAL;
+    }
 }
 
 /* sys_getdents64 (217) */
@@ -949,22 +1408,25 @@ static int fd_is_pipe(int fd) {
            (fd_table[fd].flags & (FD_FLAG_PIPE_R | FD_FLAG_PIPE_W));
 }
 
+/* Linux pipe semantics:
+ *   read : block only while the pipe is empty and a writer still exists;
+ *          once any bytes are available, return them (short read is fine).
+ *          Empty + no writers = EOF (0).
+ *   write: block while full; if no reader is left, fail with EPIPE
+ *          instead of waiting forever (e.g. `ls | head` after head exits). */
+#define LX_EPIPE (-32)
 static int64_t pipe_read(int fd, char* buf, uint64_t count) {
     int pi = (int)fd_table[fd].offset;
     if (pi < 0 || pi >= PIPE_MAX) return EBADF;
     pipe_t* p = &pipe_pool[pi];
+    if (count == 0) return 0;
+    while (p->used == 0) {
+        if (!p->write_open) return 0;     /* EOF: all writers closed */
+        yield();                          /* wait for data */
+    }
     uint64_t i = 0;
-    while (i < count) {
-        if (p->used == 0) {
-            if (!p->write_open) break;   /* EOF: writer closed */
-            yield();                      /* wait for data */
-            continue;
-        }
-        char c;
-        if (copy_from_user(&c, buf + i, 0) != 0) {
-            /* reading to kernel buf is fine — buf is user pointer */
-        }
-        c = (char)p->buf[p->head];
+    while (i < count && p->used > 0) {
+        char c = (char)p->buf[p->head];
         p->head = (p->head + 1) % PIPE_BUF_SIZE;
         p->used--;
         if (copy_to_user(buf + i, &c, 1) != 0) return i > 0 ? (int64_t)i : EFAULT;
@@ -979,7 +1441,8 @@ static int64_t pipe_write(int fd, const char* buf, uint64_t count) {
     pipe_t* p = &pipe_pool[pi];
     uint64_t i = 0;
     while (i < count) {
-        while (p->used == PIPE_BUF_SIZE) yield();  /* wait for space */
+        if (!p->read_open) return i > 0 ? (int64_t)i : LX_EPIPE;
+        if (p->used == PIPE_BUF_SIZE) { yield(); continue; }   /* wait for space */
         char c;
         if (copy_from_user(&c, buf + i, 1) != 0) return i > 0 ? (int64_t)i : EFAULT;
         p->buf[p->tail] = (uint8_t)c;
@@ -992,13 +1455,13 @@ static int64_t pipe_write(int fd, const char* buf, uint64_t count) {
 
 /* sys_pipe (22) / sys_pipe2 (293) */
 static int64_t sys_linux_pipe(int* upipefd, int flags) {
-    (void)flags;
+    unsigned char cx = (flags & LX_O_CLOEXEC) ? FD_FLAG_CLOEXEC : 0;
     int pi = pipe_alloc();
     if (pi < 0) return ENOMEM;
 
     int rfd = fd_alloc();
     if (rfd < 0) { pipe_pool[pi].read_open = pipe_pool[pi].write_open = 0; return EMFILE; }
-    fd_table[rfd].flags  = FD_FLAG_USED | FD_FLAG_PIPE_R;
+    fd_table[rfd].flags  = FD_FLAG_USED | FD_FLAG_PIPE_R | cx;
     fd_table[rfd].offset = (unsigned int)pi;
     fd_table[rfd].size   = 0;
 
@@ -1008,7 +1471,7 @@ static int64_t sys_linux_pipe(int* upipefd, int flags) {
         pipe_pool[pi].read_open = pipe_pool[pi].write_open = 0;
         return EMFILE;
     }
-    fd_table[wfd].flags  = FD_FLAG_USED | FD_FLAG_PIPE_W;
+    fd_table[wfd].flags  = FD_FLAG_USED | FD_FLAG_PIPE_W | cx;
     fd_table[wfd].offset = (unsigned int)pi;
     fd_table[wfd].size   = 0;
 
@@ -1027,6 +1490,7 @@ static int64_t sys_linux_dup(int oldfd) {
     int nfd = fd_alloc();
     if (nfd < 0) return EMFILE;
     fd_table[nfd] = fd_table[oldfd];
+    fd_table[nfd].flags &= (unsigned char)~FD_FLAG_CLOEXEC;
     /* if it's a pipe, bump open count */
     if (fd_table[oldfd].flags & (FD_FLAG_PIPE_R | FD_FLAG_PIPE_W)) {
         int pi = (int)fd_table[oldfd].offset;
@@ -1051,7 +1515,15 @@ static int64_t sys_linux_dup2(int oldfd, int newfd) {
             if (--pipe_pool[pi].write_open <= 0) pipe_pool[pi].write_open = 0;
         }
     }
+    /* flush/release whatever newfd was (files too, not just pipes) */
+    if (fd_table[newfd].flags & FD_FLAG_USED) {
+        fd_entry_t* e = &fd_table[newfd];
+        e->flags &= (unsigned char)~(FD_FLAG_PIPE_R | FD_FLAG_PIPE_W);
+        fd_flush(e);
+        e->flags = 0;
+    }
     fd_table[newfd] = fd_table[oldfd];
+    fd_table[newfd].flags &= (unsigned char)~FD_FLAG_CLOEXEC;
     if (fd_table[oldfd].flags & (FD_FLAG_PIPE_R | FD_FLAG_PIPE_W)) {
         int pi = (int)fd_table[oldfd].offset;
         if (fd_table[oldfd].flags & FD_FLAG_PIPE_R) pipe_pool[pi].read_open++;
@@ -1227,6 +1699,12 @@ static void follow_symlinks(char* path, unsigned int pathsz) {
         /* normalize (handles "..") */
         if (vfs_resolve(next, path, pathsz) < 0) return;
     }
+}
+
+/* Exported for the ELF loader (PT_INTERP paths such as
+   /lib/ld-musl-x86_64.so.1 may be symlinks). */
+void linux_follow_symlinks(char* path, unsigned int pathsz) {
+    follow_symlinks(path, pathsz);
 }
 
 /* sys_link (86) — hard link: copy the file */
@@ -1447,7 +1925,22 @@ static int64_t sys_linux_fsync(int fd) {
 /* sys_fchdir (81) */
 static int64_t sys_linux_fchdir(int fd) {
     if (!fd_valid(fd)) return EBADF;
-    return sys_linux_chdir((const char*)(uint64_t)0); /* can't call directly — use path */
+    fd_entry_t* d = &fd_table[fd];
+    if (!(d->flags & FD_FLAG_DIR)) return ENOTDIR;
+    /* The fd already holds a resolved absolute path; chdir to it directly.
+       (Used by apk before running package scripts: fchdir(root_fd).) */
+    if (vfs_chdir(d->path) < 0) return ENOENT;
+    return 0;
+}
+
+/* sys_chroot (161) — there is only one root here. apk calls chroot(".")
+   after fchdir(root_fd); when "." is already "/" that is a no-op, so accept
+   it. Anything else is unsupported. */
+static int64_t sys_linux_chroot(const char* upath) {
+    char path[512];
+    if (resolve_user_path(upath, path, sizeof(path)) < 0) return ENOENT;
+    if (path[0] == '/' && path[1] == '\0') return 0;
+    return -1; /* EPERM */
 }
 
 /* sys_getdents (78) — redirect to getdents64 */
@@ -2125,6 +2618,8 @@ static int64_t sys_linux_arch_prctl(int code, uint64_t addr) {
                 "a"((uint32_t)addr),
                 "d"((uint32_t)(addr >> 32))
         );
+        task_t* ct = task_current();
+        if (ct) ct->fs_base = addr;   /* remember it for task switches */
         return 0;
     }
     if (code == ARCH_GET_FS) {
@@ -2186,10 +2681,51 @@ static int64_t sys_linux_newfstatat(int dirfd, const char* upath,
 
 /* sys_ioctl (16) — stub for terminal ioctls */
 static int64_t sys_linux_ioctl(int fd, uint64_t req, uint64_t arg) {
-    (void)fd; (void)arg;
-    /* TCGETS/TCSETS — pretend we're a tty */
-    if (req == 0x5401 || req == 0x5402) return 0;
-    return EINVAL;
+    if (!fd_valid(fd)) return EBADF;
+    int is_tty = (fd_table[fd].flags & FD_FLAG_TTY) != 0;
+
+    switch (req) {
+    case 0x5401:                    /* TCGETS */
+        if (!is_tty) return LX_ENOTTY;
+        if (copy_to_user((void*)arg, &tty_tio, sizeof(tty_tio)) != 0) return EFAULT;
+        return 0;
+    case 0x5402: case 0x5403: case 0x5404: {   /* TCSETS / TCSETSW / TCSETSF */
+        if (!is_tty) return LX_ENOTTY;
+        lx_termios_t t;
+        if (copy_from_user(&t, (const void*)arg, sizeof(t)) != 0) return EFAULT;
+        tty_tio = t;
+        if (req == 0x5404) tty_line_len = tty_line_pos = 0;   /* flush input */
+        return 0;
+    }
+    case 0x5413: {                  /* TIOCGWINSZ — this is how musl's isatty() asks */
+        if (!is_tty) return LX_ENOTTY;
+        uint16_t ws[4] = { (uint16_t)con_rows(), (uint16_t)con_cols(), 0, 0 };
+        if (copy_to_user((void*)arg, ws, sizeof(ws)) != 0) return EFAULT;
+        return 0;
+    }
+    case 0x5414:                    /* TIOCSWINSZ */
+        return is_tty ? 0 : LX_ENOTTY;
+    case 0x540F: {                  /* TIOCGPGRP: one session; foreground = getpgrp() */
+        if (!is_tty) return LX_ENOTTY;
+        int pg = 1;
+        if (copy_to_user((void*)arg, &pg, sizeof(pg)) != 0) return EFAULT;
+        return 0;
+    }
+    case 0x5410:                    /* TIOCSPGRP */
+    case 0x540E:                    /* TIOCSCTTY */
+        return is_tty ? 0 : LX_ENOTTY;
+    case 0x541B: {                  /* FIONREAD: bytes ready without blocking */
+        int n = 0;
+        if (is_tty) n = (int)(tty_line_len - tty_line_pos);
+        if (copy_to_user((void*)arg, &n, sizeof(n)) != 0) return EFAULT;
+        return 0;
+    }
+    case 0x5421:                    /* FIONBIO */
+    case 0x5451: case 0x5450:       /* FIOCLEX / FIONCLEX */
+        return 0;
+    default:
+        return is_tty ? EINVAL : LX_ENOTTY;
+    }
 }
 
 /* sys_rt_sigaction (13), sys_rt_sigprocmask (14) — stub */
@@ -2212,6 +2748,18 @@ static int64_t sys_linux_rt_sigprocmask(int how, void* set, void* oset, uint64_t
     return 0;
 }
 
+static int64_t fd_read_any(int fd, char* buf, uint64_t count) {
+    if (fd_is_pipe(fd)) return pipe_read(fd, buf, count);
+    if (fd_is_sock(fd)) return sock_read(fd, buf, count);
+    return sys_linux_read(fd, buf, count);
+}
+
+static int64_t fd_write_any(int fd, const char* buf, uint64_t count) {
+    if (fd_is_pipe(fd)) return pipe_write(fd, buf, count);
+    if (fd_is_sock(fd)) return sock_write(fd, buf, count);
+    return sys_linux_write(fd, buf, count);
+}
+
 /* ------------------------------------------------------------------ */
 /* Main dispatcher                                                      */
 /* ------------------------------------------------------------------ */
@@ -2230,12 +2778,11 @@ void linux_syscall_handler(linux_frame_t* frame) {
 
     int64_t ret = ENOSYS;
     switch (num) {
-        case 0:   ret = fd_is_pipe((int)a1) ? pipe_read((int)a1,(char*)a2,a3)
-                      : fd_is_sock((int)a1) ? sock_read((int)a1,(char*)a2,a3)
-                                            : sys_linux_read((int)a1,(char*)a2,a3); break;
-        case 1:   ret = fd_is_pipe((int)a1) ? pipe_write((int)a1,(const char*)a2,a3)
-                      : fd_is_sock((int)a1) ? sock_write((int)a1,(const char*)a2,a3)
-                                            : sys_linux_write((int)a1,(const char*)a2,a3); break;
+        case 0:   ret = fd_read_any ((int)a1, (char*)a2, a3); break;
+        case 1:   ret = fd_write_any((int)a1, (const char*)a2, a3); break;
+        case 17:  ret = sys_linux_pread((int)a1, (char*)a2, a3, (int64_t)a4, 0); break; /* pread64 */
+        case 18:  ret = sys_linux_pread((int)a1, (char*)a2, a3, (int64_t)a4, 1); break; /* pwrite64 */
+        case 19:  ret = sys_linux_readv((int)a1, (const iovec_t*)a2, (int)a3); break;
         case 2:   ret = sys_linux_open   ((const char*)a1, (int)a2, (int)a3); break;
         case 3:   ret = sys_linux_close  ((int)a1); break;
         case 4:   ret = sys_linux_stat   ((const char*)a1, (linux_stat_t*)a2); break;
@@ -2273,6 +2820,12 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 22:  ret = sys_linux_pipe    ((int*)a1, 0); break;
         case 32:  ret = sys_linux_dup     ((int)a1); break;
         case 33:  ret = sys_linux_dup2    ((int)a1, (int)a2); break;
+        case 292: { /* dup3(old, new, flags) */
+            if ((int)a1 == (int)a2) { ret = EINVAL; break; }
+            ret = sys_linux_dup2((int)a1, (int)a2);
+            if (ret >= 0 && (a3 & LX_O_CLOEXEC)) fd_table[ret].flags |= FD_FLAG_CLOEXEC;
+            break;
+        }
         case 11:  ret = sys_linux_munmap (a1, a2); break;
         case 12:  ret = sys_linux_brk(a1); break;
         case 13:  ret = sys_linux_rt_sigaction((int)a1, (void*)a2, (void*)a3, a4); break;
@@ -2283,7 +2836,7 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 39:  ret = sys_linux_getpid (); break;
         case 57:  ret = sys_linux_fork   (frame); break;
         case 56:  ret = sys_linux_clone  (a1, a2, frame); break;
-        case 59:  ret = sys_linux_execve ((const char*)a1, frame); break;
+        case 59:  ret = sys_linux_execve ((const char*)a1, (const char* const*)a2, (const char* const*)a3, frame); break;
         case 82:  ret = sys_linux_rename ((const char*)a1, (const char*)a2); break;
         case 84:  ret = sys_linux_rmdir  ((const char*)a1); break;
         case 86:  ret = sys_linux_link   ((const char*)a1, (const char*)a2); break;
@@ -2410,6 +2963,7 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 77:  ret = sys_linux_ftruncate((int)a1,(int64_t)a2); break;
         case 78:  ret = sys_linux_getdents((int)a1,(void*)a2,(unsigned int)a3); break;
         case 81:  ret = sys_linux_fchdir((int)a1); break;
+        case 161: ret = sys_linux_chroot((const char*)a1); break;
         case 92:  ret = sys_linux_chown((const char*)a1,(int)a2,(int)a3); break;
         case 93:  ret = sys_linux_fchown((int)a1,(int)a2,(int)a3); break;
         case 94:  ret = sys_linux_lchown((const char*)a1,(int)a2,(int)a3); break;
@@ -2444,6 +2998,8 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 234: ret = sys_linux_kill((int)a1,(int)a3); break;  /* tgkill */
         case 235: ret = 0; break;  /* utimes stub */
         case 269: ret = sys_linux_faccessat((int)a1,(const char*)a2,(int)a3,(int)a4); break; /* faccessat */
+        case 186: { task_t* ct = task_current(); ret = ct ? ct->id : 1; break; } /* gettid */
+        case 439: ret = sys_linux_faccessat((int)a1,(const char*)a2,(int)a3,(int)a4); break; /* faccessat2 */
         case 270: {
             /* pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
              * Used by libfetch to wait for non-blocking connect to complete.

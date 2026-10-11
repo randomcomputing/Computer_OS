@@ -150,6 +150,14 @@ void gdt_init(void) {
     tss_flush();
 }
 
+extern uint64_t g_syscall_kernel_rsp;   /* syscall_asm.asm */
+
+/* Called on every switch to a user task. Both ring-3 entry paths must land
+   on *this task's* kernel stack: interrupts/int 0x80 use TSS.rsp0, and the
+   SYSCALL instruction uses g_syscall_kernel_rsp. Sharing one syscall stack
+   between tasks corrupts a blocked task's saved frame (e.g. parent in
+   wait4 while the forked child makes syscalls). */
 void tss_set_kernel_stack(uint64_t rsp0) {
     tss.rsp0 = rsp0;
+    g_syscall_kernel_rsp = rsp0;
 }

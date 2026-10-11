@@ -78,4 +78,13 @@ int loader_fork(struct registers* frame);
 // original image is left running.
 int loader_exec(const char* path, struct registers* frame);
 
+// Linux execve(): like loader_exec, but builds a proper Linux initial stack
+// (argc, argv, envp, auxv) from KERNEL copies of argv/envp. Only ELF files
+// are accepted. Returns 0 on success, -1 on failure, -2 if the file is not
+// an ELF (caller may treat it as a "#!" script), -7 if args are too large.
+int loader_exec_argv(const char* path,
+                     const char* const* argv, int argc,
+                     const char* const* envp, int envc,
+                     struct registers* frame);
+
 #endif

@@ -13,6 +13,7 @@ ASFLAGS = -f elf64
 CFLAGS  = -ffreestanding -fno-asynchronous-unwind-tables -fno-pie \
           -fno-stack-protector -nostdlib -nostdinc \
           -mcmodel=kernel -mno-red-zone \
+          -mno-sse -mno-sse2 -mno-mmx -mno-80387 \
           -Iinclude -c -std=c11
 
 LDFLAGS = -T linker.ld -nostdlib
@@ -252,15 +253,15 @@ $(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
 	mmd -i $(FAT32_IMG) ::usr
 	mmd -i $(FAT32_IMG) ::usr/lib
 	@printf "x86_64\n"  > /tmp/_apk_arch
-	@echo "http://151.101.2.132/alpine/v3.19/main" > /tmp/_apk_repos
-	@echo "http://151.101.2.132/alpine/v3.19/community" >> /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.20/main" > /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.20/community" >> /tmp/_apk_repos
 	@printf ""           > /tmp/_apk_world
 	@printf ""           > /tmp/_apk_installed
 	mcopy -i $(FAT32_IMG) /tmp/_apk_arch        ::etc/apk/arch
 	mcopy -i $(FAT32_IMG) /tmp/_apk_repos       ::etc/apk/repositories
 	mcopy -i $(FAT32_IMG) /tmp/_apk_world       ::etc/apk/world
 	mcopy -i $(FAT32_IMG) /tmp/_apk_installed   ::lib/apk/db/installed
-	@# Alpine signing key for v3.19
+	@# Alpine signing key (works across releases)
 	@if [ -f /tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub ]; then \
 	  mcopy -i $(FAT32_IMG) "/tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub" \
 	    "::etc/apk/keys/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"; \
@@ -271,10 +272,13 @@ $(FAT32_IMG): userprogs/hello.asm userprogs/count.asm \
 	@echo "151.101.2.132 dl-cdn.alpinelinux.org" >> /tmp/_hosts
 	mcopy -i $(FAT32_IMG) /tmp/_resolv.conf     ::etc/resolv.conf
 	mcopy -i $(FAT32_IMG) /tmp/_hosts           ::etc/hosts
+	@# /etc/os-release — lets fastfetch and friends show the OS name
+	@printf 'NAME="Computer OS"\nPRETTY_NAME="Computer OS (64-bit)"\nID=computeros\nVERSION_ID=0.1\n' > /tmp/_osrel
+	mcopy -i $(FAT32_IMG) /tmp/_osrel            ::etc/os-release
 	@echo "hosts: files" > /tmp/_nsswitch.conf
 	@echo "networks: files" >> /tmp/_nsswitch.conf
 	mcopy -i $(FAT32_IMG) /tmp/_nsswitch.conf   ::etc/nsswitch.conf
-	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts
+	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts /tmp/_osrel
 	@# --- apk.static binary ---
 	mcopy -i $(FAT32_IMG) apk.static           ::apk.static
 	@rm -f /tmp/_helloworld.txt /tmp/_readme.txt /tmp/_hello.bin /tmp/_count.bin
@@ -334,8 +338,8 @@ apk-fs:
 	-mmd -i $(FAT32_IMG) ::usr
 	-mmd -i $(FAT32_IMG) ::usr/lib
 	@printf "x86_64\n" > /tmp/_apk_arch
-	@echo "http://151.101.2.132/alpine/v3.19/main" > /tmp/_apk_repos
-	@echo "http://151.101.2.132/alpine/v3.19/community" >> /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.20/main" > /tmp/_apk_repos
+	@echo "http://151.101.2.132/alpine/v3.20/community" >> /tmp/_apk_repos
 	@printf "" > /tmp/_apk_world
 	@printf "" > /tmp/_apk_installed
 	-mcopy -oi $(FAT32_IMG) /tmp/_apk_arch      ::etc/apk/arch
@@ -350,7 +354,7 @@ apk-fs:
 	@echo "hosts: files" > /tmp/_nsswitch.conf
 	@echo "networks: files" >> /tmp/_nsswitch.conf
 	-mcopy -oi $(FAT32_IMG) /tmp/_nsswitch.conf ::etc/nsswitch.conf
-	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts /tmp/_nsswitch.conf
+	@rm -f /tmp/_apk_arch /tmp/_apk_repos /tmp/_apk_world /tmp/_apk_installed /tmp/_resolv.conf /tmp/_hosts /tmp/_osrel /tmp/_nsswitch.conf
 	mcopy -oi $(FAT32_IMG) apk.static          ::apk.static
 	@echo "Done. Run 'make' to rebuild disk.img with the new FAT32 image."
 

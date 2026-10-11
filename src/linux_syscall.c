@@ -365,10 +365,32 @@ static char         tty_line[512];
 static unsigned int tty_line_len = 0;
 static unsigned int tty_line_pos = 0;
 
-static char tty_getc_blocking(void) {
-    char c;
-    while (!keyboard_try_getchar(&c)) yield();
-    return c;
+/* Defined with the signal code further down. */
+static int signal_ready(task_t* t);
+
+/* Block for one key. Returns 0 on success, -1 if a signal became pending
+   (so the caller can return EINTR and let it be delivered). */
+static int tty_getc_blocking(char* out) {
+    while (!keyboard_try_getchar(out)) {
+        if (signal_ready(task_current())) return -1;
+        yield();
+    }
+    return 0;
+}
+
+/* Terminal special char -> signal. Called from the keyboard IRQ. Returns 1
+   if the char was consumed as a signal (ISIG) and must not be buffered. */
+#define LX_ISIG 0x0001
+void signal_raise(task_t* t, int signo);
+int tty_intr_char(char c) {
+    if (!(tty_tio.c_lflag & LX_ISIG)) return 0;     /* literal when ISIG off */
+    int sig = 0;
+    if (c == 0x03)      sig = 2;                     /* Ctrl-C -> SIGINT  */
+    else if (c == 0x1c) sig = 3;                     /* Ctrl-\ -> SIGQUIT */
+    else return 0;
+    task_t* t = task_current();
+    if (t && t->is_user) signal_raise(t, sig);
+    return 1;
 }
 
 static int64_t tty_read(char* ubuf, uint64_t count) {
@@ -378,7 +400,8 @@ static int64_t tty_read(char* ubuf, uint64_t count) {
     if (!(tty_tio.c_lflag & LX_ICANON)) {
         /* Raw: block for one key, then return whatever else is queued. */
         uint64_t n = 0;
-        char c = tty_getc_blocking();
+        char c;
+        if (tty_getc_blocking(&c) < 0) return EINTR;
         for (;;) {
             if ((unsigned char)c < 0x80) {            /* drop KEY_* codes */
                 if (tty_tio.c_lflag & LX_ECHO) con_putchar(c);
@@ -395,7 +418,11 @@ static int64_t tty_read(char* ubuf, uint64_t count) {
         /* Collect a new line. */
         tty_line_len = tty_line_pos = 0;
         for (;;) {
-            char c = tty_getc_blocking();
+            char c;
+            if (tty_getc_blocking(&c) < 0) {               /* interrupted */
+                tty_line_len = tty_line_pos = 0;           /* discard partial line */
+                return EINTR;
+            }
             if (c == '\r') c = '\n';                       /* ICRNL */
             if (c == '\b' || c == 0x7f) {                  /* erase */
                 if (tty_line_len > 0) { tty_line_len--; con_putchar('\b'); }
@@ -476,6 +503,11 @@ static int  ansi_state = 0;            /* 0 normal, 1 after ESC, 2 in CSI */
 static int  ansi_params[8];
 static int  ansi_nparams = 0;
 static int  ansi_fg = CON_LIGHT_GREY, ansi_bg = CON_BLACK, ansi_bold = 0;
+/* DECSC/DECRC (ESC 7 / ESC 8) saved cursor + rendition. apk's progress bar
+   saves the cursor, draws the bar, then restores to the line start and
+   clears, so each frame redraws in place instead of on a new line. */
+static int  ansi_saved_row = 0, ansi_saved_col = 0;
+static int  ansi_saved_fg = CON_LIGHT_GREY, ansi_saved_bg = CON_BLACK, ansi_saved_bold = 0;
 
 static void ansi_apply_color(void) {
     int fg = ansi_fg;
@@ -553,6 +585,17 @@ static void tty_putc(char c) {
     }
     if (ansi_state == 1) {
         if (c == '[') { ansi_state = 2; ansi_nparams = 0; ansi_params[0] = 0; return; }
+        if (c == '7') {                           /* DECSC: save cursor + attrs */
+            con_get_cursor(&ansi_saved_row, &ansi_saved_col);
+            ansi_saved_fg = ansi_fg; ansi_saved_bg = ansi_bg; ansi_saved_bold = ansi_bold;
+            ansi_state = 0; return;
+        }
+        if (c == '8') {                           /* DECRC: restore cursor + attrs */
+            con_set_cursor(ansi_saved_row, ansi_saved_col);
+            ansi_fg = ansi_saved_fg; ansi_bg = ansi_saved_bg; ansi_bold = ansi_saved_bold;
+            ansi_apply_color();
+            ansi_state = 0; return;
+        }
         ansi_state = 0;                           /* ESC x: ignore both */
         return;
     }
@@ -1243,11 +1286,13 @@ static int64_t sys_linux_wait4(int pid, int* ustatus, int options) {
 static int64_t sys_linux_uname(linux_utsname_t* ubuf) {
     linux_utsname_t u;
     memset(&u, 0, sizeof(u));
-    /* Claim to be Linux so musl/apk accept us */
-    memcpy(u.sysname,    "Linux",          6);
-    memcpy(u.nodename,   "computer-os",    12);
-    memcpy(u.release,    "6.1.0",          6);
-    memcpy(u.version,    "#1 Computer OS", 15);
+    /* Binary compatibility comes from the syscall ABI, not this string,
+       so we can brand it freely. `release` stays a valid modern version
+       in case a glibc binary (which checks it) ever runs. */
+    memcpy(u.sysname,    "Computer OS",       12);
+    memcpy(u.nodename,   "computer-os",       12);
+    memcpy(u.release,    "6.1.0-computeros",  17);
+    memcpy(u.version,    "#1 Computer OS",     15);
     memcpy(u.machine,    "x86_64",         7);
     memcpy(u.domainname, "(none)",         7);
     if (copy_to_user(ubuf, &u, sizeof(u)) != 0) return EFAULT;
@@ -1852,9 +1897,55 @@ static int64_t sys_linux_getgroups(int sz, int* ulist) {
 }
 static int64_t sys_linux_setgroups(int sz, const int* ulist) { (void)sz;(void)ulist; return 0; }
 
-/* sys_kill (62) / tkill (200) / tgkill (234) — stub, just SIGCHLD wakeup */
+/* ================================================================== */
+/* POSIX signals                                                       */
+/* ================================================================== */
+#define SIG_DFL_H  0
+#define SIG_IGN_H  1
+#define LX_SIGKILL 9
+#define LX_SIGSTOP 19
+#define LX_SIGINT  2
+#define LX_SIGQUIT 3
+#define LX_SIGCHLD 17
+
+/* Default action is to ignore (not terminate) for these. */
+static int sig_default_ignored(int s) {
+    return s == 17 || s == 18 || s == 23 || s == 28 ||     /* CHLD CONT URG WINCH */
+           s == 19 || s == 20 || s == 21 || s == 22;        /* STOP TSTP TTIN TTOU */
+}
+
+/* Make `signo` pending on `t`. Wakes a blocked task so it can return EINTR
+   from whatever it was waiting on and then take delivery. Non-static:
+   keyboard.c calls this for Ctrl-C. */
+void signal_raise(task_t* t, int signo) {
+    if (!t || signo <= 0 || signo >= 32) return;
+    /* SIGKILL / SIGSTOP can neither be caught nor blocked. */
+    if (signo == LX_SIGKILL) {
+        if (t->is_user) { t->sig_pending |= (1u << signo); }
+    }
+    t->sig_pending |= (1u << signo);
+    if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+}
+
+/* Does this task have a signal ready to deliver right now? */
+static int signal_ready(task_t* t) {
+    if (!t) return 0;
+    uint32_t deliverable = t->sig_pending & ~t->sig_blocked;
+    /* SIGKILL/SIGSTOP ignore the block mask. */
+    deliverable |= t->sig_pending & ((1u << LX_SIGKILL) | (1u << LX_SIGSTOP));
+    return deliverable != 0;
+}
+
 static int64_t sys_linux_kill(int pid, int sig) {
-    (void)pid; (void)sig; return 0;
+    if (sig == 0) return 0;                 /* existence check — say yes */
+    if (sig < 0 || sig >= 32) return EINVAL;
+    task_t* self = task_current();
+    /* pid <= 0 means "process group / all"; we have one group, so target self
+       (matches how the shell signals its own group). */
+    task_t* target = (pid > 0) ? task_find_by_id(pid) : self;
+    if (!target) return -3;                 /* ESRCH */
+    signal_raise(target, sig);
+    return 0;
 }
 
 /* sys_prctl (157) */
@@ -2065,6 +2156,21 @@ static int64_t sys_linux_sysinfo(linux_sysinfo_t* ubuf) {
 
 /* sys_sched_yield (24) */
 static int64_t sys_linux_sched_yield(void) { yield(); return 0; }
+
+/* sys_sched_getaffinity (204). Single CPU: report cpu 0 online.
+   Returns the number of bytes written to the mask, which is what musl's
+   sched_getaffinity / get_nprocs (used by fastfetch for the core count)
+   expects. */
+static int64_t sys_linux_sched_getaffinity(int pid, unsigned int len, void* umask) {
+    (void)pid;
+    if (!umask || len == 0) return EINVAL;
+    unsigned int n = len < 128 ? len : 128;   /* cap the zero-fill */
+    unsigned char mask[128];
+    memset(mask, 0, n);
+    mask[0] = 0x01;                            /* cpu 0 present */
+    if (copy_to_user(umask, mask, n) != 0) return EFAULT;
+    return (int64_t)n;
+}
 
 /* sys_madvise (28), msync (26), mincore (27) — stubs */
 static int64_t sys_linux_madvise(uint64_t a, uint64_t l, int adv) {
@@ -2729,23 +2835,153 @@ static int64_t sys_linux_ioctl(int fd, uint64_t req, uint64_t arg) {
 }
 
 /* sys_rt_sigaction (13), sys_rt_sigprocmask (14) — stub */
+/* struct kernel_sigaction (x86_64): handler@0, flags@8, restorer@16, mask@24 */
+typedef struct { uint64_t handler, flags, restorer, mask; } lx_sigaction_t;
+
 static int64_t sys_linux_rt_sigaction(int sig, void* act, void* oact, uint64_t sz) {
-    (void)sig; (void)sz;
+    (void)sz;
+    task_t* t = task_current();
+    if (!t || sig <= 0 || sig >= 32) return EINVAL;
     if (oact) {
-        /* Zero out old action */
-        char zero[32]; memset(zero, 0, sizeof(zero));
-        copy_to_user(oact, zero, 32);
+        lx_sigaction_t old = {0};
+        old.handler  = t->sig_handlers[sig];
+        old.restorer = t->sig_restorer;
+        if (copy_to_user(oact, &old, sizeof(old)) != 0) return EFAULT;
     }
-    (void)act;
+    if (act) {
+        lx_sigaction_t na;
+        if (copy_from_user(&na, act, sizeof(na)) != 0) return EFAULT;
+        /* SIGKILL and SIGSTOP cannot have their disposition changed. */
+        if (sig != LX_SIGKILL && sig != LX_SIGSTOP) {
+            t->sig_handlers[sig] = na.handler;
+            if (na.restorer) t->sig_restorer = na.restorer;
+        }
+    }
     return 0;
 }
+
 static int64_t sys_linux_rt_sigprocmask(int how, void* set, void* oset, uint64_t sz) {
-    (void)how; (void)set; (void)sz;
+    (void)sz;
+    task_t* t = task_current();
+    if (!t) return EINVAL;
     if (oset) {
-        char zero[8]; memset(zero, 0, 8);
-        copy_to_user(oset, zero, 8);
+        uint64_t cur = t->sig_blocked;
+        if (copy_to_user(oset, &cur, 8) != 0) return EFAULT;
+    }
+    if (set) {
+        uint64_t v;
+        if (copy_from_user(&v, set, 8) != 0) return EFAULT;
+        uint32_t m = (uint32_t)v;
+        if (how == 0)      t->sig_blocked |= m;        /* SIG_BLOCK   */
+        else if (how == 1) t->sig_blocked &= ~m;       /* SIG_UNBLOCK */
+        else if (how == 2) t->sig_blocked = m;         /* SIG_SETMASK */
+        /* Never block the uncatchable signals. */
+        t->sig_blocked &= ~((1u << LX_SIGKILL) | (1u << LX_SIGSTOP));
     }
     return 0;
+}
+
+/* Signal frame pushed onto the user stack when invoking a custom handler.
+   Layout is private to this kernel: deliver pushes it, rt_sigreturn reads
+   it back. `ret_addr` sits at the lowest address so the handler's final
+   `ret` pops it and lands in the restorer, which calls rt_sigreturn(15). */
+typedef struct {
+    uint64_t ret_addr;                                  /* = sa_restorer      */
+    uint64_t r8,r9,r10,r11,r12,r13,r14,r15;
+    uint64_t rdi,rsi,rbp,rbx,rdx,rax,rcx;
+    uint64_t rip, rflags, rsp;
+    uint64_t blocked;                                   /* mask to restore    */
+    uint64_t signo;
+} lx_sigframe_t;
+
+/* The six callee-saved user registers are pushed by linux_syscall_entry just
+   below the linux_frame_t; index them the same way loader_fork does. */
+static inline uint64_t* csaved(linux_frame_t* f) { return (uint64_t*)f; }
+
+/* Deliver at most one pending signal by rewriting `frame` so sysret enters
+   either the handler (custom) or, for SIG_DFL/terminate, the task dies here.
+   Called at the end of every syscall, after frame->rax is set. */
+void deliver_signals(linux_frame_t* frame) {
+    task_t* t = task_current();
+    if (!t || !t->is_user) return;
+    if (!signal_ready(t)) return;
+
+    uint32_t ready = (t->sig_pending & ~t->sig_blocked)
+                   | (t->sig_pending & ((1u<<LX_SIGKILL)|(1u<<LX_SIGSTOP)));
+    int sig = 0;
+    for (int i = 1; i < 32; i++) if (ready & (1u << i)) { sig = i; break; }
+    if (!sig) return;
+    t->sig_pending &= ~(1u << sig);
+
+    uint64_t h = t->sig_handlers[sig];
+
+    if (h == SIG_IGN_H || (h == SIG_DFL_H && sig_default_ignored(sig)))
+        return;                                         /* ignore */
+
+    if (h == SIG_DFL_H || sig == LX_SIGKILL) {
+        /* Default action: terminate. Exit status = 128 + signo (shell view). */
+        __asm__ volatile ("cli");
+        task_exit_code(128 + sig);
+        for (;;) __asm__ volatile ("hlt");              /* never returns */
+    }
+
+    /* Custom handler: build a signal frame on the user stack. */
+    uint64_t* cs = csaved(frame);
+    uint64_t sp = frame->user_rsp;
+    sp -= 128;                                          /* skip the red zone */
+    sp &= ~15ULL;
+    sp -= sizeof(lx_sigframe_t);
+    /* Entry ABI: on `call`, (rsp % 16) == 0 after the return addr is pushed,
+       i.e. rsp points at ret_addr and (rsp+8) % 16 == 0. */
+    if (((sp + 8) & 15) != 0) sp -= 8;
+
+    lx_sigframe_t sf;
+    sf.ret_addr = t->sig_restorer;
+    sf.rip = frame->rcx; sf.rflags = frame->r11; sf.rsp = frame->user_rsp;
+    sf.rax = frame->rax; sf.rbx = frame->rbx; sf.rcx = frame->rcx;
+    sf.rdx = frame->rdx; sf.rsi = frame->rsi; sf.rdi = frame->rdi;
+    sf.r8 = frame->r8; sf.r9 = frame->r9; sf.r10 = frame->r10; sf.r11 = frame->r11;
+    sf.rbp = cs[-1]; sf.r12 = cs[-3]; sf.r13 = cs[-4]; sf.r14 = cs[-5]; sf.r15 = cs[-6];
+    sf.blocked = t->sig_blocked;
+    sf.signo = sig;
+
+    if (copy_to_user((void*)sp, &sf, sizeof(sf)) != 0) {
+        /* Can't push the frame (bad stack) — fall back to killing the task. */
+        __asm__ volatile ("cli");
+        task_exit_code(128 + sig);
+        for (;;) __asm__ volatile ("hlt");
+    }
+
+    /* Block this signal while its handler runs (classic POSIX behaviour). */
+    t->sig_blocked |= (1u << sig);
+
+    /* Enter the handler: rip=handler, rdi=signo, rsp at the frame. */
+    frame->rcx      = h;             /* sysret uses rcx as the new rip        */
+    frame->rdi      = (uint64_t)sig; /* handler arg1                          */
+    frame->user_rsp = sp;
+    frame->r11      = frame->r11 | 0x200;   /* ensure IF set in handler       */
+}
+
+/* sys_rt_sigreturn (15): undo deliver_signals — restore the interrupted
+   context from the signal frame at the top of the user stack. */
+static int64_t sys_linux_rt_sigreturn(linux_frame_t* frame) {
+    task_t* t = task_current();
+    /* After the handler's `ret` popped ret_addr, user_rsp points just past
+       it, at the saved-register area. Read the frame from one word back. */
+    uint64_t sp = frame->user_rsp - 8;
+    lx_sigframe_t sf;
+    if (copy_from_user(&sf, (void*)sp, sizeof(sf)) != 0) return EFAULT;
+
+    frame->rcx = sf.rip;            /* resume rip   */
+    frame->r11 = sf.rflags;         /* resume flags */
+    frame->user_rsp = sf.rsp;       /* resume rsp   */
+    frame->rax = sf.rax; frame->rbx = sf.rbx;
+    frame->rdx = sf.rdx; frame->rsi = sf.rsi; frame->rdi = sf.rdi;
+    frame->r8 = sf.r8; frame->r9 = sf.r9; frame->r10 = sf.r10;
+    uint64_t* cs = csaved(frame);
+    cs[-1] = sf.rbp; cs[-3] = sf.r12; cs[-4] = sf.r13; cs[-5] = sf.r14; cs[-6] = sf.r15;
+    if (t) t->sig_blocked = (uint32_t)sf.blocked;
+    return (int64_t)sf.rax;         /* frame->rax already set; keep it        */
 }
 
 static int64_t fd_read_any(int fd, char* buf, uint64_t count) {
@@ -2829,6 +3065,7 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 11:  ret = sys_linux_munmap (a1, a2); break;
         case 12:  ret = sys_linux_brk(a1); break;
         case 13:  ret = sys_linux_rt_sigaction((int)a1, (void*)a2, (void*)a3, a4); break;
+        case 15:  ret = sys_linux_rt_sigreturn(frame); break;  /* undo deliver_signals */
         case 14:  ret = sys_linux_rt_sigprocmask((int)a1,(void*)a2,(void*)a3,a4); break;
         case 16:  ret = sys_linux_ioctl  ((int)a1, a2, a3); break;
         case 20:  ret = sys_linux_writev ((int)a1, (const iovec_t*)a2, (int)a3); break;
@@ -2908,6 +3145,8 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 334: ret = 0; break;  /* rseq — stub */
         case 435: ret = 0; break;  /* clone3 — stub */
         case 24:  ret = sys_linux_sched_yield(); break;
+        case 203: ret = 0; break; /* sched_setaffinity — accept */
+        case 204: ret = sys_linux_sched_getaffinity((int)a1,(unsigned int)a2,(void*)a3); break;
         case 26:  ret = sys_linux_msync(a1, a2, (int)a3); break;
         case 28:  ret = sys_linux_madvise(a1, a2, (int)a3); break;
         case 35:  ret = sys_linux_nanosleep((const void*)a1, (void*)a2); break;
@@ -3069,7 +3308,8 @@ void linux_syscall_handler(linux_frame_t* frame) {
 
     frame->rax = (uint64_t)ret;
 
-
+    /* Take delivery of any pending signal before returning to user mode. */
+    deliver_signals(frame);
 }
 
 /* ------------------------------------------------------------------ */

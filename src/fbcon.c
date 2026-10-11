@@ -40,6 +40,7 @@ static int g_cols;
 static int g_rows;
 static int g_cur_row;
 static int g_cur_col;
+static int g_wrap_pending;  /* VT-style deferred wrap: cursor parked in last column */
 static unsigned char g_fg = 7;
 static unsigned char g_bg = 0;
 static int g_ready = 0;
@@ -171,6 +172,15 @@ static void fb_set_color(enum con_color fg, enum con_color bg) {
 }
 
 static void put_glyph(char c) {
+    /* Deferred wrap: the previous glyph filled the last column but we did
+       not advance the line. Do it now, just before printing the next one,
+       so a \r arriving in between can still return to this same line
+       (that is what lets apk's progress bar redraw in place). */
+    if (g_wrap_pending) {
+        newline();
+        g_wrap_pending = 0;
+    }
+
     cell_t cell;
     cell.ch = (unsigned char)c;
     cell.fg = g_fg;
@@ -182,7 +192,9 @@ static void put_glyph(char c) {
     g_cur_col++;
 
     if (g_cur_col >= g_cols) {
-        newline();
+        /* Park in the last column; wrap only when the next glyph arrives. */
+        g_cur_col = g_cols - 1;
+        g_wrap_pending = 1;
     }
 }
 
@@ -191,14 +203,17 @@ static void fb_putchar(char c) {
 
     switch (c) {
         case '\n':
+            g_wrap_pending = 0;
             newline();
             break;
 
         case '\r':
+            g_wrap_pending = 0;
             g_cur_col = 0;
             break;
 
         case '\b':
+            g_wrap_pending = 0;
             if (g_cur_col > 0) {
                 g_cur_col--;
             } else if (g_cur_row > 0) {
@@ -265,6 +280,7 @@ static void fb_set_cursor(int row, int col) {
 
     g_cur_row = row;
     g_cur_col = col;
+    g_wrap_pending = 0;
 
     draw_cursor(1);
 }

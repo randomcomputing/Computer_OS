@@ -136,6 +136,11 @@ static void keyboard_irq(struct registers* regs) {
         else return;
     }
 
+    /* Terminal signal chars (Ctrl-C/Ctrl-\) raise a signal on the
+       foreground task instead of being delivered as input. */
+    extern int tty_intr_char(char c);
+    if (tty_intr_char(c)) return;
+
     push_char(c);
 }
 

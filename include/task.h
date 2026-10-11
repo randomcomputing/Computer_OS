@@ -42,6 +42,12 @@ typedef struct task {
     uint64_t  fs_base;      /* per-task FS base (user TLS pointer), MSR 0xC0000100 */
     void*     fdt;          /* Linux fd table (linux_syscall.c), NULL until first use */
 
+    /* --- POSIX signals (linux_syscall.c) --- */
+    uint64_t  sig_handlers[32];  /* per-signal disposition: 0=DFL, 1=IGN, else user handler */
+    uint64_t  sig_restorer;      /* sa_restorer trampoline from sigaction (musl supplies it) */
+    uint32_t  sig_pending;       /* bit (1u<<signo) set => signal pending */
+    uint32_t  sig_blocked;       /* bit (1u<<signo) set => signal blocked */
+
     struct task* next;
 } task_t;
 

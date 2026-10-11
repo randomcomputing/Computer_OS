@@ -1302,7 +1302,8 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     char basename[FAT32_NAME_MAX + 1];
 
     if (fat32_resolve_parent(path, &parent, basename) < 0) {
-        printf("[fat32] read: resolve_parent FAILED for '%s'\n", path);
+        /* Routine: callers (and apps like apk/fastfetch) probe for files
+           whose parent directory does not exist. Not an error. */
         return -1;
     }
 
@@ -1317,8 +1318,7 @@ int fat32_read_file(const char* path, void* buf, unsigned int max) {
     }
 
     if (e.attr & ATTR_DIRECTORY) {
-        printf("[fat32] read: '%s' is a directory\n", basename);
-        return -1;
+        return -1;   /* reading a directory as a file: routine (EISDIR) */
     }
 
     unsigned int remaining = (e.size < max) ? e.size : max;

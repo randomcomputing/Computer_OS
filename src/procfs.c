@@ -153,6 +153,34 @@ static int gen_meminfo(char* buf, unsigned int max) {
     return n;
 }
 
+static int gen_stat(char* buf, unsigned int max) {
+    /* Minimal /proc/stat: one cpu line (jiffies, 100 Hz) + btime + processes.
+       top/uptime read this; exact idle split isn't important here. */
+    unsigned long long up_j = (unsigned long long)pit_millis() / 10;  /* 100 Hz jiffies */
+    char tmp[256]; int n = 0; char sv[32];
+    #define PUT(str) do { const char* _s=(str); while(*_s && n<255) tmp[n++]=*_s++; } while(0)
+    #define PUTN(v)  do { u64_to_str(sv,(unsigned long long)(v)); for(int _i=0;sv[_i];_i++) tmp[n++]=sv[_i]; } while(0)
+    PUT("cpu  0 0 0 "); PUTN(up_j); PUT(" 0 0 0 0 0 0\n");
+    PUT("cpu0 0 0 0 "); PUTN(up_j); PUT(" 0 0 0 0 0 0\n");
+    PUT("intr 0\nctxt 0\n");
+    PUT("btime 0\n");
+    PUT("processes 1\nprocs_running 1\nprocs_blocked 0\n");
+    #undef PUT
+    #undef PUTN
+    tmp[n]='\0';
+    if ((unsigned int)n >= max) n = (int)max - 1;
+    memcpy(buf, tmp, (unsigned int)n + 1);
+    return n;
+}
+
+static int gen_loadavg(char* buf, unsigned int max) {
+    const char* c = "0.00 0.00 0.00 1/1 1\n";
+    unsigned int len = (unsigned int)strlen(c);
+    if (len >= max) len = max - 1;
+    memcpy(buf, c, len); buf[len]='\0';
+    return (int)len;
+}
+
 static int gen_mounts(char* buf, unsigned int max) {
     const char* content =
         "rootfs / rootfs rw 0 0\n"
@@ -260,6 +288,8 @@ static int procfs_list(const char* path, vfs_dirent_t* out, int max) {
         ENTRY("cpuinfo", 512, 0);
         ENTRY("meminfo", 256, 0);
         ENTRY("mounts",  256, 0);
+        ENTRY("stat",    256, 0);
+        ENTRY("loadavg", 48, 0);
     } else if (streq(path, "/self")) {
         ENTRY("exe",     64, 0);
         ENTRY("maps",    256, 0);
@@ -270,6 +300,11 @@ static int procfs_list(const char* path, vfs_dirent_t* out, int max) {
         ENTRY("0", 0, 0);
         ENTRY("1", 0, 0);
         ENTRY("2", 0, 0);
+    } else {
+        /* Not a directory. Returning 0 here would make open() mistake every
+           /proc FILE for an empty directory (so reads give EISDIR / 0 bytes);
+           -1 tells the VFS "not a directory". */
+        return -1;
     }
     #undef ENTRY
 
@@ -284,6 +319,8 @@ static int procfs_read_file(const char* path, void* buf, unsigned int max) {
     if (streq(path, "/cpuinfo"))      return gen_cpuinfo(out, max);
     if (streq(path, "/meminfo"))      return gen_meminfo(out, max);
     if (streq(path, "/mounts"))       return gen_mounts(out, max);
+    if (streq(path, "/stat"))         return gen_stat(out, max);
+    if (streq(path, "/loadavg"))      return gen_loadavg(out, max);
     if (streq(path, "/self/status"))  return gen_self_status(out, max);
     if (streq(path, "/self/cmdline")) return gen_self_cmdline(out, max);
     if (streq(path, "/self/exe"))     return gen_self_exe(out, max);

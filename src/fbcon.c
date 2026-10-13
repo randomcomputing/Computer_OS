@@ -47,6 +47,21 @@ static int g_ready = 0;
 
 static cell_t g_cells[MAX_ROWS][MAX_COLS];
 
+/* Scrollback history: rows that scrolled off the top are kept here so PgUp
+   can bring them back. Ring buffer of the last HIST_ROWS lines. */
+#define HIST_ROWS 512
+static cell_t g_hist[HIST_ROWS][MAX_COLS];
+static int g_hist_head  = 0;   /* next slot to write                     */
+static int g_hist_count = 0;   /* valid history rows (<= HIST_ROWS)       */
+static int g_view_offset = 0;  /* rows scrolled up from live (0 = live)   */
+static int g_redrawing = 0;    /* 1 while redraw_view() repaints the view */
+
+static void hist_push(const cell_t* row) {
+    for (int c = 0; c < g_cols; c++) g_hist[g_hist_head][c] = row[c];
+    g_hist_head = (g_hist_head + 1) % HIST_ROWS;
+    if (g_hist_count < HIST_ROWS) g_hist_count++;
+}
+
 static cell_t blank_cell(void) {
     cell_t c;
     c.ch = ' ';
@@ -61,6 +76,12 @@ static void draw_cell(int row, int col, cell_t cell, int invert) {
     }
 
     if (row < 0 || row >= g_rows || col < 0 || col >= g_cols) {
+        return;
+    }
+
+    /* While the user is scrolled back, live output updates g_cells/history
+       but must not paint over the frozen view; only redraw_view() paints. */
+    if (g_view_offset != 0 && !g_redrawing) {
         return;
     }
 
@@ -105,6 +126,8 @@ static void clear_framebuffer_raw(unsigned int color) {
 }
 
 static void scroll_up_one(void) {
+    hist_push(g_cells[0]);            /* save the line leaving the screen */
+
     for (int r = 0; r < g_rows - 1; r++) {
         for (int c = 0; c < g_cols; c++) {
             g_cells[r][c] = g_cells[r + 1][c];
@@ -117,9 +140,14 @@ static void scroll_up_one(void) {
         g_cells[g_rows - 1][c] = b;
     }
 
-    /*
-     * Move framebuffer pixels up by one character row.
-     */
+    if (g_view_offset != 0) {
+        /* Scrolled back: don't disturb the framebuffer. Nudge the offset so
+           the same lines stay on screen as history grows underneath. */
+        if (g_view_offset < g_hist_count) g_view_offset++;
+        return;
+    }
+
+    /* Live: move framebuffer pixels up by one character row. */
     unsigned int row_pixels = g_stride;
     unsigned int move_rows  = (unsigned int)(g_rows - 1) * CELL_H;
 
@@ -135,6 +163,30 @@ static void scroll_up_one(void) {
     for (int c = 0; c < g_cols; c++) {
         draw_cell(g_rows - 1, c, b, 0);
     }
+}
+
+/* Repaint the whole visible area from history + current cells at the current
+   scroll offset. */
+static void redraw_view(void) {
+    g_redrawing = 1;
+    for (int vr = 0; vr < g_rows; vr++) {
+        int logical = g_hist_count - g_view_offset + vr;
+        for (int c = 0; c < g_cols; c++) {
+            cell_t cell;
+            if (logical < 0) {
+                cell = blank_cell();
+            } else if (logical < g_hist_count) {
+                int idx = (g_hist_head - g_hist_count + logical) % HIST_ROWS;
+                if (idx < 0) idx += HIST_ROWS;
+                cell = g_hist[idx][c];
+            } else {
+                int sr = logical - g_hist_count;
+                cell = (sr >= 0 && sr < g_rows) ? g_cells[sr][c] : blank_cell();
+            }
+            draw_cell(vr, c, cell, 0);
+        }
+    }
+    g_redrawing = 0;
 }
 
 static void newline(void) {
@@ -162,6 +214,7 @@ static void fb_clear(void) {
 
     g_cur_row = 0;
     g_cur_col = 0;
+    g_view_offset = 0;        /* clear returns us to the live view */
 
     draw_cursor(1);
 }
@@ -311,25 +364,33 @@ static int fb_cols(void) {
     return g_cols;
 }
 
-/*
- * Scrollback stubs.
- *
- * These are still no-ops. Normal terminal scrolling works through
- * scroll_up_one(), but mouse-wheel scrollback/history is not implemented here.
- */
+/* Scrollback: PgUp/PgDn move a view window back through g_hist. */
 static void fb_scroll_up(int rows) {
-    (void)rows;
+    if (rows <= 0) return;
+    draw_cursor(0);
+    g_view_offset += rows;
+    if (g_view_offset > g_hist_count) g_view_offset = g_hist_count;
+    redraw_view();
 }
 
 static void fb_scroll_down(int rows) {
-    (void)rows;
+    if (rows <= 0) return;
+    draw_cursor(0);
+    g_view_offset -= rows;
+    if (g_view_offset < 0) g_view_offset = 0;
+    redraw_view();
+    if (g_view_offset == 0) draw_cursor(1);
 }
 
 static void fb_scroll_reset(void) {
+    if (g_view_offset == 0) return;
+    g_view_offset = 0;
+    redraw_view();
+    draw_cursor(1);
 }
 
 static int fb_is_scrolled(void) {
-    return 0;
+    return g_view_offset != 0;
 }
 
 static const console_backend_t fb_backend = {

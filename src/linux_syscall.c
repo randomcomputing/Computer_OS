@@ -30,6 +30,7 @@ int dns_resolve(const char* hostname, unsigned int* out_ip);
 #include "console.h"
 #include "stdint.h"
 #include "pmm.h"
+#include "pit.h"
 #include "vmm.h"
 #include <stddef.h>
 
@@ -335,13 +336,15 @@ static int get_file_size(const char* abspath) {
 /* Console terminal (the fds flagged FD_FLAG_TTY)                       */
 /* ------------------------------------------------------------------ */
 /* Kernel-side termios, as read/written by TCGETS/TCSETS (Linux's 36-byte
- * kernel struct). Defaults: canonical line input (ICANON) + ISIG.
+ * kernel struct). Defaults: canonical line input (ICANON) + ISIG + ECHO,
+ * matching a normal Linux console.
  *
- * ECHO is deliberately NOT reported even though the kernel echoes typed
- * characters in canonical mode: busybox's line editor sees "ICANON without
- * ECHO" and falls back to plain line input (prompt + fgets). Its full
- * editor needs ANSI escape sequences, which this console doesn't draw yet.
- * Once the console understands ESC[...] sequences, report ECHO here too. */
+ * ECHO must be reported here. busybox's line editor checks the terminal on
+ * startup and, if ECHO is OFF, assumes it is not a real interactive terminal
+ * and falls back to plain canonical input (no history, no cursor keys). With
+ * ECHO on it switches to raw mode and drives its full editor with ANSI escape
+ * sequences, which the TTY write path (tty_putc / ansi_csi below) now draws —
+ * so arrow keys, history and in-line editing work in busybox and friends. */
 #define LX_ICANON 0x0002
 #define LX_ECHO   0x0008
 #define LX_ENOTTY (-25)
@@ -354,7 +357,7 @@ static lx_termios_t tty_tio = {
     0x0100,          /* ICRNL                  */
     0x0005,          /* OPOST | ONLCR          */
     0x00BF,          /* B38400 | CS8 | CREAD   */
-    0x0003,          /* ISIG | ICANON          */
+    0x000B,          /* ISIG | ICANON | ECHO   */
     0,
     { 3, 0x1c, 0x7f, 0x15, 4, 0, 1, 0, 0x11, 0x13, 0x1a, 0, 0x12, 0x0f, 0x17, 0x16, 0, 0, 0 }
 };
@@ -364,6 +367,16 @@ static lx_termios_t tty_tio = {
 static char         tty_line[512];
 static unsigned int tty_line_len = 0;
 static unsigned int tty_line_pos = 0;
+
+/* Terminal -> program input injected by the kernel itself, e.g. the reply to
+ * a "report cursor position" (ESC[6n) query. tty_read hands these bytes out
+ * before any keyboard input so the asking program sees its answer. */
+static unsigned char tty_inject_buf[40];
+static int tty_inject_len = 0, tty_inject_pos = 0;
+static void tty_inject(const char* s) {
+    while (*s && tty_inject_len < (int)sizeof(tty_inject_buf))
+        tty_inject_buf[tty_inject_len++] = (unsigned char)*s++;
+}
 
 /* Defined with the signal code further down. */
 static int signal_ready(task_t* t);
@@ -397,20 +410,84 @@ static int64_t tty_read(char* ubuf, uint64_t count) {
     if (count == 0) return 0;
     if (!user_range_ok(ubuf, count)) return EFAULT;
 
-    if (!(tty_tio.c_lflag & LX_ICANON)) {
-        /* Raw: block for one key, then return whatever else is queued. */
+    /* Hand out any kernel-injected input first (e.g. the ESC[6n reply). */
+    if (tty_inject_pos < tty_inject_len) {
         uint64_t n = 0;
+        while (tty_inject_pos < tty_inject_len && n < count) {
+            if (copy_to_user(ubuf + n, &tty_inject_buf[tty_inject_pos], 1) != 0)
+                return n ? (int64_t)n : EFAULT;
+            tty_inject_pos++; n++;
+        }
+        if (tty_inject_pos >= tty_inject_len) tty_inject_len = tty_inject_pos = 0;
+        return (int64_t)n;
+    }
+
+    if (!(tty_tio.c_lflag & LX_ICANON)) {
+        /* Raw mode (busybox's line editor, vi, less, ...). Deliver bytes as
+           they come, translating KEY_* codes into the ANSI escape sequences
+           a real terminal sends so arrows/Home/End/Delete work. A key can
+           expand to several bytes (e.g. Up = ESC [ A) while the caller often
+           reads one byte at a time, so leftover bytes are stashed in
+           tty_push and handed out on the next read. PgUp/PgDn are consumed
+           here as scrollback and never reach the program. */
+        static unsigned char tty_push[8];
+        static int tty_push_len = 0, tty_push_pos = 0;
+        uint64_t n = 0;
+
+        /* 1. Drain any pending bytes from a previous multi-byte key. */
+        while (tty_push_pos < tty_push_len && n < count) {
+            if (copy_to_user(ubuf + n, &tty_push[tty_push_pos], 1) != 0)
+                return n ? (int64_t)n : EFAULT;
+            tty_push_pos++; n++;
+        }
+        if (tty_push_pos >= tty_push_len) tty_push_len = tty_push_pos = 0;  /* fully drained */
+        if (n > 0) return (int64_t)n;      /* finish the pending sequence first */
+
         char c;
         if (tty_getc_blocking(&c) < 0) return EINTR;
         for (;;) {
-            if ((unsigned char)c < 0x80) {            /* drop KEY_* codes */
-                if (tty_tio.c_lflag & LX_ECHO) con_putchar(c);
-                if (copy_to_user(ubuf + n, &c, 1) != 0) return n ? (int64_t)n : EFAULT;
-                n++;
+            unsigned char uc = (unsigned char)c;
+            unsigned char seq[8]; int slen = 0;   /* bytes this key expands to */
+
+            if (uc == KEY_PGUP) { con_scroll_up(con_rows() / 2);   goto next; }
+            if (uc == KEY_PGDN) { con_scroll_down(con_rows() / 2); goto next; }
+            if (con_is_scrolled()) con_scroll_reset();   /* any real key -> live view */
+
+            #define SEQ(a,b,c2) do { seq[0]=(a); seq[1]=(b); seq[2]=(c2); slen=3; } while(0)
+            switch (uc) {
+                case KEY_UP:     SEQ(0x1b,'[','A'); break;
+                case KEY_DOWN:   SEQ(0x1b,'[','B'); break;
+                case KEY_RIGHT:  SEQ(0x1b,'[','C'); break;
+                case KEY_LEFT:   SEQ(0x1b,'[','D'); break;
+                case KEY_HOME:   SEQ(0x1b,'[','H'); break;
+                case KEY_END:    SEQ(0x1b,'[','F'); break;
+                case KEY_DELETE: seq[0]=0x1b; seq[1]='['; seq[2]='3'; seq[3]='~'; slen=4; break;
+                case 0x08:       seq[0]=0x7f; slen=1; break;      /* Backspace -> DEL */
+                default:
+                    if (uc < 0x80) { seq[0]=c; slen=1; }          /* ordinary byte    */
+                    break;                                        /* other KEY_*: drop */
             }
+            #undef SEQ
+
+            if (slen == 1 && seq[0] != 0x7f && (tty_tio.c_lflag & LX_ECHO))
+                con_putchar((char)seq[0]);
+
+            for (int i = 0; i < slen; i++) {
+                if (n < count) {
+                    if (copy_to_user(ubuf + n, &seq[i], 1) != 0)
+                        return n ? (int64_t)n : EFAULT;
+                    n++;
+                } else {
+                    /* Doesn't fit this read — stash for next time. */
+                    if (tty_push_len >= (int)sizeof(tty_push)) break;
+                    tty_push[tty_push_len++] = seq[i];
+                }
+            }
+            if (tty_push_len > 0) { tty_push_pos = 0; break; }  /* return, drain later */
+        next:
             if (n >= count || !keyboard_try_getchar(&c)) break;
         }
-        if (n == 0) return tty_read(ubuf, count);    /* only special keys */
+        if (n == 0) return tty_read(ubuf, count);    /* only scroll/special keys */
         return (int64_t)n;
     }
 
@@ -573,6 +650,24 @@ static void ansi_csi(char final) {
     case 'C': con_set_cursor(row, col + n >= cols ? cols - 1 : col + n); break;
     case 'D': con_set_cursor(row, col - n < 0 ? 0 : col - n); break;
     case 'G': con_set_cursor(row, n - 1 >= cols ? cols - 1 : n - 1); break;
+    case 'n':                                     /* device status report */
+        if (p0 == 6) {                            /* ESC[6n: report cursor pos */
+            /* Reply ESC[<row>;<col>R, 1-based, so line editors (busybox)
+               can locate where the prompt left the cursor. */
+            char rep[20]; int k = 0;
+            int rr = row + 1, cc = col + 1;
+            rep[k++] = 0x1b; rep[k++] = '[';
+            if (rr >= 100) rep[k++] = '0' + (rr / 100) % 10;
+            if (rr >= 10)  rep[k++] = '0' + (rr / 10) % 10;
+            rep[k++] = '0' + rr % 10;
+            rep[k++] = ';';
+            if (cc >= 100) rep[k++] = '0' + (cc / 100) % 10;
+            if (cc >= 10)  rep[k++] = '0' + (cc / 10) % 10;
+            rep[k++] = '0' + cc % 10;
+            rep[k++] = 'R'; rep[k] = '\0';
+            tty_inject(rep);
+        }
+        break;
     default: break;                               /* unsupported: ignore */
     }
 }
@@ -580,6 +675,19 @@ static void ansi_csi(char final) {
 static void tty_putc(char c) {
     if (ansi_state == 0) {
         if (c == 0x1b) { ansi_state = 1; return; }
+        if (c == 0x08) {
+            /* Backspace from a program is a NON-destructive cursor-left (the
+               program erases separately with ESC[K / ESC[J and reprints).
+               con_putchar('\b') would blank the cell, corrupting the line a
+               line editor like busybox's is redrawing, so move the cursor by
+               hand instead. The kernel's own canonical echo still uses the
+               destructive con_putchar('\b') directly and is unaffected. */
+            int row, col;
+            con_get_cursor(&row, &col);
+            if (col > 0)       con_set_cursor(row, col - 1);
+            else if (row > 0)  con_set_cursor(row - 1, con_cols() - 1);
+            return;
+        }
         con_putchar(c);
         return;
     }
@@ -725,6 +833,23 @@ open_path:;
 
     int fd = fd_alloc();
     if (fd < 0) return EMFILE;
+
+    /* /dev/tty, /dev/console, /dev/tty0..1 → the controlling console.
+       Hand back a fd flagged FD_FLAG_TTY so reads/writes/ioctls route to
+       the console terminal (line discipline, TCGETS/TCSETS, winsize).
+       Without this, open("/dev/tty") fell through to the regular-file path,
+       failed with ENOENT, and programs like busybox gave up on the tty —
+       disabling their line editor (so arrow keys never worked). */
+    if (strcmp(path, "/dev/tty")     == 0 || strcmp(path, "/dev/console") == 0 ||
+        strcmp(path, "/dev/tty0")    == 0 || strcmp(path, "/dev/tty1")    == 0) {
+        fd_table[fd].flags  = FD_FLAG_USED | FD_FLAG_TTY
+                            | ((flags & LX_O_CLOEXEC) ? FD_FLAG_CLOEXEC : 0);
+        fd_table[fd].offset = 0;
+        fd_table[fd].size   = 0;
+        fd_table[fd].wbuf = 0; fd_table[fd].wbuf_cap = 0;
+        fd_table[fd].path[0] = '\0';
+        return fd;
+    }
 
     /* Check if it's a directory */
     vfs_dirent_t* ents = (vfs_dirent_t*)kmalloc(2 * sizeof(vfs_dirent_t));
@@ -2145,11 +2270,13 @@ typedef struct {
 static int64_t sys_linux_sysinfo(linux_sysinfo_t* ubuf) {
     linux_sysinfo_t s;
     memset(&s, 0, sizeof(s));
-    s.uptime   = 42;
-    s.totalram = 8ULL * 1024 * 1024 * 1024;
-    s.freeram  = 4ULL * 1024 * 1024 * 1024;
-    s.procs    = 2;
-    s.mem_unit = 1;
+    s.uptime   = (int64_t)(pit_millis() / 1000);               /* real seconds since boot */
+    s.totalram = (uint64_t)pmm_total_pages() * 4096ULL;        /* real physical memory    */
+    s.freeram  = (uint64_t)pmm_free_pages()  * 4096ULL;
+    s.sharedram = 0; s.bufferram = 0;
+    s.totalswap = 0; s.freeswap = 0;
+    s.procs    = 1;
+    s.mem_unit = 1;                                            /* fields are in bytes     */
     if (copy_to_user(ubuf, &s, sizeof(s)) != 0) return EFAULT;
     return 0;
 }
@@ -2773,6 +2900,71 @@ static int64_t sys_linux_openat(int dirfd, const char* upath, int flags, int mod
 }
 
 /* sys_fstatat/newfstatat (262) */
+/* sys_statx (332). A fuller stat used by newer libc/tools (fastfetch).
+   We fill the basic fields from the same info fill_stat uses. */
+typedef struct { int64_t sec; uint32_t nsec; int32_t _pad; } statx_ts_t;
+typedef struct {
+    uint32_t stx_mask, stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink, stx_uid, stx_gid;
+    uint16_t stx_mode, _spare0;
+    uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
+    statx_ts_t stx_atime, stx_btime, stx_ctime, stx_mtime;
+    uint32_t stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t _spare2[13];
+} lx_statx_t;
+#define AT_EMPTY_PATH_F 0x1000
+#define STATX_BASIC_STATS 0x000007ffU
+
+static int64_t sys_linux_statx(int dirfd, const char* upath, int flags,
+                               unsigned int mask, void* ubuf) {
+    (void)mask;
+    char rel[256];
+    if (copy_str_from_user(rel, upath, sizeof(rel)) < 0) return EFAULT;
+
+    char path[512];
+    if ((flags & AT_EMPTY_PATH_F) && rel[0] == '\0') {
+        /* stat the fd itself */
+        if (dirfd == AT_FDCWD) return EBADF;
+        if (!fd_valid(dirfd)) return EBADF;
+        unsigned int i = 0;
+        for (; fd_table[dirfd].path[i] && i < sizeof(path)-1; i++) path[i] = fd_table[dirfd].path[i];
+        path[i] = '\0';
+    } else {
+        int jr = at_join_path(dirfd, upath, path, sizeof(path));
+        if (jr < 0) return jr;
+        char resolved[512];
+        if (vfs_resolve(path, resolved, sizeof(resolved)) < 0) return ENOENT;
+        unsigned int i = 0; for (; resolved[i] && i < sizeof(path)-1; i++) path[i]=resolved[i]; path[i]='\0';
+        if (!(flags & AT_SYMLINK_NOFOLLOW)) follow_symlinks(path, sizeof(path));
+    }
+
+    lx_statx_t sx;
+    memset(&sx, 0, sizeof(sx));
+
+    vfs_dirent_t* ents = (vfs_dirent_t*)kmalloc(sizeof(vfs_dirent_t));
+    int is_dir = 0;
+    if (ents) { if (vfs_list(path, ents, 1) >= 0) is_dir = 1; kfree(ents); }
+
+    if (is_dir) {
+        sx.stx_mode = 0040755; sx.stx_size = 4096;
+    } else {
+        int sz = get_file_size(path);
+        if (sz < 0) return ENOENT;
+        sx.stx_mode = 0100644; sx.stx_size = (uint64_t)sz;
+        sx.stx_blocks = (uint64_t)(sz + 511) / 512;
+    }
+    sx.stx_mask    = STATX_BASIC_STATS;
+    sx.stx_blksize = 512;
+    sx.stx_nlink   = 1;
+    sx.stx_ino     = 1;
+    sx.stx_dev_major = 0; sx.stx_dev_minor = 1;
+
+    if (copy_to_user(ubuf, &sx, sizeof(sx)) != 0) return EFAULT;
+    return 0;
+}
+
 static int64_t sys_linux_newfstatat(int dirfd, const char* upath,
                                      linux_stat_t* ustat, int flags) {
     char full[512];
@@ -3116,6 +3308,7 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 274: ret = 0; break;  /* get_robust_list — stub */
         case 231: ret = sys_linux_exit   ((int)a1); break; /* exit_group */
         case 257: ret = sys_linux_openat ((int)a1,(const char*)a2,(int)a3,(int)a4); break;
+        case 332: ret = sys_linux_statx((int)a1,(const char*)a2,(int)a3,(unsigned int)a4,(void*)frame->r8); break;
         case 262: ret = sys_linux_newfstatat((int)a1,(const char*)a2,(linux_stat_t*)a3,(int)a4); break;
         case 202: {
             /* futex(uaddr, op, val, timeout, uaddr2, val3)

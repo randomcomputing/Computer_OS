@@ -22,6 +22,8 @@
 #include "task.h"
 #include "ata.h"
 #include "fat32.h"
+#include "ext2.h"
+#include "cfs.h"
 #include "vfs.h"
 #include "ramfs.h"
 #include "procfs.h"
@@ -290,6 +292,26 @@ void kmain(void) {
             print_status(0, "FAT32 mount failed");
         }
 
+        /* ext2 data partition: at /mnt next to FAT32, or as the root
+         * filesystem when there is no FAT32 volume. */
+        if (ext2_mount() == 0) {
+            const char* at = g_fs_ok ? "/mnt" : "/";
+            if (vfs_mount(at, ext2_vfs_ops(), "ext2") == 0) {
+                con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+                printf("[OK]");
+                con_set_color(CON_WHITE, CON_BLACK);
+                printf(" ext2 mounted at %s (%s)\n", at,
+                       ext2_writable() ? "read-write" : "read-only");
+                printf("     ");
+                ext2_print_info();
+                g_fs_ok = 1;
+            } else {
+                print_status(0, "ext2 mount failed");
+            }
+        } else {
+            print_status(0, "No ext2 partition");
+        }
+
         ramfs_init();
         if (vfs_mount("/tmp", ramfs_vfs_ops(), "ramfs") == 0) {
             print_status(1, "ramfs mounted at /tmp");
@@ -309,6 +331,22 @@ void kmain(void) {
             print_status(1, "devfs mounted at /dev");
         } else {
             print_status(0, "devfs mount failed");
+        }
+
+        /* CFS: our own extent-based filesystem on partition 4, at /cfs. */
+        if (cfs_mount() == 0) {
+            if (vfs_mount("/cfs", cfs_vfs_ops(), "cfs") == 0) {
+                con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+                printf("[OK]");
+                con_set_color(CON_WHITE, CON_BLACK);
+                printf(" CFS mounted at /cfs\n");
+                printf("     ");
+                cfs_print_info();
+            } else {
+                print_status(0, "CFS mount failed");
+            }
+        } else {
+            print_status(0, "No CFS partition");
         }
     } else {
         print_status(0, "No ATA disk");

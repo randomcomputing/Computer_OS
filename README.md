@@ -21,6 +21,7 @@ Required tools on macOS:
 ```bash
 brew install nasm qemu mtools xorriso
 brew install x86_64-elf-binutils x86_64-elf-gcc
+brew install e2fsprogs gptfdisk   # mke2fs for the ext2 partition, sgdisk
 ```
 
 Build and run:
@@ -88,7 +89,8 @@ Use `timeout: 0` to boot immediately, or `timeout: -1` to keep the boot menu for
 - Basic tasking and scheduling
 - Syscall path
 - ATA PIO disk probing
-- FAT12 root filesystem
+- FAT32 root filesystem
+- ext2 filesystem (read/write) on partition 3, mounted at `/mnt`
 - ramfs mounted at `/tmp`
 - VFS layer
 - PCI scanning
@@ -209,7 +211,9 @@ src/kheap.c           kernel heap
 src/task.c            tasking/scheduler
 src/syscall.c/.asm    syscall handling
 src/ata.c             ATA PIO disk
-src/fat12.c           FAT12 filesystem
+src/fat32.c           FAT32 filesystem
+src/ext2.c            ext2 filesystem (read/write, native symlinks)
+tests/ext2/           host tests for ext2.c (`make -C tests/ext2`)
 src/vfs.c             virtual filesystem layer
 src/ramfs.c           RAM filesystem
 src/pci.c             PCI scan
@@ -237,4 +241,3 @@ For OS development, prefer small changes and rebuild often:
 make clean
 make run
 ```
-

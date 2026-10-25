@@ -18,7 +18,7 @@ int ping(unsigned int dst_ip, int count, unsigned int timeout_ms);
 
 // Resolve a hostname to an IPv4 address via DNS (querying the SLIRP resolver
 // at 10.0.2.3). On success writes the host-order IP into *out_ip and returns
-// 1; returns 0 on failure (timeout, NXDOMAIN, parse error).
+// 1; returns 0 on failur e (timeout, NXDOMAIN, parse error).
 int dns_resolve(const char* hostname, unsigned int* out_ip);
 
 // Our own IPv4 address (SLIRP default 10.0.2.15) and the gateway.

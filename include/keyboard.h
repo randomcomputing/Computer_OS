@@ -28,4 +28,7 @@ char keyboard_getchar(void);
 // blocked user task can yield instead of monopolizing the CPU.
 int keyboard_try_getchar(char* out);
 
+// Non-destructive: non-zero if at least one key is buffered.
+int keyboard_has_char(void);
+
 #endif

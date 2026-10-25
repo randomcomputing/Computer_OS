@@ -440,6 +440,19 @@ void task_list_print(void) {
     } while (p != ready);
 }
 
+/* Fill ids[] with the id of every task (up to max), skipping dead ones.
+   Returns the number written. Used by procfs to list /proc/<pid>. */
+int task_enumerate(int* ids, int max) {
+    int n = 0;
+    if (!ready) return 0;
+    task_t* p = ready;
+    do {
+        if (p->state != TASK_DEAD && n < max) ids[n++] = p->id;
+        p = p->next;
+    } while (p != ready && n < max);
+    return n;
+}
+
 void task_count_states(int* out_total, int* out_running,
                        int* out_ready, int* out_blocked) {
     *out_total = *out_running = *out_ready = *out_blocked = 0;

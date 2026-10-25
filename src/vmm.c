@@ -240,6 +240,7 @@ int vmm_page_fault(struct registers* regs) {
         return 1;
     }
 
+
     /* User space fault outside of uaccess — mark task for death.
        We can't call task_exit_code() from inside an ISR because
        task_switch does a ret which corrupts the ISR stack.

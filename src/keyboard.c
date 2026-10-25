@@ -166,3 +166,9 @@ int keyboard_try_getchar(char* out) {
     buf_tail = (buf_tail + 1) % BUF_SIZE;
     return 1;
 }
+
+/* Non-destructive check: is there at least one key buffered? Used by poll()
+   so it can report the console readable only when input is actually waiting. */
+int keyboard_has_char(void) {
+    return buf_head != buf_tail;
+}

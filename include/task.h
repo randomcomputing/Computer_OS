@@ -74,6 +74,7 @@ void     scheduler_tick(void);
 task_t*  task_current(void);
 task_t*  task_find_by_id(int id);
 void     task_list_print(void);
+int      task_enumerate(int* ids, int max);
 void     task_count_states(int* out_total, int* out_running,
                            int* out_ready, int* out_blocked);
 

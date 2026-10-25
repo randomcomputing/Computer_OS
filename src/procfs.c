@@ -36,6 +36,19 @@ static int startswith(const char* s, const char* prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+/* If path begins with "/<digits>" as a whole component, return that pid and
+   point *rest at the char after it ('/' or '\0'); otherwise return -1. */
+static int parse_pid_path(const char* path, const char** rest) {
+    if (path[0] != '/') return -1;
+    const char* p = path + 1;
+    if (*p < '0' || *p > '9') return -1;
+    int pid = 0;
+    while (*p >= '0' && *p <= '9') { pid = pid * 10 + (*p - '0'); p++; }
+    if (*p != '/' && *p != '\0') return -1;   /* e.g. "/12ab" is not a pid */
+    *rest = p;
+    return pid;
+}
+
 /* Write a decimal number into buf, return length */
 static int u64_to_str(char* buf, unsigned long long v) {
     if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
@@ -195,10 +208,29 @@ static int gen_mounts(char* buf, unsigned int max) {
     return (int)len;
 }
 
-static int gen_self_status(char* buf, unsigned int max) {
-    task_t* t = task_current();
-    int pid = t ? t->id : 1;
-    char pidstr[16]; u64_to_str(pidstr, (unsigned long long)pid);
+/* State letter for a task, in the /proc "stat"/"status" convention. */
+static char task_state_char(task_t* t) {
+    if (!t) return 'R';
+    switch (t->state) {
+        case TASK_RUNNING: return 'R';
+        case TASK_READY:   return 'R';
+        case TASK_BLOCKED: return 'S';
+        default:           return 'Z';   /* TASK_DEAD */
+    }
+}
+
+static const char* task_state_word(task_t* t) {
+    switch (task_state_char(t)) {
+        case 'R': return "R (running)";
+        case 'S': return "S (sleeping)";
+        default:  return "Z (zombie)";
+    }
+}
+
+static int gen_task_status(task_t* t, int pid, char* buf, unsigned int max) {
+    char pidstr[16];  u64_to_str(pidstr, (unsigned long long)pid);
+    int ppid = (t && t->parent) ? t->parent->id : 1;
+    char ppidstr[16]; u64_to_str(ppidstr, (unsigned long long)ppid);
 
     char tmp[512]; int n = 0;
     #define APPEND(s) do { \
@@ -207,9 +239,9 @@ static int gen_self_status(char* buf, unsigned int max) {
     } while(0)
 
     APPEND("Name:\t"); APPEND(t ? t->name : "kernel"); APPEND("\n");
-    APPEND("State:\tR (running)\n");
+    APPEND("State:\t"); APPEND(task_state_word(t)); APPEND("\n");
     APPEND("Pid:\t"); APPEND(pidstr); APPEND("\n");
-    APPEND("PPid:\t1\n");
+    APPEND("PPid:\t"); APPEND(ppidstr); APPEND("\n");
     APPEND("Uid:\t0\t0\t0\t0\n");
     APPEND("Gid:\t0\t0\t0\t0\n");
     APPEND("VmRSS:\t4096 kB\n");
@@ -221,6 +253,72 @@ static int gen_self_status(char* buf, unsigned int max) {
     if ((unsigned int)n >= max) n = (int)max - 1;
     memcpy(buf, tmp, (unsigned int)n + 1);
     return n;
+}
+
+static int gen_self_status(char* buf, unsigned int max) {
+    task_t* t = task_current();
+    return gen_task_status(t, t ? t->id : 1, buf, max);
+}
+
+/* /proc/<pid>/stat — the single space-separated line top/ps parse. We fill
+   the fields we have (pid, comm, state, ppid, a plausible vsize/rss) and zero
+   the rest; fields run out to 39 so parsers that index late fields are safe. */
+static int gen_pid_stat(int pid, char* buf, unsigned int max) {
+    task_t* t = task_find_by_id(pid);
+    if (!t) return -1;
+    int ppid = t->parent ? t->parent->id : 0;
+
+    char tmp[512]; int n = 0;
+    #define NUM(v) do { char b[24]; int l = u64_to_str(b,(unsigned long long)(v)); \
+                        for (int i=0;i<l && n<500;i++) tmp[n++]=b[i]; } while(0)
+    #define CH(c)  do { if (n<500) tmp[n++]=(char)(c); } while(0)
+    #define STR(s) do { const char* _p=(s); while(*_p && n<500) tmp[n++]=*_p++; } while(0)
+
+    NUM(pid); CH(' ');
+    CH('('); STR(t->name); CH(')'); CH(' ');
+    CH(task_state_char(t)); CH(' ');
+    NUM(ppid); CH(' ');                        /* 4  ppid                     */
+    for (int i=0;i<9;i++)  { NUM(0); CH(' '); } /* 5-13 pgrp..cmajflt          */
+    NUM(0); CH(' ');                            /* 14 utime                    */
+    NUM(0); CH(' ');                            /* 15 stime                    */
+    NUM(0); CH(' '); NUM(0); CH(' ');           /* 16-17 cutime cstime         */
+    NUM(20); CH(' '); NUM(0); CH(' ');          /* 18-19 priority nice         */
+    NUM(1); CH(' '); NUM(0); CH(' ');           /* 20-21 num_threads itreal    */
+    NUM(0); CH(' ');                            /* 22 starttime                */
+    NUM(8192UL*1024UL); CH(' ');                /* 23 vsize (bytes)            */
+    NUM(256); CH(' ');                          /* 24 rss (pages)              */
+    for (int i=0;i<14;i++) { NUM(0); CH(' '); } /* 25-38                       */
+    NUM(0);                                     /* 39 processor                */
+    CH('\n');
+    #undef NUM
+    #undef CH
+    #undef STR
+
+    if ((unsigned int)n >= max) n = (int)max - 1;
+    memcpy(buf, tmp, (unsigned int)n);
+    if ((unsigned int)n < max) buf[n] = '\0';
+    return n;
+}
+
+/* /proc/<pid>/statm — seven page counts: size resident shared text lib data dt */
+static int gen_pid_statm(int pid, char* buf, unsigned int max) {
+    if (!task_find_by_id(pid)) return -1;
+    const char* s = "2048 256 0 1 0 512 0\n";
+    unsigned int len = (unsigned int)strlen(s);
+    if (len >= max) len = max - 1;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    return (int)len;
+}
+
+static int gen_pid_cmdline(int pid, char* buf, unsigned int max) {
+    task_t* t = task_find_by_id(pid);
+    if (!t) return -1;
+    unsigned int len = (unsigned int)strlen(t->name);
+    if (len + 1 >= max) len = max - 2;
+    memcpy(buf, t->name, len);
+    buf[len] = '\0';           /* argv terminator */
+    return (int)len + 1;
 }
 
 static int gen_self_cmdline(char* buf, unsigned int max) {
@@ -263,6 +361,13 @@ static int procfs_is_dir(const char* path) {
     if (streq(path, "/"))           return 1;
     if (streq(path, "/self"))       return 1;
     if (streq(path, "/self/fd"))    return 1;
+    /* /proc/<pid> and /proc/<pid>/fd are directories (for an existing task). */
+    const char* rest;
+    int pid = parse_pid_path(path, &rest);
+    if (pid >= 0 && task_find_by_id(pid)) {
+        if (rest[0] == '\0')          return 1;
+        if (streq(rest, "/fd"))       return 1;
+    }
     return 0;
 }
 
@@ -281,6 +386,9 @@ static int procfs_list(const char* path, vfs_dirent_t* out, int max) {
         } \
     } while(0)
 
+    const char* rest;
+    int pid = parse_pid_path(path, &rest);
+
     if (streq(path, "/")) {
         ENTRY("self",    0, 1);
         ENTRY("version", 128, 0);
@@ -290,6 +398,13 @@ static int procfs_list(const char* path, vfs_dirent_t* out, int max) {
         ENTRY("mounts",  256, 0);
         ENTRY("stat",    256, 0);
         ENTRY("loadavg", 48, 0);
+        /* One numeric directory per live task, so ps/top can enumerate. */
+        int ids[64];
+        int cnt = task_enumerate(ids, 64);
+        for (int i = 0; i < cnt; i++) {
+            char nm[16]; u64_to_str(nm, (unsigned long long)ids[i]);
+            ENTRY(nm, 0, 1);
+        }
     } else if (streq(path, "/self")) {
         ENTRY("exe",     64, 0);
         ENTRY("maps",    256, 0);
@@ -297,6 +412,18 @@ static int procfs_list(const char* path, vfs_dirent_t* out, int max) {
         ENTRY("cmdline", 64, 0);
         ENTRY("fd",      0, 1);
     } else if (streq(path, "/self/fd")) {
+        ENTRY("0", 0, 0);
+        ENTRY("1", 0, 0);
+        ENTRY("2", 0, 0);
+    } else if (pid >= 0 && task_find_by_id(pid) && rest[0] == '\0') {
+        /* /proc/<pid> */
+        ENTRY("stat",    256, 0);
+        ENTRY("statm",   64, 0);
+        ENTRY("status",  256, 0);
+        ENTRY("cmdline", 64, 0);
+        ENTRY("exe",     64, 0);
+        ENTRY("fd",      0, 1);
+    } else if (pid >= 0 && task_find_by_id(pid) && streq(rest, "/fd")) {
         ENTRY("0", 0, 0);
         ENTRY("1", 0, 0);
         ENTRY("2", 0, 0);
@@ -325,6 +452,33 @@ static int procfs_read_file(const char* path, void* buf, unsigned int max) {
     if (streq(path, "/self/cmdline")) return gen_self_cmdline(out, max);
     if (streq(path, "/self/exe"))     return gen_self_exe(out, max);
     if (streq(path, "/self/maps"))    return gen_self_maps(out, max);
+
+    /* /proc/<pid>/... */
+    {
+        const char* rest;
+        int pid = parse_pid_path(path, &rest);
+        if (pid >= 0 && rest[0] == '/') {
+            if (streq(rest, "/stat"))    return gen_pid_stat(pid, out, max);
+            if (streq(rest, "/statm"))   return gen_pid_statm(pid, out, max);
+            if (streq(rest, "/status"))  return gen_task_status(task_find_by_id(pid), pid, out, max);
+            if (streq(rest, "/cmdline")) return gen_pid_cmdline(pid, out, max);
+            if (streq(rest, "/exe")) {
+                task_t* t = task_find_by_id(pid);
+                const char* p = (t && t->name[0]) ? t->name : "/";
+                unsigned int len = (unsigned int)strlen(p);
+                if (len >= max) len = max - 1;
+                memcpy(out, p, len); out[len] = '\0';
+                return (int)len;
+            }
+            if (startswith(rest, "/fd/")) {
+                const char* p = "/dev/tty";
+                unsigned int len = (unsigned int)strlen(p);
+                if (len >= max) len = max - 1;
+                memcpy(out, p, len); out[len] = '\0';
+                return (int)len;
+            }
+        }
+    }
 
     /* /proc/self/fd/N */
     if (startswith(path, "/self/fd/")) {

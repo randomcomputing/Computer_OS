@@ -23,6 +23,15 @@ LIMINE_DIR ?= limine
 KERNEL_ELF  = kernel.elf
 DISK_IMG    = disk.img
 FAT32_IMG   = fat32disk.img
+EXT2_IMG    = ext2disk.img
+CFS_IMG     = cfsdisk.img
+
+# Host compiler for build-time tools (mkfs.cfs). Not the cross CC.
+HOSTCC ?= cc
+
+# mke2fs with -d (populate from a directory) needs e2fsprogs >= 1.43.
+# On macOS: brew install e2fsprogs  (keg-only, so we look for it there).
+MKE2FS ?= $(shell command -v mke2fs 2>/dev/null || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 
 # -----------------------------------------------------------------------
 # Object files
@@ -52,6 +61,8 @@ KHEAP_O    = $(OBJDIR)/kheap.o
 TASK_O     = $(OBJDIR)/task.o
 ATA_O      = $(OBJDIR)/ata.o
 FAT32_O         = $(OBJDIR)/fat32.o
+EXT2_O          = $(OBJDIR)/ext2.o
+CFS_O           = $(OBJDIR)/cfs.o
 INFLATE_O       = $(OBJDIR)/inflate.o
 LINUX_SYSCALL_O = $(OBJDIR)/linux_syscall.o
 PROCFS_O        = $(OBJDIR)/procfs.o
@@ -89,7 +100,7 @@ KERNEL_OBJS = \
     $(KERNEL_O) $(GDT_O) $(IDT_O) $(ISR_O) $(PIC_O) $(IRQ_O) \
     $(KEYBOARD_O) $(MOUSE_O) $(PIT_O) $(SERIAL_O) \
     $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
-    $(TASK_O) $(ATA_O) $(FAT32_O) $(VFS_O) $(RAMFS_O) \
+    $(TASK_O) $(ATA_O) $(FAT32_O) $(EXT2_O) $(CFS_O) $(VFS_O) $(RAMFS_O) \
     $(INFLATE_O) $(LINUX_SYSCALL_O) $(PROCFS_O) $(DEVFS_O) \
     $(SYSCALL_O) $(USERPROG_O) $(LOADER_O) $(EDITOR_O) \
     $(RTC_O) $(GFX_O) $(FONT_O) $(UACCESS_O) \
@@ -145,6 +156,8 @@ $(KHEAP_O):   src/kheap.c | $(OBJDIR);    $(CC) $(CFLAGS) $< -o $@
 $(TASK_O):    src/task.c | $(OBJDIR);     $(CC) $(CFLAGS) $< -o $@
 $(ATA_O):     src/ata.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(FAT32_O):         src/fat32.c | $(OBJDIR);         $(CC) $(CFLAGS) $< -o $@
+$(EXT2_O):          src/ext2.c | $(OBJDIR);          $(CC) $(CFLAGS) $< -o $@
+$(CFS_O):           src/cfs.c | $(OBJDIR);           $(CC) $(CFLAGS) -DCFS_KERNEL $< -o $@
 $(INFLATE_O):       src/inflate.c | $(OBJDIR);       $(CC) $(CFLAGS) $< -o $@
 $(LINUX_SYSCALL_O): src/linux_syscall.c | $(OBJDIR); $(CC) $(CFLAGS) $< -o $@
 $(PROCFS_O):        src/procfs.c | $(OBJDIR);        $(CC) $(CFLAGS) $< -o $@
@@ -184,19 +197,78 @@ $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 # Disk image
 # -----------------------------------------------------------------------
 
-$(DISK_IMG): $(KERNEL_ELF) $(FAT32_IMG) limine.conf
+# Partition layout (512-byte sectors):
+#   1  ESP    2048   .. 67583    32 MB  Limine + kernel.elf
+#   2  FAT32  67584  .. 198655   64 MB  fat32disk.img  (mounted at /)
+#   3  ext2   198656 .. 313343   56 MB  ext2disk.img   (mounted at /mnt)
+#   4  CFS    313344 .. 327646  ~7 MB   cfsdisk.img    (mounted at /cfs)
+$(DISK_IMG): $(KERNEL_ELF) $(FAT32_IMG) $(EXT2_IMG) $(CFS_IMG) limine.conf
 	@echo "Creating UEFI disk image..."
-	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=128 2>/dev/null
-	sgdisk -n 1:2048:67583   -t 1:ef00 \
-	       -n 2:67584:0      -t 2:0700 \
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=160 2>/dev/null
+	sgdisk -n 1:2048:67583    -t 1:ef00 \
+	       -n 2:67584:198655  -t 2:0700 \
+	       -n 3:198656:313343 -t 3:8300 \
+	       -n 4:313344:327646 -t 4:8300 \
 	       $(DISK_IMG)
 	mformat -i $(DISK_IMG)@@1M -F -v EFI ::
 	mmd    -i $(DISK_IMG)@@1M ::/EFI ::/EFI/BOOT
 	mcopy  -i $(DISK_IMG)@@1M $(LIMINE_DIR)/BOOTX64.EFI   ::/EFI/BOOT/
 	mcopy  -i $(DISK_IMG)@@1M limine.conf                 ::/
 	mcopy  -i $(DISK_IMG)@@1M $(KERNEL_ELF)               ::/
-	dd if=$(FAT32_IMG) of=$(DISK_IMG) bs=512 seek=67584 conv=notrunc 2>/dev/null
+	@# mount points so the ext2 and CFS volumes show up in `ls /`
+	@mdir -i $(FAT32_IMG) ::mnt >/dev/null 2>&1 || mmd -i $(FAT32_IMG) ::mnt
+	@mdir -i $(FAT32_IMG) ::cfs >/dev/null 2>&1 || mmd -i $(FAT32_IMG) ::cfs
+	dd if=$(FAT32_IMG) of=$(DISK_IMG) bs=512 seek=67584  conv=notrunc 2>/dev/null
+	dd if=$(EXT2_IMG)  of=$(DISK_IMG) bs=512 seek=198656 conv=notrunc 2>/dev/null
+	dd if=$(CFS_IMG)   of=$(DISK_IMG) bs=512 seek=313344 conv=notrunc 2>/dev/null
 	@echo "Disk image ready: $(DISK_IMG)"
+
+# -----------------------------------------------------------------------
+# ext2 data disk (56 MB, populated from a staging directory)
+# -----------------------------------------------------------------------
+
+EXT2_STAGE = $(OBJDIR)/ext2root
+
+$(EXT2_IMG): Makefile | $(OBJDIR)
+	@echo "Building ext2 data disk..."
+	rm -rf $(EXT2_STAGE) && mkdir -p $(EXT2_STAGE)/etc $(EXT2_STAGE)/bin $(EXT2_STAGE)/home/user
+	@printf "Hello from ext2!\n" > $(EXT2_STAGE)/hello.txt
+	@printf 'NAME="Computer OS"\nPRETTY_NAME="Computer OS (64-bit)"\nID=computeros\nVERSION_ID=0.1\n' > $(EXT2_STAGE)/etc/os-release
+	@printf "This file lives on an ext2 partition.\n" > $(EXT2_STAGE)/home/user/notes.txt
+	ln -s hello.txt $(EXT2_STAGE)/greeting
+	-cp userprogs/c/*.elf $(EXT2_STAGE)/bin/ 2>/dev/null
+	rm -f $(EXT2_IMG)
+	$(MKE2FS) -q -F -t ext2 -b 4096 -m 0 -L computeros \
+	    -O ^metadata_csum,^uninit_bg -E root_owner=0:0 \
+	    -d $(EXT2_STAGE) $(EXT2_IMG) 56M
+	@echo "ext2 disk ready: $(EXT2_IMG)"
+
+# -----------------------------------------------------------------------
+# CFS data disk (~7 MB, built by our own mkfs.cfs host tool)
+# -----------------------------------------------------------------------
+# Partition 4 is sectors 313344..327646 = 14303 sectors; at 8 sectors/block
+# that is 1787 CFS blocks (14296 sectors, fits with room to spare).
+
+MKFS_CFS  = $(OBJDIR)/mkfs_cfs
+CFS_STAGE = $(OBJDIR)/cfsroot
+CFS_BLOCKS = 1787
+
+# The host tool shares the filesystem core (src/cfs.c), compiled WITHOUT
+# -DCFS_KERNEL so the ATA binding is excluded. Both halves use the host cc.
+$(MKFS_CFS): src/mkfs_cfs.c src/cfs.c include/cfs.h | $(OBJDIR)
+	@echo "Building mkfs.cfs (host tool)..."
+	$(HOSTCC) -O2 -std=c11 -fno-builtin -Iinclude -c src/cfs.c -o $(OBJDIR)/cfs_host.o
+	$(HOSTCC) -O2 -std=c11 -c src/mkfs_cfs.c -o $(OBJDIR)/mkfs_cfs.o
+	$(HOSTCC) $(OBJDIR)/cfs_host.o $(OBJDIR)/mkfs_cfs.o -o $(MKFS_CFS)
+
+$(CFS_IMG): $(MKFS_CFS) Makefile | $(OBJDIR)
+	@echo "Building CFS data disk..."
+	rm -rf $(CFS_STAGE) && mkdir -p $(CFS_STAGE)/home/user $(CFS_STAGE)/etc
+	@printf "Hello from CFS!\nExtent-based, long filenames, journaled-to-be.\n" > $(CFS_STAGE)/hello.txt
+	@printf 'NAME="Computer OS"\nFS=cfs\n' > $(CFS_STAGE)/etc/os-release
+	@printf "This file lives on a native CFS partition.\n" > $(CFS_STAGE)/home/user/notes.txt
+	$(MKFS_CFS) $(CFS_IMG) $(CFS_BLOCKS) computeros $(CFS_STAGE)
+	@echo "CFS disk ready: $(CFS_IMG)"
 
 # -----------------------------------------------------------------------
 # FAT32 data disk
@@ -359,5 +431,5 @@ apk-fs:
 	@echo "Done. Run 'make' to rebuild disk.img with the new FAT32 image."
 
 clean:
-	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT32_IMG)
+	rm -rf $(OBJDIR) *.elf $(DISK_IMG) $(FAT32_IMG) $(EXT2_IMG) $(CFS_IMG)
 	-$(MAKE) -C userprogs/c clean 2>/dev/null || true

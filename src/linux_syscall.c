@@ -378,6 +378,26 @@ static void tty_inject(const char* s) {
         tty_inject_buf[tty_inject_len++] = (unsigned char)*s++;
 }
 
+/* Raw-mode pushback: bytes of a multi-byte key (e.g. Up = ESC [ A) left over
+ * when the caller read fewer bytes than the key expands to. File-scope so
+ * poll() can report the tty readable while these are pending — otherwise a
+ * program probing after ESC (busybox read_key) would miss the rest. */
+static unsigned char tty_push[8];
+static int tty_push_len = 0, tty_push_pos = 0;
+
+/* Is there console input a read() could return right now, without blocking?
+ * Covers kernel-injected bytes, leftover multi-byte key bytes, a buffered
+ * keypress, and (canonical mode) an already-collected line. poll() needs an
+ * honest answer: reporting "always readable" makes programs that probe after
+ * ESC (vi, busybox read_key) treat a lone ESC as the start of an escape
+ * sequence and hang waiting for bytes that never come. */
+static int tty_input_ready(void) {
+    if (tty_inject_pos < tty_inject_len) return 1;
+    if (tty_push_pos   < tty_push_len)   return 1;
+    if (tty_line_pos   < tty_line_len)   return 1;
+    return keyboard_has_char();
+}
+
 /* Defined with the signal code further down. */
 static int signal_ready(task_t* t);
 
@@ -429,9 +449,8 @@ static int64_t tty_read(char* ubuf, uint64_t count) {
            expand to several bytes (e.g. Up = ESC [ A) while the caller often
            reads one byte at a time, so leftover bytes are stashed in
            tty_push and handed out on the next read. PgUp/PgDn are consumed
-           here as scrollback and never reach the program. */
-        static unsigned char tty_push[8];
-        static int tty_push_len = 0, tty_push_pos = 0;
+           here as scrollback and never reach the program. (tty_push is at
+           file scope so poll() can see pending bytes.) */
         uint64_t n = 0;
 
         /* 1. Drain any pending bytes from a previous multi-byte key. */
@@ -558,6 +577,13 @@ static int64_t sys_linux_read(int fd, char* buf, uint64_t count) {
     if (!filebuf) { kfree(kbuf); return ENOMEM; }
     int n = vfs_read_file(f->path, filebuf, f->size);
     if (n < 0) { kfree(filebuf); kfree(kbuf); return EIO; }
+
+    /* n is the real content length. For generated files (procfs, devfs) it is
+     * usually smaller than the declared size, so clamp to it — otherwise the
+     * uninitialised tail of filebuf would leak out as garbage. */
+    unsigned int avail = (unsigned int)n;
+    if (f->offset >= avail) { kfree(filebuf); kfree(kbuf); return 0; }  /* EOF */
+    if (f->offset + to_read > avail) to_read = avail - f->offset;
 
     for (unsigned int i = 0; i < to_read; i++)
         kbuf[i] = filebuf[f->offset + i];
@@ -3219,27 +3245,43 @@ void linux_syscall_handler(linux_frame_t* frame) {
         case 8:   ret = sys_linux_lseek  ((int)a1, (int64_t)a2, (int)a3); break;
         case 9:   ret = sys_linux_mmap(a1,a2,(int)a3,(int)a4,(int)frame->r8,(int64_t)frame->r9); break;
         case 7: {
-            /* poll(struct pollfd* fds, nfds_t nfds, int timeout) */
+            /* poll(struct pollfd* fds, nfds_t nfds, int timeout)
+               timeout: <0 block forever, 0 return immediately, >0 wait N ms.
+               A console (tty) fd reports POLLIN only when input is actually
+               waiting — reporting it always-ready makes programs that probe
+               after ESC (vi, busybox read_key) hang. Other fds keep the
+               single-threaded "always ready" model. */
             typedef struct { int fd; short events; short revents; } pollfd_t;
             pollfd_t* pfds = (pollfd_t*)a1;
             int nfds = (int)a2;
+            int timeout = (int)(int32_t)a3;
+            uint32_t start = pit_millis();
             int nready = 0;
-            for (int _pi = 0; _pi < nfds; _pi++) {
-                pollfd_t pfd;
-                if (copy_from_user(&pfd, &pfds[_pi], sizeof(pfd)) != 0) continue;
-                pfd.revents = 0;
-                if (pfd.fd >= 0) {
-                    if (fd_is_sock(pfd.fd)) {
-                        /* Sockets: always ready for read+write (we're single-threaded) */
-                        if (pfd.events & 0x0004) pfd.revents |= 0x0004; /* POLLOUT */
-                        if (pfd.events & 0x0001) pfd.revents |= 0x0001; /* POLLIN */
-                    } else if (fd_valid(pfd.fd)) {
-                        /* Regular files: always readable */
-                        if (pfd.events & 0x0001) pfd.revents |= 0x0001; /* POLLIN */
+            for (;;) {
+                nready = 0;
+                for (int _pi = 0; _pi < nfds; _pi++) {
+                    pollfd_t pfd;
+                    if (copy_from_user(&pfd, &pfds[_pi], sizeof(pfd)) != 0) continue;
+                    pfd.revents = 0;
+                    if (pfd.fd >= 0) {
+                        if (fd_is_sock(pfd.fd)) {
+                            if (pfd.events & 0x0004) pfd.revents |= 0x0004; /* POLLOUT */
+                            if (pfd.events & 0x0001) pfd.revents |= 0x0001; /* POLLIN  */
+                        } else if (fd_valid(pfd.fd)) {
+                            int is_tty = (fd_table[pfd.fd].flags & FD_FLAG_TTY) != 0;
+                            if (pfd.events & 0x0001) {        /* POLLIN */
+                                if (!is_tty || tty_input_ready())
+                                    pfd.revents |= 0x0001;
+                            }
+                        }
+                        if (pfd.revents) nready++;
                     }
-                    if (pfd.revents) nready++;
+                    copy_to_user(&pfds[_pi], &pfd, sizeof(pfd));
                 }
-                copy_to_user(&pfds[_pi], &pfd, sizeof(pfd));
+                if (nready > 0 || timeout == 0) break;
+                if (signal_ready(task_current())) { nready = EINTR; break; }
+                if (timeout > 0 && (int)(pit_millis() - start) >= timeout) break;
+                yield();
             }
             ret = nready;
             break;

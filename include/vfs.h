@@ -16,6 +16,14 @@
 //   - Listing and cwd are PATH-based (no cluster numbers leak through the
 //     interface), so non-FAT filesystems such as ramfs work cleanly.
 
+// Symlink representation at the VFS boundary. A read of a symlink returns
+// this prefix followed by the target path; writing content with this
+// prefix creates a symlink. FAT32 and ramfs store it literally (they have
+// no symlinks); ext2 translates it to/from native symlinks. Must match
+// SYMLINK_MAGIC in linux_syscall.c.
+#define VFS_SYMLINK_MAGIC     "!<symlink>"
+#define VFS_SYMLINK_MAGIC_LEN 10
+
 // One directory entry returned by vfs_list().
 typedef struct {
     char          name[256];      // LFN-capable name, null-terminated

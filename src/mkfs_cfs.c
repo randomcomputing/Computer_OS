@@ -125,7 +125,11 @@ int main(int argc, char** argv) {
     cfs_bdev_t bd = { file_read, file_write, NULL, 0 };
     cfs_fs_t* fs = (cfs_fs_t*)fsmem;
 
-    if (cfs_format(&bd, blocks, 0, label) != 0) {
+    /* Reserve a journal: ~1/32 of the volume, clamped to a sane range. */
+    uint64_t jblocks = blocks / 32;
+    if (jblocks < 34)   jblocks = 34;
+    if (jblocks > 1024) jblocks = 1024;
+    if (cfs_format(&bd, blocks, jblocks, label) != 0) {
         fprintf(stderr, "cfs_format failed\n"); return 1;
     }
     if (cfs_mount_bd(&bd, fs) != 0) {

@@ -12,6 +12,8 @@
 #include "kheap.h"
 #include "task.h"
 #include "vfs.h"
+#include "cfs.h"
+#include "cred.h"
 #include "tar.h"
 #include "io.h"
 #include "userprog.h"
@@ -38,8 +40,9 @@ static const char* commands[] = {
     "meminfo", "pmemstat", "palloc", "vmap", "kmstat", "kmtest",
     "lspci", "vbe", "nettest", "ping", "resolve", "http",
     "ps", "spawn", "yield", "preempt",
-    "ls", "cat", "write", "rm", "cp", "mv", "mkdir", "rmdir",
-    "cd", "pwd", "mount", "tar", "stats",
+    "ls", "cat", "write", "rm", "cp", "mv", "ln", "mkdir", "rmdir",
+    "cd", "pwd", "mount", "fsck", "tar", "stats",
+    "whoami", "su", "chmod", "chown",
     "history", "date", "time", "tz",
     "user", "run", "edit", "reboot", "shutdown",
     "gfx",
@@ -760,9 +763,15 @@ static void cmd_help(void) {
     printf("  write <file> <text>  create or overwrite a file\n");
     printf("  rm <file>            delete a file\n");
     printf("  cp <src> <dst>       copy a file\n");
+    printf("  ln <target> <name>   hard link (same filesystem)\n");
     printf("  mv <src> <dst>       rename or move a file/directory\n");
     printf("  mkdir <path>         create a directory\n");
     printf("  rmdir <path>         remove an empty directory\n");
+    printf("  fsck [-r]            check (or repair) the CFS volume\n");
+    printf("  whoami              show the current user\n");
+    printf("  su [user|uid]       switch user (no arg = root)\n");
+    printf("  chmod <octal> <f>   change permission bits\n");
+    printf("  chown <user> <f>    change owner (root only)\n");
     printf("  cd [path]            change directory; no arg goes to /\n");
     printf("  pwd                  print working directory\n");
     printf("  tar [-tv|-xv]f <f>   list or extract a .tar archive\n");
@@ -1202,6 +1211,85 @@ static void cmd_mount(void) {
     if (!shown) printf("(no filesystems mounted)\n");
 }
 
+static void cmd_fsck(const char* args) {
+    int repair = (strcmp(args, "-r") == 0 || strcmp(args, "repair") == 0 ||
+                  strcmp(args, "fix") == 0);
+    cfs_fsck_print(repair);
+}
+
+static void take_arg(const char** args, char* out, int cap);   /* defined below */
+
+static int all_digits(const char* s) {
+    if (!*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
+static void cmd_whoami(const char* args) {
+    (void)args;
+    uint32_t u = cred_uid();
+    const char* n = cred_name(u);
+    printf("%s (uid=%u gid=%u)\n", n ? n : "?", u, cred_gid());
+}
+
+static void cmd_su(const char* args) {
+    char who[32];
+    take_arg(&args, who, sizeof(who));
+    if (who[0] == '\0') { cred_set(0, 0); printf("switched to root\n"); return; }
+    uint32_t uid, gid;
+    if (cred_lookup(who, &uid, &gid)) {
+        cred_set(uid, gid);
+        printf("switched to %s (uid=%u gid=%u)\n", who, uid, gid);
+    } else if (all_digits(who)) {
+        uid = atou(who);
+        cred_set(uid, uid);
+        printf("switched to uid=%u gid=%u\n", uid, uid);
+    } else {
+        printf("su: unknown user '%s'\n", who);
+    }
+}
+
+static void cmd_chmod(const char* args) {
+    char modearg[16], path[256];
+    take_arg(&args, modearg, sizeof(modearg));
+    take_arg(&args, path, sizeof(path));
+    if (modearg[0] == '\0' || path[0] == '\0') {
+        printf("usage: chmod <octal> <path>\n"); return;
+    }
+    unsigned int mode = 0;
+    for (const char* p = modearg; *p; p++) {
+        if (*p < '0' || *p > '7') { printf("chmod: bad mode '%s'\n", modearg); return; }
+        mode = mode * 8 + (unsigned int)(*p - '0');
+    }
+    if (vfs_chmod(path, mode) < 0) {
+        printf("chmod: %s: failed (no such file, not permitted, or not supported)\n", path);
+    } else {
+        printf("mode of %s -> %o\n", path, mode);
+    }
+}
+
+static void cmd_chown(const char* args) {
+    char owner[32], path[256];
+    take_arg(&args, owner, sizeof(owner));
+    take_arg(&args, path, sizeof(path));
+    if (owner[0] == '\0' || path[0] == '\0') {
+        printf("usage: chown <user|uid> <path>\n"); return;
+    }
+    uint32_t uid, gid = (uint32_t)-1;
+    if (cred_lookup(owner, &uid, &gid)) {
+        /* uid and gid both set */
+    } else if (all_digits(owner)) {
+        uid = atou(owner);                 /* gid left unchanged */
+    } else {
+        printf("chown: unknown user '%s'\n", owner); return;
+    }
+    if (vfs_chown(path, uid, gid) < 0) {
+        printf("chown: %s: failed (no such file, needs root, or not supported)\n", path);
+    } else {
+        printf("owner of %s -> %u\n", path, uid);
+    }
+}
+
 static void cmd_ls(const char* args) {
     while (*args == ' ') args++;
 
@@ -1357,7 +1445,7 @@ static void cmd_cat(const char* args) {
     char* buf = (char*)kmalloc(cat_max);
     if (!buf) { printf("cat: out of memory\n"); return; }
     int n = vfs_read_file(fname, buf, cat_max);
-    if (n < 0) { printf("cat: %s: not found\n", fname); kfree(buf); return; }
+    if (n < 0) { printf("cat: %s: not found or permission denied\n", fname); kfree(buf); return; }
 
     if (outfile) {
         if (append) {
@@ -1405,7 +1493,7 @@ static void cmd_write(const char* args) {
     int n = vfs_write_file(fname, buf, len + 1);
     kfree(buf);
     if (n < 0) {
-        printf("write: %s: failed (disk full, bad name, or read-only)\n", fname);
+        printf("write: %s: failed (permission denied, disk full, or bad name)\n", fname);
         return;
     }
     printf("wrote %d bytes to %s\n", n, fname);
@@ -1445,6 +1533,20 @@ static void cmd_cp(const char* args) {
         return;
     }
     printf("copied %s -> %s\n", src, dst);
+}
+
+static void cmd_ln(const char* args) {
+    char target[128], linkname[128];
+    take_arg(&args, target, sizeof(target));
+    take_arg(&args, linkname, sizeof(linkname));
+    if (target[0] == '\0' || linkname[0] == '\0') {
+        printf("usage: ln <target> <linkname>\n"); return;
+    }
+    if (vfs_link(target, linkname) < 0) {
+        printf("ln: failed (missing target, a directory, cross-filesystem, or name exists)\n");
+        return;
+    }
+    printf("linked %s -> %s\n", linkname, target);
 }
 
 static void cmd_mv(const char* args) {
@@ -1927,9 +2029,15 @@ static void execute(char* line) {
     else if (strcmp(line, "write")    == 0) cmd_write(args);
     else if (strcmp(line, "rm")       == 0) cmd_rm(args);
     else if (strcmp(line, "cp")       == 0) cmd_cp(args);
+    else if (strcmp(line, "ln")       == 0) cmd_ln(args);
     else if (strcmp(line, "mv")       == 0) cmd_mv(args);
     else if (strcmp(line, "mkdir")    == 0) cmd_mkdir(args);
     else if (strcmp(line, "rmdir")    == 0) cmd_rmdir(args);
+    else if (strcmp(line, "fsck")     == 0) cmd_fsck(args);
+    else if (strcmp(line, "whoami")   == 0) cmd_whoami(args);
+    else if (strcmp(line, "su")       == 0) cmd_su(args);
+    else if (strcmp(line, "chmod")    == 0) cmd_chmod(args);
+    else if (strcmp(line, "chown")    == 0) cmd_chown(args);
     else if (strcmp(line, "cd")       == 0) cmd_cd(args);
     else if (strcmp(line, "pwd")      == 0) cmd_pwd();
     else if (strcmp(line, "mount")    == 0) cmd_mount();

@@ -63,6 +63,7 @@ ATA_O      = $(OBJDIR)/ata.o
 FAT32_O         = $(OBJDIR)/fat32.o
 EXT2_O          = $(OBJDIR)/ext2.o
 CFS_O           = $(OBJDIR)/cfs.o
+CRED_O          = $(OBJDIR)/cred.o
 INFLATE_O       = $(OBJDIR)/inflate.o
 LINUX_SYSCALL_O = $(OBJDIR)/linux_syscall.o
 PROCFS_O        = $(OBJDIR)/procfs.o
@@ -100,7 +101,7 @@ KERNEL_OBJS = \
     $(KERNEL_O) $(GDT_O) $(IDT_O) $(ISR_O) $(PIC_O) $(IRQ_O) \
     $(KEYBOARD_O) $(MOUSE_O) $(PIT_O) $(SERIAL_O) \
     $(MEMMAP_O) $(PMM_O) $(VMM_O) $(KHEAP_O) \
-    $(TASK_O) $(ATA_O) $(FAT32_O) $(EXT2_O) $(CFS_O) $(VFS_O) $(RAMFS_O) \
+    $(TASK_O) $(ATA_O) $(FAT32_O) $(EXT2_O) $(CFS_O) $(CRED_O) $(VFS_O) $(RAMFS_O) \
     $(INFLATE_O) $(LINUX_SYSCALL_O) $(PROCFS_O) $(DEVFS_O) \
     $(SYSCALL_O) $(USERPROG_O) $(LOADER_O) $(EDITOR_O) \
     $(RTC_O) $(GFX_O) $(FONT_O) $(UACCESS_O) \
@@ -158,6 +159,7 @@ $(ATA_O):     src/ata.c | $(OBJDIR);      $(CC) $(CFLAGS) $< -o $@
 $(FAT32_O):         src/fat32.c | $(OBJDIR);         $(CC) $(CFLAGS) $< -o $@
 $(EXT2_O):          src/ext2.c | $(OBJDIR);          $(CC) $(CFLAGS) $< -o $@
 $(CFS_O):           src/cfs.c | $(OBJDIR);           $(CC) $(CFLAGS) -DCFS_KERNEL $< -o $@
+$(CRED_O):          src/cred.c | $(OBJDIR);          $(CC) $(CFLAGS) $< -o $@
 $(INFLATE_O):       src/inflate.c | $(OBJDIR);       $(CC) $(CFLAGS) $< -o $@
 $(LINUX_SYSCALL_O): src/linux_syscall.c | $(OBJDIR); $(CC) $(CFLAGS) $< -o $@
 $(PROCFS_O):        src/procfs.c | $(OBJDIR);        $(CC) $(CFLAGS) $< -o $@
@@ -197,18 +199,19 @@ $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 # Disk image
 # -----------------------------------------------------------------------
 
-# Partition layout (512-byte sectors):
+# Partition layout (512-byte sectors). CFS is now the root filesystem; the
+# disk is grown to 256 MB so CFS (partition 4) can hold it.
 #   1  ESP    2048   .. 67583    32 MB  Limine + kernel.elf
-#   2  FAT32  67584  .. 198655   64 MB  fat32disk.img  (mounted at /)
+#   2  FAT32  67584  .. 198655   64 MB  fat32disk.img  (mounted at /fat)
 #   3  ext2   198656 .. 313343   56 MB  ext2disk.img   (mounted at /mnt)
-#   4  CFS    313344 .. 327646  ~7 MB   cfsdisk.img    (mounted at /cfs)
+#   4  CFS    313344 .. 524254 ~103 MB  cfsdisk.img    (mounted at /  — root)
 $(DISK_IMG): $(KERNEL_ELF) $(FAT32_IMG) $(EXT2_IMG) $(CFS_IMG) limine.conf
 	@echo "Creating UEFI disk image..."
-	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=160 2>/dev/null
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=256 2>/dev/null
 	sgdisk -n 1:2048:67583    -t 1:ef00 \
 	       -n 2:67584:198655  -t 2:0700 \
 	       -n 3:198656:313343 -t 3:8300 \
-	       -n 4:313344:327646 -t 4:8300 \
+	       -n 4:313344:524254 -t 4:8300 \
 	       $(DISK_IMG)
 	mformat -i $(DISK_IMG)@@1M -F -v EFI ::
 	mmd    -i $(DISK_IMG)@@1M ::/EFI ::/EFI/BOOT
@@ -251,7 +254,9 @@ $(EXT2_IMG): Makefile | $(OBJDIR)
 
 MKFS_CFS  = $(OBJDIR)/mkfs_cfs
 CFS_STAGE = $(OBJDIR)/cfsroot
-CFS_BLOCKS = 1787
+# Partition 4 is sectors 313344..524254 = 210911 sectors; at 8 sectors/block
+# that is 26363 CFS blocks (~103 MiB).
+CFS_BLOCKS = 26363
 
 # The host tool shares the filesystem core (src/cfs.c), compiled WITHOUT
 # -DCFS_KERNEL so the ATA binding is excluded. Both halves use the host cc.
@@ -261,14 +266,36 @@ $(MKFS_CFS): src/mkfs_cfs.c src/cfs.c include/cfs.h | $(OBJDIR)
 	$(HOSTCC) -O2 -std=c11 -c src/mkfs_cfs.c -o $(OBJDIR)/mkfs_cfs.o
 	$(HOSTCC) $(OBJDIR)/cfs_host.o $(OBJDIR)/mkfs_cfs.o -o $(MKFS_CFS)
 
+# The CFS root holds the user programs under /bin, an /etc, and empty mount
+# points so /fat, /mnt, /tmp, /proc and /dev appear in `ls /`. The richer
+# apk/alpine tree stays on the FAT32 volume, now reachable at /fat.
 $(CFS_IMG): $(MKFS_CFS) Makefile | $(OBJDIR)
-	@echo "Building CFS data disk..."
-	rm -rf $(CFS_STAGE) && mkdir -p $(CFS_STAGE)/home/user $(CFS_STAGE)/etc
-	@printf "Hello from CFS!\nExtent-based, long filenames, journaled-to-be.\n" > $(CFS_STAGE)/hello.txt
-	@printf 'NAME="Computer OS"\nFS=cfs\n' > $(CFS_STAGE)/etc/os-release
-	@printf "This file lives on a native CFS partition.\n" > $(CFS_STAGE)/home/user/notes.txt
+	@echo "Building CFS root disk..."
+	$(MAKE) -C userprogs/c all
+	rm -rf $(CFS_STAGE)
+	mkdir -p $(CFS_STAGE)/bin $(CFS_STAGE)/etc $(CFS_STAGE)/home/user \
+	         $(CFS_STAGE)/fat $(CFS_STAGE)/mnt $(CFS_STAGE)/tmp \
+	         $(CFS_STAGE)/proc $(CFS_STAGE)/dev
+	-cp userprogs/c/*.elf $(CFS_STAGE)/bin/ 2>/dev/null
+	@printf "Welcome to Computer OS, booting from the CFS root filesystem.\n" > $(CFS_STAGE)/hello.txt
+	@printf "User programs live in /bin. apk and its tree live at the root.\n" > $(CFS_STAGE)/home/user/notes.txt
+	@# --- apk / alpine tree (moved off FAT32 so apk runs from the root) ---
+	mkdir -p $(CFS_STAGE)/etc/apk/keys $(CFS_STAGE)/etc/apk/protected_paths.d \
+	         $(CFS_STAGE)/lib/apk/db $(CFS_STAGE)/var/cache/apk $(CFS_STAGE)/usr/lib
+	@printf "x86_64\n" > $(CFS_STAGE)/etc/apk/arch
+	@printf 'http://151.101.2.132/alpine/v3.20/main\nhttp://151.101.2.132/alpine/v3.20/community\n' > $(CFS_STAGE)/etc/apk/repositories
+	@: > $(CFS_STAGE)/etc/apk/world
+	@: > $(CFS_STAGE)/lib/apk/db/installed
+	@if [ -f /tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub ]; then \
+	  cp "/tmp/alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub" \
+	     "$(CFS_STAGE)/etc/apk/keys/"; fi
+	@printf 'NAME="Computer OS"\nPRETTY_NAME="Computer OS (64-bit)"\nID=computeros\nVERSION_ID=0.1\n' > $(CFS_STAGE)/etc/os-release
+	@printf "nameserver 10.0.2.3\n" > $(CFS_STAGE)/etc/resolv.conf
+	@printf "127.0.0.1 localhost\n151.101.2.132 dl-cdn.alpinelinux.org\n" > $(CFS_STAGE)/etc/hosts
+	@printf "hosts: files\nnetworks: files\n" > $(CFS_STAGE)/etc/nsswitch.conf
+	cp apk.static $(CFS_STAGE)/apk.static
 	$(MKFS_CFS) $(CFS_IMG) $(CFS_BLOCKS) computeros $(CFS_STAGE)
-	@echo "CFS disk ready: $(CFS_IMG)"
+	@echo "CFS root disk ready: $(CFS_IMG)"
 
 # -----------------------------------------------------------------------
 # FAT32 data disk

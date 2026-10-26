@@ -84,6 +84,11 @@ int printf(const char* fmt, ...) {
                                    : (uint64_t)va_arg(ap, unsigned int);
                 utoa64(v, 16, buf, 1); written += print_str(buf); break;
             }
+            case 'o': {
+                uint64_t v = is_ll ? va_arg(ap, unsigned long long)
+                                   : (uint64_t)va_arg(ap, unsigned int);
+                utoa64(v, 8, buf, 0); written += print_str(buf); break;
+            }
             case 'p': {
                 uint64_t v = (uint64_t)va_arg(ap, void*);
                 written += print_str("0x");

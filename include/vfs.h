@@ -45,6 +45,9 @@ typedef struct vfs_ops {
     int (*rmdir)(const char* path);
     int (*cp)(const char* src, const char* dst);
     int (*mv)(const char* src, const char* dst);
+    int (*link)(const char* oldpath, const char* newpath);  /* hard link */
+    int (*chmod)(const char* path, unsigned int mode);
+    int (*chown)(const char* path, unsigned int uid, unsigned int gid);
 } vfs_ops_t;
 
 typedef struct vfs_mount {
@@ -69,6 +72,9 @@ int  vfs_mkdir(const char* path);
 int  vfs_rmdir(const char* path);
 int  vfs_cp(const char* src, const char* dst);
 int  vfs_mv(const char* src, const char* dst);
+int  vfs_link(const char* oldpath, const char* newpath);  /* same mount only */
+int  vfs_chmod(const char* path, unsigned int mode);
+int  vfs_chown(const char* path, unsigned int uid, unsigned int gid);
 
 // ---- working directory (VFS-owned, path-based) ------------------------
 int  vfs_chdir(const char* path);

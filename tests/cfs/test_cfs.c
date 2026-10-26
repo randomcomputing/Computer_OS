@@ -64,7 +64,7 @@ int main(void) {
     cfs_fs_t fs;
 
     printf("CFS core: format + mount\n");
-    check(cfs_format(&bd, DISK_BLOCKS, 16, "testfs") == 0, "format a 16 MiB volume");
+    check(cfs_format(&bd, DISK_BLOCKS, 64, "testfs") == 0, "format a 16 MiB volume");
     check(cfs_mount_bd(&bd, &fs) == 0,                      "mount the volume");
     uint64_t free_at_start = fs.free_blocks;
 
@@ -134,6 +134,45 @@ int main(void) {
     check(cfs_list(&fs, "/many", ents, 300) == 200, "all 200 listed (dir spans blocks)");
     check(cfs_read_file(&fs, "/many/file137", rb, sizeof rb) == 2
           && rb[0] == 'h' && rb[1] == 'i', "look one up by name");
+
+    printf("Native symlinks\n");
+    {
+        int ml = (int)strlen(VFS_SYMLINK_MAGIC);
+        const char* tgt = "/home/user/notes.txt";
+        int tl = (int)strlen(tgt);
+        char lb[320]; memcpy(lb, VFS_SYMLINK_MAGIC, ml); memcpy(lb + ml, tgt, tl);
+        check(cfs_write_file(&fs, "/mylink", lb, ml + tl) == ml + tl, "create a symlink");
+        char rr[320];
+        int r = cfs_read_file(&fs, "/mylink", rr, sizeof rr);
+        check(r == ml + tl && memcmp(rr, VFS_SYMLINK_MAGIC, ml) == 0
+              && memcmp(rr + ml, tgt, tl) == 0, "reads back as magic + target");
+        check(cfs_is_dir(&fs, "/mylink") == 0, "symlink is not a directory");
+
+        char big[420]; for (int i = 0; i < 380; i++) big[i] = (char)('a' + i % 26);
+        char lb2[440]; memcpy(lb2, VFS_SYMLINK_MAGIC, ml); memcpy(lb2 + ml, big, 380);
+        check(cfs_write_file(&fs, "/longlink", lb2, ml + 380) == ml + 380,
+              "create a long (slow) symlink");
+        char rr2[440];
+        check(cfs_read_file(&fs, "/longlink", rr2, sizeof rr2) == ml + 380
+              && memcmp(rr2 + ml, big, 380) == 0, "long symlink reads back");
+    }
+
+    printf("Hard links\n");
+    {
+        check(cfs_write_file(&fs, "/f1", "shared", 6) == 6, "write /f1");
+        check(cfs_link(&fs, "/f1", "/f2") == 0, "link /f2 -> /f1");
+        char rb[16];
+        check(cfs_read_file(&fs, "/f2", rb, sizeof rb) == 6
+              && memcmp(rb, "shared", 6) == 0, "/f2 reads the same data");
+        check(cfs_link(&fs, "/f1", "/f2") == -1, "linking over an existing name fails");
+        check(cfs_link(&fs, "/home", "/dlink") == -1, "hard link to a directory fails");
+        check(cfs_unlink(&fs, "/f1") == 0, "unlink /f1 (one of two names)");
+        check(cfs_read_file(&fs, "/f2", rb, sizeof rb) == 6, "/f2 still readable");
+        cfs_fsck_result_t fr;
+        check(cfs_fsck(&fs, 0, &fr) == 0, "fsck clean after link churn");
+        check(cfs_unlink(&fs, "/f2") == 0, "unlink /f2 (last link)");
+        check(cfs_read_file(&fs, "/f2", rb, sizeof rb) < 0, "/f2 now gone");
+    }
 
     printf("Removal: rmdir + unlink + free-space accounting\n");
     check(cfs_rmdir(&fs, "/home/user") == -1, "rmdir a non-empty dir fails");

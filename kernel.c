@@ -274,37 +274,48 @@ void kmain(void) {
         }
     }
 
-    int g_fs_ok = 0;
     if (ata_init()) {
         print_status(1, "ATA primary master detected");
 
         vfs_init();
 
+        /* CFS is the root filesystem (partition 4). */
+        if (cfs_mount() == 0) {
+            if (vfs_mount("/", cfs_vfs_ops(), "cfs") == 0) {
+                con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+                printf("[OK]");
+                con_set_color(CON_WHITE, CON_BLACK);
+                printf(" CFS mounted at / (root)\n");
+                printf("     ");
+                cfs_print_info();
+            } else {
+                print_status(0, "CFS root mount failed");
+            }
+        } else {
+            print_status(0, "No CFS partition");
+        }
 
+        /* FAT32 kept as a secondary volume at /fat. */
         if (fat32_mount() == 0) {
-            if (vfs_mount("/", fat32_vfs_ops(), "fat32") == 0) {
-                print_status(1, "FAT32 mounted at /");
-                g_fs_ok = 1;
+            if (vfs_mount("/fat", fat32_vfs_ops(), "fat32") == 0) {
+                print_status(1, "FAT32 mounted at /fat");
             } else {
                 print_status(0, "FAT32 mount failed");
             }
         } else {
-            print_status(0, "FAT32 mount failed");
+            print_status(0, "No FAT32 partition");
         }
 
-        /* ext2 data partition: at /mnt next to FAT32, or as the root
-         * filesystem when there is no FAT32 volume. */
+        /* ext2 data volume at /mnt. */
         if (ext2_mount() == 0) {
-            const char* at = g_fs_ok ? "/mnt" : "/";
-            if (vfs_mount(at, ext2_vfs_ops(), "ext2") == 0) {
+            if (vfs_mount("/mnt", ext2_vfs_ops(), "ext2") == 0) {
                 con_set_color(CON_LIGHT_GREEN, CON_BLACK);
                 printf("[OK]");
                 con_set_color(CON_WHITE, CON_BLACK);
-                printf(" ext2 mounted at %s (%s)\n", at,
+                printf(" ext2 mounted at /mnt (%s)\n",
                        ext2_writable() ? "read-write" : "read-only");
                 printf("     ");
                 ext2_print_info();
-                g_fs_ok = 1;
             } else {
                 print_status(0, "ext2 mount failed");
             }
@@ -332,26 +343,9 @@ void kmain(void) {
         } else {
             print_status(0, "devfs mount failed");
         }
-
-        /* CFS: our own extent-based filesystem on partition 4, at /cfs. */
-        if (cfs_mount() == 0) {
-            if (vfs_mount("/cfs", cfs_vfs_ops(), "cfs") == 0) {
-                con_set_color(CON_LIGHT_GREEN, CON_BLACK);
-                printf("[OK]");
-                con_set_color(CON_WHITE, CON_BLACK);
-                printf(" CFS mounted at /cfs\n");
-                printf("     ");
-                cfs_print_info();
-            } else {
-                print_status(0, "CFS mount failed");
-            }
-        } else {
-            print_status(0, "No CFS partition");
-        }
     } else {
         print_status(0, "No ATA disk");
     }
-    (void)g_fs_ok;
 
     printf("\n");
     __asm__ volatile ("sti");

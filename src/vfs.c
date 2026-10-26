@@ -246,6 +246,29 @@ int vfs_mv(const char* src, const char* dst) {
     return sm->ops->delete_file(ssub);
 }
 
+int vfs_link(const char* oldpath, const char* newpath) {
+    char osub[256], nsub[256];
+    const vfs_mount_t* om = resolve_route(oldpath, osub, sizeof(osub));
+    const vfs_mount_t* nm = resolve_route(newpath, nsub, sizeof(nsub));
+    if (!om || !nm || om != nm) return -1;   /* hard links can't cross mounts */
+    if (!om->ops->link) return -1;
+    return om->ops->link(osub, nsub);
+}
+
+int vfs_chmod(const char* path, unsigned int mode) {
+    char sub[256];
+    const vfs_mount_t* m = resolve_route(path, sub, sizeof(sub));
+    if (!m || !m->ops->chmod) return -1;
+    return m->ops->chmod(sub, mode);
+}
+
+int vfs_chown(const char* path, unsigned int uid, unsigned int gid) {
+    char sub[256];
+    const vfs_mount_t* m = resolve_route(path, sub, sizeof(sub));
+    if (!m || !m->ops->chown) return -1;
+    return m->ops->chown(sub, uid, gid);
+}
+
 // ---- working directory ------------------------------------------------
 int vfs_chdir(const char* path) {
     char abspath[256], sub[256];

@@ -163,6 +163,8 @@ typedef struct cfs_fs {
     uint64_t    inode_table_start;
     uint64_t    data_start;
     uint64_t    root_ino;
+    uint64_t    journal_start;    /* first journal block, 0 if no journal */
+    uint64_t    journal_blocks;   /* journal region length in blocks */
 } cfs_fs_t;
 
 /* ------------------------------------------------------------------ */
@@ -189,6 +191,46 @@ int cfs_write_file(cfs_fs_t* fs, const char* path, const void* data,
 int cfs_mkdir(cfs_fs_t* fs, const char* path);
 int cfs_rmdir(cfs_fs_t* fs, const char* path);
 int cfs_unlink(cfs_fs_t* fs, const char* path);
+int cfs_link(cfs_fs_t* fs, const char* oldpath, const char* newpath);
+
+/* Permissions: report and change mode / ownership. chmod sets the low 12
+ * bits (rwx + setuid/setgid/sticky), preserving the file type. chown with a
+ * field of (uint32_t)-1 leaves that field unchanged. */
+typedef struct {
+    uint16_t mode;      /* type + permission bits */
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t size;
+    uint32_t flags;
+} cfs_stat_t;
+
+int cfs_stat(cfs_fs_t* fs, const char* path, cfs_stat_t* out);
+int cfs_chmod(cfs_fs_t* fs, const char* path, uint16_t perm);
+int cfs_chown(cfs_fs_t* fs, const char* path, uint32_t uid, uint32_t gid);
+
+/* ------------------------------------------------------------------ */
+/* fsck — offline consistency check and repair                         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int sb_bad;         /* superblock/geometry unusable (incl. too large)  */
+    int block_badref;   /* block referenced by an inode but marked free    */
+    int block_leaks;    /* block marked used but referenced by nothing     */
+    int block_dup;      /* block referenced by more than one inode         */
+    int inode_badref;   /* inode referenced by a dir entry but marked free */
+    int inode_leaks;    /* inode marked used but unreachable (orphan)       */
+    int linkcount_bad;  /* inode link count != directory references         */
+    int freecount_bad;  /* superblock free counts wrong                     */
+    int total;          /* sum of the above                                 */
+} cfs_fsck_result_t;
+
+/* Check the mounted volume. With repair != 0, rebuild the bitmaps, fix link
+ * counts, reclaim orphaned inodes, and correct the free counts. Fills `out`
+ * and returns the number of problems found (0 = clean), or -1 if the volume
+ * is too large for the built-in checker. Run after cfs_mount_bd (so the
+ * journal has already been replayed). Repair writes directly, not through
+ * the journal; re-run fsck if it is itself interrupted. */
+int cfs_fsck(cfs_fs_t* fs, int repair, cfs_fsck_result_t* out);
 
 /* ------------------------------------------------------------------ */
 /* Kernel bindings (single global volume on the ATA disk)              */
@@ -198,6 +240,10 @@ int cfs_unlink(cfs_fs_t* fs, const char* path);
 int cfs_mount(void);
 int cfs_mounted(void);
 void cfs_print_info(void);
+
+/* Run fsck on the mounted CFS volume and print the result to the console.
+ * repair != 0 also fixes what it finds. For the shell `fsck` command. */
+void cfs_fsck_print(int repair);
 
 /* Ops table to hand to vfs_mount(). */
 const vfs_ops_t* cfs_vfs_ops(void);

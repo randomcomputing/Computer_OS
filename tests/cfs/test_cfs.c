@@ -174,6 +174,40 @@ int main(void) {
         check(cfs_read_file(&fs, "/f2", rb, sizeof rb) < 0, "/f2 now gone");
     }
 
+    printf("Inline data (tiny files stored in the inode, no data block)\n");
+    {
+        uint64_t f0 = fs.free_blocks;
+        check(cfs_write_file(&fs, "/tiny", "small file", 10) == 10, "write a 10-byte file");
+        check(fs.free_blocks == f0, "  no data block allocated (inline)");
+        char ib[256];
+        check(cfs_read_file(&fs, "/tiny", ib, sizeof ib) == 10
+              && memcmp(ib, "small file", 10) == 0, "  reads back inline data");
+
+        static unsigned char b144[144];
+        for (int i = 0; i < 144; i++) b144[i] = (unsigned char)(i * 3 + 1);
+        uint64_t f1 = fs.free_blocks;
+        check(cfs_write_file(&fs, "/max", b144, 144) == 144, "write 144 bytes (inline max)");
+        check(fs.free_blocks == f1, "  still inline (no block)");
+
+        static unsigned char b145[145];
+        for (int i = 0; i < 145; i++) b145[i] = (unsigned char)(i * 7 + 2);
+        uint64_t f2 = fs.free_blocks;
+        check(cfs_write_file(&fs, "/over", b145, 145) == 145, "write 145 bytes (just over)");
+        check(fs.free_blocks == f2 - 1, "  uses one data block");
+
+        /* grow an inline file past the limit, then shrink it back */
+        check(cfs_write_file(&fs, "/tiny", b145, 145) == 145, "grow /tiny beyond inline");
+        static unsigned char gb[200];
+        check(cfs_read_file(&fs, "/tiny", gb, sizeof gb) == 145
+              && memcmp(gb, b145, 145) == 0, "  reads back (now block-based)");
+        check(cfs_write_file(&fs, "/tiny", "hi", 2) == 2, "shrink /tiny back to inline");
+        check(cfs_read_file(&fs, "/tiny", ib, sizeof ib) == 2
+              && ib[0] == 'h' && ib[1] == 'i', "  reads back inline after shrink");
+
+        cfs_fsck_result_t ir;
+        check(cfs_fsck(&fs, 0, &ir) == 0, "fsck clean with inline files");
+    }
+
     printf("Removal: rmdir + unlink + free-space accounting\n");
     check(cfs_rmdir(&fs, "/home/user") == -1, "rmdir a non-empty dir fails");
     check(cfs_unlink(&fs, "/home/user/notes.txt") == 0, "unlink the file inside it");

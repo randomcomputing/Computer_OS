@@ -136,6 +136,18 @@ static uint32_t crc32_up(uint32_t crc, const void* data, uint32_t len) {
     return ~crc;
 }
 
+/* crc32 of an inode with its csum field treated as zero. */
+static uint32_t inode_csum(const cfs_dinode_t* in) {
+    cfs_dinode_t t = *in;
+    t.csum = 0;
+    return crc32_up(0, &t, sizeof t);
+}
+/* crc32 of the 4 KiB superblock block, skipping the sb_csum field (off 140). */
+static uint32_t super_csum(const unsigned char* sb) {
+    uint32_t c = crc32_up(0, sb, 140);
+    return crc32_up(c, sb + 144, BS - 144);
+}
+
 static struct { uint64_t home; unsigned char data[BS]; } txn[CFS_MAX_TXN]
     __attribute__((aligned(8)));
 static int      txn_active = 0;
@@ -356,7 +368,9 @@ static int write_dinode(cfs_fs_t* fs, uint64_t ino, const cfs_dinode_t* in) {
     uint64_t blk = fs->inode_table_start + byteoff / BS;
     uint32_t off = (uint32_t)(byteoff % BS);
     if (bd_read_block(fs, blk, it_buf) < 0) return -1;
-    memcpy(it_buf + off, in, sizeof(cfs_dinode_t));
+    cfs_dinode_t tmp = *in;
+    tmp.csum = (fs->flags & CFS_FEAT_CSUM) ? inode_csum(in) : 0;
+    memcpy(it_buf + off, &tmp, sizeof tmp);
     return bd_write_block(fs, blk, it_buf);
 }
 
@@ -366,6 +380,7 @@ static void sync_super(cfs_fs_t* fs) {
     sb->free_blocks = fs->free_blocks;
     sb->free_inodes = fs->free_inodes;
     sb->state = CFS_STATE_CLEAN;
+    if (fs->flags & CFS_FEAT_CSUM) { sb->sb_csum = 0; sb->sb_csum = super_csum(sb_buf); }
     bd_write_block(fs, 0, sb_buf);
 }
 
@@ -634,7 +649,13 @@ int cfs_mount_bd(cfs_bdev_t* bd, cfs_fs_t* fs) {
     fs->root_ino           = sb->root_inode;
     fs->journal_start      = sb->journal_start;
     fs->journal_blocks     = sb->journal_blocks;
+    fs->flags              = sb->flags;
     fs->mounted = 1;
+
+    /* Verify the superblock checksum (report; do not refuse to mount). */
+    fs->csum_ok = 1;
+    if (fs->flags & CFS_FEAT_CSUM)
+        fs->csum_ok = (sb->sb_csum == super_csum(sb_buf));
 
     /* Recover a transaction interrupted by a crash, then reload the
      * superblock counts (replay may have rewritten block 0). */
@@ -675,6 +696,7 @@ int cfs_format(cfs_bdev_t* bd, uint64_t total_blocks,
     fs.root_ino = CFS_ROOT_INO;
     fs.journal_start = journal_blocks ? 1 : 0;
     fs.journal_blocks = journal_blocks;
+    fs.flags = CFS_FEAT_CSUM;               /* root inode gets a checksum too */
 
     /* Zero every metadata region (sb, journal, bitmaps, inode table). */
     memset(io_buf, 0, BS);
@@ -727,12 +749,15 @@ int cfs_format(cfs_bdev_t* bd, uint64_t total_blocks,
     sb->journal_start = journal_blocks ? 1 : 0;
     sb->journal_blocks = journal_blocks;
     sb->state = CFS_STATE_CLEAN;
+    sb->flags = CFS_FEAT_CSUM;
     sb->mkfs_time = (uint32_t)(now / 1000000000ull);
     if (label) {
         uint32_t i = 0;
         for (; label[i] && i < sizeof(sb->label) - 1; i++) sb->label[i] = label[i];
         sb->label[i] = '\0';
     }
+    sb->sb_csum = 0;
+    sb->sb_csum = super_csum(sb_buf);
     if (bd_write_block(&fs, 0, sb_buf) < 0) return -1;
     return 0;
 }
@@ -836,6 +861,16 @@ int cfs_read_at(cfs_fs_t* fs, const char* path, void* buf,
 
     if (CFS_ISDIR(din.mode)) return -1;
     if (!may_access(din.mode, din.uid, din.gid, CFS_R)) return -1;
+
+    /* Inline file: data lives in the inode's extent area, not in a block. */
+    if (din.flags & CFS_FL_INLINE) {
+        if (offset >= din.size) return 0;
+        uint32_t avail2 = (uint32_t)din.size - offset;
+        if (len > avail2) len = avail2;
+        memcpy(buf, (const unsigned char*)din.extent + offset, len);
+        return (int)len;
+    }
+
     if (offset >= din.size) return 0;
     uint64_t avail = din.size - offset;
     if (len > avail) len = (uint32_t)avail;
@@ -928,6 +963,21 @@ static int do_write_file(cfs_fs_t* fs, const char* path, const void* data, uint3
         sync_super(fs);
         return (int)size;
     }
+
+    /* A small regular file is stored inline in the inode — no data block. */
+    if (size <= CFS_INLINE_MAX) {
+        memset(din.extent, 0, sizeof din.extent);
+        if (size) memcpy((unsigned char*)din.extent, data, size);
+        din.flags |= CFS_FL_INLINE;
+        din.nextents = 0;
+        din.size = size;
+        din.mtime_ns = din.ctime_ns = now;
+        if (din.atime_ns == 0) din.atime_ns = now;
+        if (write_dinode(fs, ino, &din) < 0) return -1;
+        sync_super(fs);
+        return (int)size;
+    }
+    din.flags &= ~(uint32_t)CFS_FL_INLINE;            /* large file: data blocks */
 
     const unsigned char* src = (const unsigned char*)data;
     uint64_t nblk = (size + BS - 1) / BS;
@@ -1314,10 +1364,16 @@ int cfs_fsck(cfs_fs_t* fs, int repair, cfs_fsck_result_t* out) {
         if (!FSCK_GET(fsck_ibm, n)) continue;
         cfs_dinode_t d;
         if (read_dinode(fs, n, &d) < 0) continue;
+        int need_write = 0;
         if (d.links != fsck_refs[n]) {
             out->linkcount_bad++;
-            if (repair) { d.links = fsck_refs[n]; write_dinode(fs, n, &d); }
+            if (repair) { d.links = (uint16_t)fsck_refs[n]; need_write = 1; }
         }
+        if ((fs->flags & CFS_FEAT_CSUM) && d.csum != inode_csum(&d)) {
+            out->inode_csum_bad++;        /* corruption detected */
+            if (repair) need_write = 1;   /* write_dinode recomputes the csum */
+        }
+        if (repair && need_write) write_dinode(fs, n, &d);
     }
 
     /* Free counts. */
@@ -1325,20 +1381,29 @@ int cfs_fsck(cfs_fs_t* fs, int repair, cfs_fsck_result_t* out) {
     uint64_t want_fi = fs->total_inodes - used_inodes;
     if (raw_read_block(fs, 0, sb_buf) == 0) {
         cfs_super_t* sb = (cfs_super_t*)sb_buf;
+        int sb_dirty = 0;
         if (sb->free_blocks != want_fb || sb->free_inodes != want_fi) {
             out->freecount_bad++;
             if (repair) {
                 sb->free_blocks = want_fb; sb->free_inodes = want_fi;
-                sb->state = CFS_STATE_CLEAN;
-                raw_write_block(fs, 0, sb_buf);
-                fs->free_blocks = want_fb; fs->free_inodes = want_fi;
+                sb->state = CFS_STATE_CLEAN; sb_dirty = 1;
             }
+        }
+        if ((fs->flags & CFS_FEAT_CSUM) && sb->sb_csum != super_csum(sb_buf)) {
+            out->sb_csum_bad++;
+            if (repair) sb_dirty = 1;
+        }
+        if (repair && sb_dirty) {
+            if (fs->flags & CFS_FEAT_CSUM) { sb->sb_csum = 0; sb->sb_csum = super_csum(sb_buf); }
+            raw_write_block(fs, 0, sb_buf);
+            fs->free_blocks = want_fb; fs->free_inodes = want_fi;
         }
     }
 
     out->total = out->sb_bad + out->block_badref + out->block_leaks +
                  out->block_dup + out->inode_badref + out->inode_leaks +
-                 out->linkcount_bad + out->freecount_bad;
+                 out->linkcount_bad + out->freecount_bad +
+                 out->sb_csum_bad + out->inode_csum_bad;
     return out->total;
 }
 
@@ -1441,6 +1506,8 @@ void cfs_print_info(void) {
            (unsigned long long)g_cfs.total_inodes,
            (unsigned long long)g_cfs.free_inodes);
     printf("\n");
+    if (!g_cfs.csum_ok)
+        printf("     warning: superblock checksum mismatch -- run fsck\n");
 }
 
 void cfs_fsck_print(int repair) {
@@ -1458,6 +1525,8 @@ void cfs_fsck_print(int repair) {
     if (r.inode_leaks)   printf("  orphaned inodes:              %d\n", r.inode_leaks);
     if (r.linkcount_bad) printf("  wrong link counts:            %d\n", r.linkcount_bad);
     if (r.freecount_bad) printf("  free-count corrections:       %d\n", r.freecount_bad);
+    if (r.sb_csum_bad)   printf("  superblock checksum bad:      %d\n", r.sb_csum_bad);
+    if (r.inode_csum_bad)printf("  inode checksums bad:          %d\n", r.inode_csum_bad);
     if (!repair) printf("  run `fsck -r` to repair\n");
 }
 

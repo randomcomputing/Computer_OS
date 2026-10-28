@@ -118,6 +118,22 @@ int main(void) {
         check(fsck_total(1) >= 1 && fsck_total(0) == 0, "reclaims it clean");
     }
 
+    printf("Corruption: inode checksum (flip a byte in an inode)\n");
+    {
+        inode_ptr(CFS_ROOT_INO)->mtime_ns ^= 0xFFull;   /* corrupt, csum now stale */
+        cfs_fsck_result_t r; cfs_mount_bd(&bd, &fs); cfs_fsck(&fs, 0, &r);
+        check(r.inode_csum_bad >= 1, "detects a corrupted inode via checksum");
+        check(fsck_total(1) >= 1 && fsck_total(0) == 0, "repairs it clean");
+    }
+
+    printf("Corruption: superblock checksum\n");
+    {
+        SB()->label[0] ^= 0xFF;                         /* corrupt the superblock */
+        cfs_fsck_result_t r; cfs_mount_bd(&bd, &fs); cfs_fsck(&fs, 0, &r);
+        check(r.sb_csum_bad >= 1, "detects a corrupted superblock via checksum");
+        check(fsck_total(1) >= 1 && fsck_total(0) == 0, "repairs it clean");
+    }
+
     printf("Data intact after all repairs:\n");
     {
         cfs_mount_bd(&bd, &fs);

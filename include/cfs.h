@@ -51,6 +51,16 @@
 #define CFS_STATE_CLEAN    1u
 #define CFS_STATE_DIRTY    0u
 
+/* Feature flags (superblock .flags). */
+#define CFS_FEAT_CSUM      0x1u    /* superblock + inodes carry a crc32 */
+
+/* Inode flags (inode .flags). */
+#define CFS_FL_INLINE      0x1u    /* file data stored inline in the inode */
+
+/* A regular file whose data fits in this many bytes is stored inline in the
+ * inode's extent area (no data block). 12 extents * 12 bytes = 144. */
+#define CFS_INLINE_MAX     (CFS_INLINE_EXTENTS * 12u)
+
 /* inode mode: type in the high bits, permission bits in the low 12 (POSIX) */
 #define CFS_S_IFMT   0xF000u
 #define CFS_S_IFREG  0x8000u
@@ -118,7 +128,8 @@ typedef struct __attribute__((packed)) {
     uint64_t xattr_block;         /*  60  xattr block (Month 4); 0 if none */
     uint64_t extent_index;        /*  68  overflow extent block (reserved) */
     cfs_extent_t extent[CFS_INLINE_EXTENTS]; /* 76.. (12 * 12 = 144) */
-    /* 220..255 reserved (zero) */
+    uint32_t csum;                /* 220  crc32 of the inode (Month 5) */
+    /* 224..255 reserved (zero) */
 } cfs_dinode_t;
 
 typedef struct __attribute__((packed)) {
@@ -165,6 +176,8 @@ typedef struct cfs_fs {
     uint64_t    root_ino;
     uint64_t    journal_start;    /* first journal block, 0 if no journal */
     uint64_t    journal_blocks;   /* journal region length in blocks */
+    uint32_t    flags;            /* feature flags copied from the superblock */
+    int         csum_ok;          /* superblock checksum verified at mount */
 } cfs_fs_t;
 
 /* ------------------------------------------------------------------ */
@@ -221,6 +234,8 @@ typedef struct {
     int inode_leaks;    /* inode marked used but unreachable (orphan)       */
     int linkcount_bad;  /* inode link count != directory references         */
     int freecount_bad;  /* superblock free counts wrong                     */
+    int sb_csum_bad;    /* superblock checksum mismatch                      */
+    int inode_csum_bad; /* inode checksum mismatch (corruption detected)     */
     int total;          /* sum of the above                                 */
 } cfs_fsck_result_t;
 
